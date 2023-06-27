@@ -3,3 +3,4 @@ checkpoints/mask_rcnn.pth
 .venv
 data
 checkpoints
+datassets
