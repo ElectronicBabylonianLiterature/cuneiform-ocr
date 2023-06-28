@@ -20,9 +20,7 @@ Use mmdetection for task (horrible library)
         {
             "id": 0,
             "name": "null"
-        }
-
-    ]
+        }]
 
 - add: 
 metainfo = {
