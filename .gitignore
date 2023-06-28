@@ -4,3 +4,6 @@ checkpoints/mask_rcnn.pth
 data
 checkpoints
 datasets
+logs
+work_dirs
+.idea
