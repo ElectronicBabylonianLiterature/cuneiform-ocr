@@ -46,22 +46,13 @@ model = dict(
     ),
     data_preprocessor=dict(
         type="TextDetDataPreprocessor",
-        mean=[0, 0, 0],
-        std=[1, 1, 1],
+        mean=[86.65888836888392, 67.92744567921709, 53.78325960605914],
+        std=[68.98970994105028, 57.20489382979894, 48.230552014910586],
         bgr_to_rgb=True,
         pad_size_divisor=32,
     ),
 )
-"""
-classes = ['ABZ579', 'ABZ13', 'ABZ342', 'ABZ70', 'ABZ461', 'ABZ142', 'ABZ318', 'ABZ231', 'ABZ1', 'ABZ480', 'ABZ533', 'ABZ449', 'ABZ75', 'ABZ354', 'ABZ61', 'ABZ597', 'ABZ536', 'ABZ139', 'ABZ381', 'ABZ308', 'ABZ86', 'ABZ328', 'ABZ330', 'ABZ69', 'ABZ214', 'ABZ73', 'ABZ545', 'ABZ15', 'ABZ295', 'ABZ296', 'ABZ151', 'ABZ55', 'ABZ335', 'ABZ537', 'ABZ371', 'ABZ68', 'ABZ457', 'ABZ84', 'ABZ366', 'ABZ5', 'ABZ353', 'ABZ396', 'ABZ411', 'ABZ206', 'ABZ58', 'ABZ324', 'ABZ99', 'ABZ376', 'ABZ532', 'ABZ384', 'ABZ334', 'ABZ383', 'ABZ74', 'ABZ59', 'ABZ343', 'ABZ145', 'ABZ589', 'ABZ586', 'ABZ211', 'ABZ212', 'ABZ399', 'ABZ7', 'ABZ367', 'ABZ78', 'ABZ115', 'ABZ322', 'ABZ207', 'ABZ38', 'ABZ319', 'ABZ144', 'ABZ85', 'ABZ97', 'ABZ112', 'ABZ60', 'ABZ79', 'ABZ427', 'ABZ232', 'ABZ80', 'ABZ167', 'ABZ312', 'ABZ535', 'ABZ52', 'ABZ172', 'ABZ331', 'ABZ554', 'ABZ314', 'ABZ128', 'ABZ142a', 'ABZ12', 'ABZ331e+152i', 'ABZ401', 'ABZ147', 'ABZ440', 'ABZ6', 'ABZ575', 'ABZ570', 'ABZ134', 'ABZ465', 'ABZ230', 'ABZ306', 'ABZ148', 'ABZ339', 'ABZ397', 'ABZ472', 'ABZ441', 'ABZ412', 'ABZ104', 'ABZ595', 'ABZ455', 'ABZ313', 'ABZ298', 'ABZ62', 'ABZ101', 'ABZ393', 'ABZ483', 'ABZ471', 'ABZ111', 'ABZ87', 'ABZ538', 'ABZ468', 'ABZ138', 'ABZ565', 'ABZ152', 'ABZ406', 'ABZ72', 'ABZ205', 'ABZ126', 'ABZ2', 'ABZ50', 'ABZ94', 'ABZ529', 'ABZ307', 'ABZ143', 'ABZ124', 'ABZ164', 'ABZ559', 'ABZ437', 'ABZ9', 'ABZ398', 'ABZ131']
 
-metainfo = {
-    'classes': classes,
-    'palette': [
-        (220, 20, 60),
-    ] * len(classes),
-}
-"""
 classes = ("null",)
 metainfo = {
     'classes': ('null', ),
@@ -203,7 +194,7 @@ default_hooks = dict(
     param_scheduler=dict(type='ParamSchedulerHook'),
     checkpoint=dict(type='CheckpointHook', interval=1),
     sampler_seed=dict(type='DistSamplerSeedHook'),
-    visualization=dict(type='DetVisualizationHook', draw=True, show=True)
+    visualization=dict(type='DetVisualizationHook', draw=False, show=False)
     )
 env_cfg = dict(
     cudnn_benchmark=False,
@@ -218,7 +209,7 @@ visualizer = dict(
 
 log_processor = dict(type='LogProcessor', window_size=50, by_epoch=True)
 log_level = 'INFO'
-load_from = 'checkpoints/fcenet_split1.pth'
+load_from = ""
 resume = False
 launcher = 'none'
-work_dir = './work_dirs/mask-rcnn_r50_fpn_1x_coco'
+work_dir = './work_dirs/fcenet-detection'
