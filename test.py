@@ -54,8 +54,8 @@ class Recognition(nn.Module):
 
 
     def test_step(self, data):
-        plt.imshow(data["inputs"][0].permute(1, 2, 0))
-        plt.show()
+        #plt.imshow(data["inputs"][0].permute(1, 2, 0))
+        #plt.show()
         result = self.detection_model.test_step(data)
         result[0].pred_instances = result[0].gt_instances.clone()
         #result[0].pred_instances = result[0].gt_instances
@@ -73,8 +73,8 @@ class Recognition(nn.Module):
 
             crop = torchvision.transforms.functional.crop(data["inputs"][0], x,y,w,h)
 
-            plt.imshow(crop.permute(1, 2, 0))
-            plt.show()
+            #plt.imshow(crop.permute(1, 2, 0))
+            #plt.show()
             #resized1 = F.interpolate(crop, size=(380,380))
 
             img = torchvision.transforms.Resize((380, 380))(crop)
@@ -127,7 +127,7 @@ def main():
 
     classification_model = classification_config(
        "configs/efficient_net.py",
-       "checkpoints/epoch_500.pth"
+       "checkpoints/epoch_100.pth"
     )
 
     runner.model = Recognition(detection_model, classification_model)

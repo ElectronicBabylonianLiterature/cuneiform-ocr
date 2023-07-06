@@ -9,4 +9,5 @@ work_dirs
 .idea
 *.pyc
 checkpoints_legacy
-*pyc
+*.pyc
+.idea
