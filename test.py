@@ -1,4 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import matplotlib
+matplotlib.use("tkAgg")
 import argparse
 import os
 import os.path as osp
@@ -9,6 +11,7 @@ from matplotlib import pyplot as plt
 from mmengine.config import Config
 from mmengine.runner import Runner
 from torch import nn
+import torch.nn.functional as F
 
 from mmdet.engine.hooks.utils import trigger_visualization_hook
 
@@ -51,7 +54,14 @@ class Recognition(nn.Module):
 
 
     def test_step(self, data):
+        plt.imshow(data["inputs"][0].permute(1, 2, 0))
+        plt.show()
         result = self.detection_model.test_step(data)
+        result[0].pred_instances = result[0].gt_instances.clone()
+        #result[0].pred_instances = result[0].gt_instances
+        #result[0].pred_instances.labels = torch.Tensor([0] * len(result[0].pred_instances)).long()
+        #result[0].pred_instances.scores = torch.Tensor([1.0] * len(result[0].pred_instances))
+        #return result
         labels = []
         scores = []
         assert len(result) == 1
@@ -62,20 +72,29 @@ class Recognition(nn.Module):
             x, y, w, h = list(map(int, [x,y,w,h]))
 
             crop = torchvision.transforms.functional.crop(data["inputs"][0], x,y,w,h)
-            # display pil image crop
 
-            plt.imshow(data["inputs"][0].permute(1, 2, 0))
             plt.imshow(crop.permute(1, 2, 0))
             plt.show()
-            crop = crop.flip(1)
-            crop = crop.float()
-            crop = (crop - torch.mean(crop)) / torch.std(crop)
-            resized = torchvision.transforms.Resize((380, 380))(crop)
-            #plt.imshow(resized.permute(1, 2, 0))
+            #resized1 = F.interpolate(crop, size=(380,380))
+
+            img = torchvision.transforms.Resize((380, 380))(crop)
+            #plt.imshow(img.permute(1, 2, 0))
             #plt.show()
 
-            resized = resized.unsqueeze(0).cuda()
-            _result = self.classification_model.predict(resized, None)[0]
+            img = img.flip(0)
+            #plt.imshow(img.permute(1, 2, 0))
+            #plt.show()
+
+            img = img.float()
+            mean = torch.Tensor([[[86.6589]], [[67.9274]], [[53.7833]]])
+            std = torch.Tensor([[[68.9897]], [[57.2049]], [[48.2306]]])
+            img = (img - mean) / std
+            #plt.imshow(img.permute(1, 2, 0))
+            #plt.show()
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            img = img.unsqueeze(0).to(device)
+            _result = self.classification_model.predict(img, None)[0]
             pred = _result.pred_label.item()
             labels.append(pred)
             scores.append(0.99)
@@ -108,10 +127,11 @@ def main():
 
     classification_model = classification_config(
        "configs/efficient_net.py",
-       "checkpoints/cross_even_tiniier/eff/epoch_700.pth"
+       "checkpoints/epoch_500.pth"
     )
 
     runner.model = Recognition(detection_model, classification_model)
+    runner.model.eval()
     runner.test()
 
 

@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="test recognition" type="PythonConfigurationType" factoryName="Python">
+  <configuration default="false" name="test recognition" type="PythonConfigurationType" factoryName="Python" singleton="false">
     <module name="cuneiform-ocr-3" />
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />
@@ -11,6 +11,7 @@
     <option name="IS_MODULE_SDK" value="true" />
     <option name="ADD_CONTENT_ROOTS" value="true" />
     <option name="ADD_SOURCE_ROOTS" value="true" />
+    <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/test.py" />
     <option name="PARAMETERS" value="configs/fcenet.py checkpoints/cross_even_tiniier/fcenet/epoch_800.pth" />
     <option name="SHOW_COMMAND_LINE" value="false" />

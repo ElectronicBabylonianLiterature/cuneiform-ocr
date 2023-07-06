@@ -8,11 +8,11 @@ import torchvision.transforms as T
 
 
 plt.rcParams["savefig.bbox"] = 'tight'
-orig_img = Image.open('astronaut.jpg')
+orig_img = Image.open('data/coco/val2017/P336009.jpg')
 transform = T.Compose([T.PILToTensor()])
 
 tensor = transform(orig_img)
-plt.imshow(tensor.permute(1, 2, 0))
+plt.imshow(tensor.flip(0).permute(1, 2, 0))
 plt.show()
 pass
 
