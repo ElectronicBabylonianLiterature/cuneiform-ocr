@@ -66,29 +66,11 @@ class Recognition(nn.Module):
         #self.cls = init_model("configs/efficient_net.py", "checkpoints/efficient_net/epoch_100.pth")
         self.detection_model = detection_model
         self.classification_model = classification_model
-        self.CLASSES = [
-            'ABZ579', 'ABZ13', 'ABZ342', 'ABZ70', 'ABZ461', 'ABZ142', 'ABZ480', 'ABZ1',
-            'ABZ231', 'ABZ533', 'ABZ449', 'ABZ318', 'ABZ75', 'ABZ61', 'ABZ354',
-            'ABZ139', 'ABZ381', 'ABZ597', 'ABZ536', 'ABZ308', 'ABZ330', 'ABZ328',
-            'ABZ86', 'ABZ15', 'ABZ214', 'ABZ545', 'ABZ73', 'ABZ295', 'ABZ55', 'ABZ335',
-            'ABZ371', 'ABZ151', 'ABZ457', 'ABZ537', 'ABZ69', 'ABZ353', 'ABZ68', 'ABZ5',
-            'ABZ296', 'ABZ84', 'ABZ366', 'ABZ411', 'ABZ396', 'ABZ206', 'ABZ58',
-            'ABZ324', 'ABZ376', 'ABZ99', 'ABZ384', 'ABZ59', 'ABZ532', 'ABZ334',
-            'ABZ589', 'ABZ383', 'ABZ343', 'ABZ586', 'ABZ399', 'ABZ74', 'ABZ211',
-            'ABZ145', 'ABZ7', 'ABZ212', 'ABZ78', 'ABZ367', 'ABZ38', 'ABZ319', 'ABZ85',
-            'ABZ115', 'ABZ322', 'ABZ97', 'ABZ144', 'ABZ112', 'ABZ427', 'ABZ60',
-            'ABZ207', 'ABZ79', 'ABZ80', 'ABZ232', 'ABZ142a', 'ABZ312', 'ABZ52',
-            'ABZ331', 'ABZ128', 'ABZ314', 'ABZ535', 'ABZ575', 'ABZ134', 'ABZ465',
-            'ABZ167', 'ABZ172', 'ABZ339', 'ABZ6', 'ABZ331e+152i', 'ABZ306', 'ABZ12',
-            'ABZ2', 'ABZ148', 'ABZ397', 'ABZ554', 'ABZ570', 'ABZ441', 'ABZ147',
-            'ABZ472', 'ABZ104', 'ABZ440', 'ABZ230', 'ABZ595', 'ABZ455', 'ABZ313',
-            'ABZ298', 'ABZ412', 'ABZ62', 'ABZ468', 'ABZ101', 'ABZ111', 'ABZ483',
-            'ABZ538', 'ABZ471', 'ABZ87', 'ABZ143', 'ABZ565', 'ABZ205', 'ABZ152',
-            'ABZ72', 'ABZ138', 'ABZ401', 'ABZ50', 'ABZ406', 'ABZ307', 'ABZ126',
-            'ABZ124', 'ABZ164', 'ABZ529', 'ABZ559', 'ABZ94', 'ABZ437', 'ABZ56',
-            'ABZ393', 'ABZ398', "No"
-        ]
-        self.CLASSES_CLASSIFICATION = ['ABZ1', 'ABZ101', 'ABZ104', 'ABZ111', 'ABZ112', 'ABZ115', 'ABZ12', 'ABZ124', 'ABZ126', 'ABZ128', 'ABZ13', 'ABZ134', 'ABZ138', 'ABZ139', 'ABZ142', 'ABZ142a', 'ABZ143', 'ABZ144', 'ABZ145', 'ABZ147', 'ABZ148', 'ABZ15', 'ABZ151', 'ABZ152', 'ABZ164', 'ABZ167', 'ABZ172', 'ABZ2', 'ABZ205', 'ABZ206', 'ABZ207', 'ABZ211', 'ABZ212', 'ABZ214', 'ABZ230', 'ABZ231', 'ABZ232', 'ABZ295', 'ABZ296', 'ABZ298', 'ABZ306', 'ABZ307', 'ABZ308', 'ABZ312', 'ABZ313', 'ABZ314', 'ABZ318', 'ABZ319', 'ABZ322', 'ABZ324', 'ABZ328', 'ABZ330', 'ABZ331', 'ABZ331e+152i', 'ABZ334', 'ABZ335', 'ABZ339', 'ABZ342', 'ABZ343', 'ABZ353', 'ABZ354', 'ABZ366', 'ABZ367', 'ABZ371', 'ABZ376', 'ABZ38', 'ABZ381', 'ABZ383', 'ABZ384', 'ABZ393', 'ABZ396', 'ABZ397', 'ABZ398', 'ABZ399', 'ABZ401', 'ABZ406', 'ABZ411', 'ABZ412', 'ABZ427', 'ABZ437', 'ABZ440', 'ABZ441', 'ABZ449', 'ABZ455', 'ABZ457', 'ABZ461', 'ABZ465', 'ABZ468', 'ABZ471', 'ABZ472', 'ABZ480', 'ABZ483', 'ABZ5', 'ABZ50', 'ABZ52', 'ABZ529', 'ABZ532', 'ABZ533', 'ABZ535', 'ABZ536', 'ABZ537', 'ABZ538', 'ABZ545', 'ABZ55', 'ABZ554', 'ABZ559', 'ABZ56', 'ABZ565', 'ABZ570', 'ABZ575', 'ABZ579', 'ABZ58', 'ABZ586', 'ABZ589', 'ABZ59', 'ABZ595', 'ABZ597', 'ABZ6', 'ABZ60', 'ABZ61', 'ABZ62', 'ABZ68', 'ABZ69', 'ABZ7', 'ABZ70', 'ABZ72', 'ABZ73', 'ABZ74', 'ABZ75', 'ABZ78', 'ABZ79', 'ABZ80', 'ABZ84', 'ABZ85', 'ABZ86', 'ABZ87', 'ABZ94', 'ABZ97', 'ABZ99', "No"]
+        self.CLASSES = ['ABZ579', 'ABZ13', 'ABZ342', 'ABZ70', 'ABZ461', 'ABZ480', 'ABZ142', 'ABZ1', 'ABZ231', 'ABZ533', 'ABZ449', 'ABZ318', 'ABZ75', 'ABZ61', 'ABZ381', 'ABZ354', 'ABZ139', 'ABZ597', 'ABZ536', 'ABZ308', 'ABZ330', 'ABZ328', 'ABZ15', 'ABZ86', 'ABZ214', 'ABZ545', 'ABZ73', 'ABZ295', 'ABZ55', 'ABZ335', 'ABZ371', 'ABZ537', 'ABZ457', 'ABZ68', 'ABZ151', 'ABZ69', 'ABZ353', 'ABZ5', 'ABZ366', 'ABZ296', 'ABZ411', 'ABZ84', 'ABZ396', 'ABZ206', 'ABZ58', 'ABZ376', 'ABZ324', 'ABZ99', 'ABZ384', 'ABZ59', 'ABZ532', 'ABZ334', 'ABZ589', 'ABZ145', 'ABZ383', 'ABZ586', 'ABZ343', 'ABZ74', 'ABZ399', 'ABZ212', 'ABZ211', 'ABZ7', 'ABZ78', 'ABZ367', 'ABZ38', 'ABZ319', 'ABZ115', 'ABZ85', 'ABZ322', 'ABZ207', 'ABZ144', 'ABZ112', 'ABZ97', 'ABZ427', 'ABZ60', 'ABZ79', 'ABZ80', 'ABZ52', 'ABZ312', 'ABZ142a', 'ABZ232', 'ABZ535', 'ABZ314', 'ABZ331', 'ABZ167', 'ABZ128', 'ABZ172', 'ABZ6', 'ABZ575', 'ABZ331e+152i', 'ABZ554', 'ABZ134', 'ABZ339', 'ABZ465', 'ABZ12', 'ABZ306', 'ABZ397', 'ABZ570', 'ABZ2', 'ABZ147', 'ABZ148', 'ABZ440', 'ABZ401', 'ABZ230', 'ABZ441', 'ABZ104', 'ABZ472', 'ABZ313', 'ABZ595', 'ABZ298', 'ABZ412', 'ABZ455', 'ABZ62', 'ABZ101', 'ABZ468', 'ABZ471', 'ABZ111', 'ABZ483', 'ABZ538', 'ABZ87', 'ABZ143', 'ABZ565', 'ABZ205', 'ABZ126', 'ABZ50', 'ABZ72', 'ABZ152', 'ABZ138', 'ABZ393', 'ABZ406', 'ABZ307', 'ABZ124', 'ABZ94', 'ABZ164', 'ABZ398', 'ABZ529', 'ABZ559', 'ABZ131', 'ABZ437', 'ABZ56', 'ABZ9', 'ABZ191']
+
+        self.CLASSES = [*self.CLASSES, "unknown"]
+        # this sorting is because thats the way the model was trained in mmcls
+        self.CLASSES_CLASSIFICATION = [*sorted(self.CLASSES), "unknown"]
         self.mapping = {self.CLASSES_CLASSIFICATION.index(a): self.CLASSES.index(a) for a in self.CLASSES_CLASSIFICATION }
 
 
@@ -158,7 +140,7 @@ def main():
 
     classification_model = classification_config(
        "configs/efficient_net.py",
-       "checkpoints/efficient_net/epoch_100.pth"
+       "checkpoints/efficient_net/final/epoch_400.pth"
     )
 
     runner.model = Recognition(detection_model, classification_model)
