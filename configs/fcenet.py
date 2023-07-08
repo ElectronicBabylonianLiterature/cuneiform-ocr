@@ -215,4 +215,4 @@ log_level = 'INFO'
 load_from = 'checkpoints/fcenet_split1.pth'
 resume = False
 launcher = 'none'
-work_dir = './work_dirs/mask-rcnn_r50_fpn_1x_coco'
+work_dir = './work_dirs/recognition'

@@ -31,3 +31,42 @@ metainfo = {
 }
 to config.
 - Replace all category ids in train2017.json with 0 
+
+
+error occurs at detection:
+    dataset = DATASETS.build(cfg.train_dataloader.dataset)
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/.venv/lib/python3.10/site-packages/mmengine/registry/registry.py", line 548, in build
+    return self.build_func(cfg, *args, **kwargs, registry=self)
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/.venv/lib/python3.10/site-packages/mmengine/registry/build_functions.py", line 144, in build_from_cfg
+    raise type(e)(
+ValueError: class `CocoDataset` in mmdet/datasets/coco.py: need at least one array to concatenate
+
+
+Is because the category ids is not correct either edit the json or the config file
+
+
+
+
+
+Error occurs at detection:
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/mmdetection/tools/analysis_tools/browse_dataset.py", line 89, in <module>
+    main()
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/mmdetection/tools/analysis_tools/browse_dataset.py", line 56, in main
+    for item in dataset:
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/.venv/lib/python3.10/site-packages/mmengine/dataset/base_dataset.py", line 413, in __getitem__
+    data = self.prepare_data(idx)
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/.venv/lib/python3.10/site-packages/mmengine/dataset/base_dataset.py", line 797, in prepare_data
+    return self.pipeline(data_info)
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/.venv/lib/python3.10/site-packages/mmengine/dataset/base_dataset.py", line 59, in __call__
+    data = t(data)
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/.venv/lib/python3.10/site-packages/mmcv/transforms/base.py", line 12, in __call__
+    return self.transform(results)
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/mmdetection/mmdet/datasets/transforms/loading.py", line 400, in transform
+    self._load_masks(results)
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/mmdetection/mmdet/datasets/transforms/loading.py", line 375, in _load_masks
+    gt_masks = self._process_masks(results)
+  File "/home/yunus/PycharmProjects/cuneiform-ocr-3/mmdetection/mmdet/datasets/transforms/loading.py", line 337, in _process_masks
+    gt_mask = instance['mask']
+KeyError: 'mask'
+
+replace "segmentation": [], with  "segmentation": [[1,1,2,2,3,3,4,4]],

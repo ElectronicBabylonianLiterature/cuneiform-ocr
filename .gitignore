@@ -11,3 +11,4 @@ work_dirs
 checkpoints_legacy
 *.pyc
 .idea
+data-recog

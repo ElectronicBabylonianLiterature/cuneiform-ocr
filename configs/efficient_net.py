@@ -53,7 +53,7 @@ env_cfg = dict(
 vis_backends = [dict(type='LocalVisBackend')]
 
 log_level = 'INFO'
-load_from = '/home/yunus/PycharmProjects/cuneiform-ocr-detection/checkpoints/epoch_500.pth'
+load_from = ''
 resume = False
 randomness = dict(seed=None, deterministic=False)
 optim_wrapper = dict(
@@ -64,103 +64,46 @@ train_cfg = dict(by_epoch=True, max_epochs=2500, val_interval=1000)
 val_cfg = dict()
 
 auto_scale_lr = dict(base_batch_size=128)
-num_classes = 222
 optimizer_config = dict(
     type='GradientCumulativeOptimizerHook', cumulative_iters=4)
 dataset_type = 'CustomDataset'
 data_preprocessor = dict(
-    mean=[124.508, 116.05, 106.438], std=[58.577, 57.31, 57.437], to_rgb=True)
-train_pipeline = [
-    dict(type='LoadImageFromFile'),
-    dict(type='EfficientNetCenterCrop', crop_size=380),
-    dict(type='RandomFlip', prob=0.25, direction='horizontal'),
-    dict(type='RandomFlip', prob=0.25, direction='vertical'),
-    dict(type='PackClsInputs')
-]
-test_pipeline = [
-    dict(type='LoadImageFromFile'),
-    dict(type='Resize', scale=380),
-    dict(type='PackClsInputs')
-]
+    mean=[86.65888836888392, 67.92744567921709, 53.78325960605914],
+    std=[68.98970994105028, 57.20489382979894, 48.230552014910586],
+    to_rgb=True)
 
 
-train_dataset = dict(
-    type='CustomDataset',
-    data_prefix='data/ebl/train_set/train_set',
-    classes=classes,
-    pipeline=[
-        dict(type='LoadImageFromFile'),
-        dict(type='EfficientNetCenterCrop', crop_size=380),
-        dict(type='RandomFlip', prob=0.25, direction='horizontal'),
-        dict(type='RandomFlip', prob=0.25, direction='vertical'),
-        dict(type='PackClsInputs')
-    ])
-train_dataloader = dict(
+
+test_dataloader = dict(
     pin_memory=True,
-    persistent_workers=True,
     collate_fn=dict(type='default_collate'),
-    batch_size=32,
-    num_workers=12,
-    dataset=dict(
-        type='ClassBalancedDataset',
-        dataset=dict(
-            type='CustomDataset',
-            data_prefix='data/ebl/train_set/train_set',
-            classes=classes,
-            pipeline=[
-                dict(type='LoadImageFromFile'),
-                dict(type='EfficientNetCenterCrop', crop_size=380),
-                dict(type='RandomFlip', prob=0.25, direction='horizontal'),
-                dict(type='RandomFlip', prob=0.25, direction='vertical'),
-                dict(type='PackClsInputs')
-            ]),
-        oversample_thr=0.001),
-    sampler=dict(type='DefaultSampler', shuffle=True))
-
-val_dataset = ({
-    'type':
-    'CustomDataset',
-    'data_prefix':
-    'data/ebl/test_set/test_set',
-    'classes': classes,
-    'pipeline': [{
-        'type': 'LoadImageFromFile'
-    }, {
-        'type': 'EfficientNetCenterCrop',
-        'crop_size': 380
-    }, {
-        'type': 'PackClsInputs'
-    }]
-}, )
-val_dataloader = dict(
-    pin_memory=True,
     persistent_workers=True,
-    collate_fn=dict(type='default_collate'),
-    batch_size=32,
+    batch_size=1,
     num_workers=12,
     dataset=dict(
         type='CustomDataset',
-        data_prefix='data/ebl/train_set/train_set',
+        data_prefix='data/ebl/test_set/test_set',
         classes=classes,
         pipeline=[
             dict(type='LoadImageFromFile'),
-            dict(type='EfficientNetCenterCrop', crop_size=380),
+            dict(type='Resize', scale=380),
             dict(type='PackClsInputs')
         ]),
     sampler=dict(type='DefaultSampler', shuffle=False))
 
-val_evaluator = [
+test_evaluator = [
     dict(type='Accuracy', topk=(1, 2, 3, 5)),
     dict(type='SingleLabelMetric', items=['precision', 'recall']),
     dict(type='AveragePrecision'),
     dict(type='MultiLabelMetric', average='macro'),
     dict(type='MultiLabelMetric', average='micro')
 ]
+train_dataloader = copy.deepcopy(test_dataloader)
+val_dataloader = copy.deepcopy(test_dataloader)
+val_evaluator = copy.deepcopy(test_evaluator)
 
 launcher = 'none'
 
-work_dir = "./" #'logs/efficient_net_1-reduced-lr'
+work_dir = "./logs"
 
-test_dataloader = copy.deepcopy(val_dataloader)
-test_evaluator = copy.deepcopy(val_evaluator)
 test_cfg = dict()
