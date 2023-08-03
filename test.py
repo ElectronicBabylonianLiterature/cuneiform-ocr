@@ -3,7 +3,7 @@ import shutil
 from random import random
 
 import matplotlib
-from mmcls import init_model, inference_model
+#from mmcls import init_model, inference_model
 
 matplotlib.use("tkAgg")
 import argparse
@@ -61,8 +61,8 @@ def classification_config(config, checkpoint):
 class Recognition(nn.Module):
     def __init__(self, detection_model, classification_model):
         super().__init__()
-        shutil.rmtree("debug")
-        os.mkdir("debug")
+        #shutil.rmtree("debug")
+        #os.mkdir("debug")
         #self.cls = init_model("configs/efficient_net.py", "checkpoints/efficient_net/epoch_100.pth")
         self.detection_model = detection_model
         self.classification_model = classification_model

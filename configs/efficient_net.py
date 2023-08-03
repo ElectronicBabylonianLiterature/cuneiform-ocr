@@ -1,5 +1,3 @@
-import copy
-
 custom_imports = dict(imports=['efficient_net'], allow_failed_imports=False)
 
 num_classes = 142
@@ -78,9 +76,9 @@ test_evaluator = [
     dict(type='MultiLabelMetric', average='macro'),
     dict(type='MultiLabelMetric', average='micro')
 ]
-train_dataloader = copy.deepcopy(test_dataloader)
-val_dataloader = copy.deepcopy(test_dataloader)
-val_evaluator = copy.deepcopy(test_evaluator)
+train_dataloader = test_dataloader
+val_dataloader = test_dataloader
+val_evaluator = test_evaluator
 
 launcher = 'none'
 
