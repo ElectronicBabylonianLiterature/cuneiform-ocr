@@ -1,5 +1,6 @@
 datasets/ebl_single/data
 checkpoints/mask_rcnn.pth
+data-coco-legacy
 .venv
 data
 checkpoints
