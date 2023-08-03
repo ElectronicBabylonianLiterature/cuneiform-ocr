@@ -19,14 +19,19 @@ pip install -v -e .
 ```
 
 
-## Check Installation
+## Check Installation with Coco2017 Dataset
 - Optional: Download Coco2017 Dataset (python tools/misc/download_dataset.py --dataset-name coco2017, see https://mmdetection.readthedocs.io/en/latest/user_guides/useful_tools.html#dataset-download) can take several hours
 - python3 mmdetection/tools/analysis_tools/browse_dataset.py configs/mask_rcnn.py
 - python3 mmdetection/tools/train.py configs/mask_rcnn.py
 - python3 mmdetection/tools/test.py configs/mask_rcnn.py checkpoints/mask_rcnn.pth
 
+## Ebl Dataset
+- place data-coco from https://github.com/ElectronicBabylonianLiterature/cuneiform-ocr-data in root and rename to data
+- run run runConfiguration/test_recognition.py
+
 ## For using browse_dataset or mmdetection only on detection (not classification or detection + classification)
-- Delete all classes in ...val2017.json rename to train2017.json, create train2017 folder next to val2017 folder
+- Delete all classes in data/annotations/val2017.json rename to train2017.json
+- create train2017 folder next to val2017 folder
 - Create one category in json:
  "categories": [
         {
@@ -42,7 +47,9 @@ metainfo = {
     ]
 }
 to config.
-- Replace all category ids in train2017.json with 0 
+- Replace all category ids in train2017.json with 0
+- Replace all `"segmentation": [],` in train2017.json with `"segmentation": [[1,1,2,2,3,3,4,4]],` run 
+- runConfiguration/test_detection.py or run runConfiguration/browse_dataset.py
 
 
 error occurs at detection:
