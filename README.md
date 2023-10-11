@@ -2,7 +2,7 @@
 - Use mmdetection for task (library is very buggy and in general would not recommend maybe port code to detectron2 someday)
 
 - Pytorch & Cuda
-- folder mmdetection (which is https://github.com/open-mmlab/mmdetection at commit: ecac3a77becc63f23d9f6980b2a36f86acd00a8a)
+- folder mmdetection (which is https://github.com/open-mmlab/mmdetection at commit: ecac3a77becc63f23d9f6980b2a36f86acd00a8a) is already downloaded !
 - Install dependencies for mmdet https://mmdetection.readthedocs.io/en/latest/get_started.html
  ```python
 pip install -U openmim
