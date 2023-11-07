@@ -28,8 +28,10 @@ pip install -v -e .
 - python3 mmdetection/tools/train.py configs/mask_rcnn.py
 - python3 mmdetection/tools/test.py configs/mask_rcnn.py checkpoints/mask_rcnn.pth
 
-## Ebl Dataset
-- place data-coco from https://github.com/ElectronicBabylonianLiterature/cuneiform-ocr-data in root and rename to data
+## Data and Checkpoints
+- download https://drive.google.com/drive/folders/18i2T1aIqqsJw4I7Geh3oreevOCvmSVZI?usp=sharing and place in root
+- cuneiform-ocr/checkpoints
+- cuneiform-ocr/data
 - run run runConfiguration/test_recognition.py
 
 ## For using browse_dataset or mmdetection only on detection (not classification or detection + classification)
