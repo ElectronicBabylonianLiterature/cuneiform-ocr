@@ -92,3 +92,15 @@ Error occurs at detection:
 KeyError: 'mask'
 
 replace "segmentation": [], with  "segmentation": [[1,1,2,2,3,3,4,4]],
+
+
+Traceback (most recent call last):
+  File "/home/yunus/PycharmProjects/cuneiform-text-detection/cuneiform-ocr/test.py", line 27, in <module>
+    from mmdet.engine.hooks.utils import trigger_visualization_hook
+  File "/home/yunus/PycharmProjects/cuneiform-text-detection/cuneiform-ocr/mmdetection/mmdet/__init__.py", line 17, in <module>
+    and mmcv_version < digit_version(mmcv_maximum_version)), \
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: MMCV==2.1.0 is used but incompatible. Please install mmcv>=2.0.0rc4, <2.1.0.
+
+
+Comment Out Assertion Statement

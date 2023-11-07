@@ -1,2 +1,1 @@
-shapely
-pyclipper
+scikit-learn
