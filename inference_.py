@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from urllib import parse
 
 import matplotlib
 import mmcv
@@ -51,7 +52,7 @@ def classification_config(config, checkpoint):
     return runner.model, classes
 
 
-def main():
+def create_model():
     args = parse_args()
     cfg = Config.fromfile(args.config)
 
@@ -79,23 +80,27 @@ def main():
 
     runner.model = Recognition(detection_model, classification_model, classes, cfg)
     runner.model.eval()
-    img = mmcv.imread('data/coco/val2017/BM.33016-0.jpg', channel_order='rgb')
-    result = inference_detector(runner.model, img)
-    # init the visualizer(execute this block only once)
-    from mmdet.registry import VISUALIZERS
-    visualizer = VISUALIZERS.build(runner.model.cfg.visualizer)
-    visualizer.add_datasample(
-        'result',
-        img,
-        data_sample=result,
-        draw_gt=False,
-        wait_time=0,
-    )
-    visualizer.show()
-    runner.test()
+    return runner.model
+
+import requests
+BASE_URL = "https://www.ebl.lmu.de/api/fragments"
+def download_image(url, filename):
+    respone = requests.get(url, stream=True)
+    respone.raw.decode_content = True
+    with open(filename, "wb") as outfile:
+        outfile.write(respone.content)
 
 
 if __name__ == '__main__':
-    main()
+    import fragments
+    model = create_model()
+    for fragment in fragments.FRAGMENTS:
+        _id = parse.quote(fragment)
+        print(fragment)
+        url = f"{BASE_URL}/{_id}/photo"
+        download_image(url, f"temp_images/{fragment}.jpg")
+        img = mmcv.imread(f"temp_images/{fragment}.jpg", channel_order='rgb')
+        result = inference_detector(model, img)
+        os.remove(f"temp_images/{fragment}.jpg")
 
 

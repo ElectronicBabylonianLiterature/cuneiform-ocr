@@ -1,10 +1,18 @@
 # models for extracting sign order from hotspot positions
 import numpy as np
 from sklearn.base import BaseEstimator, ClusterMixin
-from sklearn.linear_model import RANSACRegressor, Ridge
-import matplotlib.pyplot as plt
+from sklearn.linear_model import RANSACRegressor
 
 
+def line_detection(centroids, classes):
+    centroids = centroids.numpy()
+    try:
+        rns = SequentialRANSAC().fit(centroids)
+    except ValueError as e:
+        print(f"RANSAC failed")
+    points_ordered = [[centroids.tolist()[order] for order in ordering] for ordering in rns.ordering__]
+    ordering = [[classes[order] for order in order_list] for order_list in rns.ordering__]
+    return ordering, points_ordered
 def dist_to_line_2d(slope, intercept, point):
     return np.abs(-slope * point[0] + point[1] - intercept) / np.sqrt((slope**2 + 1))
 
