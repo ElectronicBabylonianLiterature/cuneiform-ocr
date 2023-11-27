@@ -1,4 +1,13 @@
 # model settings
+
+
+metainfo = {
+    'classes': ('null', ),
+    'palette': [
+        (220, 20, 60),
+    ]
+}
+
 model = dict(
     type='RetinaNet',
     data_preprocessor=dict(
@@ -26,7 +35,7 @@ model = dict(
         num_outs=5),
     bbox_head=dict(
         type='RetinaHead',
-        num_classes=80,
+        num_classes=len(metainfo['classes']),
         in_channels=256,
         stacked_convs=4,
         feat_channels=256,

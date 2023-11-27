@@ -15,3 +15,4 @@ checkpoints_legacy
 .idea
 data-recog
 data-detec
+mmdetection/data
