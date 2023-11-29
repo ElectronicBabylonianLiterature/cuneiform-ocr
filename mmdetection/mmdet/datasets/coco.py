@@ -13,7 +13,6 @@ from .base_det_dataset import BaseDetDataset
 @DATASETS.register_module()
 class CocoDataset(BaseDetDataset):
     """Dataset for COCO."""
-
     METAINFO = {
         'classes':
         ('HA', 'A', 'TA', 'PAP', 'MEŠ', 'UD', 'I', 'MU', 'UB', 'IGI', 'SA', 'DI', 'AŠ', 'RI', 'TI', 'ŠU₂', 'RU', 'MA', '|U.KA|', 'LU₂', 'BA', 'AN', 'NI', 'UnclearSign', 'ŠU', 'U', 'ŠA₃', 'KA', 'DIŠ', '|U.5(DIŠ)|', 'DU', 'GIŠ', 'KU', 'AD', 'TE', 'TAR', 'KI', 'GAR', 'UŠ', 'KAK', 'BAD', 'ZE₂', 'SAG', 'SI', 'BI', 'MI', 'NE', 'LUGAL', 'NA', 'HI', 'IM', 'BU', '|U.GUD|', 'A₂', 'EN', 'ZU', '|U.U|', 'U₂', 'RA', 'LU', 'TU', 'HU', 'KUR', 'IŠ', 'PA', 'IG', 'LI', '|I.A|', 'ŠA', 'E', 'PI', 'MAŠ', 'UR', 'DA', 'LA', 'MIN', 'SAL', 'KAL', 'NU', 'E₂', 'KU₃', 'ŠE', 'SU', 'DIN', 'GI', 'ME', 'GAL', 'ZI', 'TUR', 'UN', 'DIM₂', 'GA', 'URU', 'AK', 'TUM', 'SAR', '|U.U.U|', '|UD×(U.U.U)|', '|HI×BAD|', '|HI×AŠ₂|', 'ZA', 'ŠEŠ', 'KID', 'AB', '|3×AN|'),
@@ -40,6 +39,12 @@ class CocoDataset(BaseDetDataset):
          (196, 172, 0), (95, 54, 80), (128, 76, 255), (201, 57, 1),
          (246, 0, 122), (191, 162, 208)], *[(191, 10, 208) for _ in range(25)]]
     }
+    """
+    METAINFO = {
+        'classes': ('null',),
+        'palette': [(220, 20, 60)]
+    }
+    """
     COCOAPI = COCO
     # ann_id is unique in coco dataset.
     ANN_ID_UNIQUE = True
