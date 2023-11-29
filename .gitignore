@@ -15,3 +15,5 @@ checkpoints_legacy
 data-recog
 data-detec
 mmdetection/data
+mmdetection/data-det
+mmdetection/data-rec
