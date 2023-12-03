@@ -72,15 +72,19 @@ class Recognition(nn.Module):
         #result[0].img_path.split("/")[-1].split(".")[:-1]
         # generate random string for name
         name = "".join([str(int(random() * 100)) for _ in range(100)])
-        self.do_line_detection(_centroids, labels, name)
-        return result
+        signs = self.do_line_detection(_centroids, labels, name)
+        return signs
 
 
     def do_line_detection(self, _centroids, labels, name):
+        signs = []
         ordering, points_ordered = line_detection(torch.Tensor(_centroids), [self.CLASSES[label] for label in labels])
         # write ordering to file
         with open(f"inference_output/{name}_ordering.txt", "w") as f:
             for ordering_elem in ordering:
-                print(" ".join(ordering_elem))
+                string = " ".join(ordering_elem)
+                signs.append(string)
+                print(string)
                 f.write(" ".join(ordering_elem) + "\n")
             print("-"* 50)
+        return signs

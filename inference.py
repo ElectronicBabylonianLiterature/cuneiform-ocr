@@ -1,9 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from urllib import parse
-
 import matplotlib
 import mmcv
-
+from bleualign.align import Aligner
 from mmdet.apis import inference_detector
 from recognition_model import Recognition
 
@@ -13,6 +12,7 @@ matplotlib.use("tkAgg")
 import argparse
 import os
 import os.path as osp
+from pymongo import MongoClient
 
 from mmengine.config import Config
 from mmengine.runner import Runner
@@ -77,7 +77,7 @@ def create_model():
         "configs/efficient_net.py",
         "checkpoints/efficient_net/epoch_500.pth"
     )
-
+    print(classes)
     runner.model = Recognition(detection_model, classification_model, classes, cfg)
     runner.model.eval()
     return runner.model
@@ -94,13 +94,25 @@ def download_image(url, filename):
 if __name__ == '__main__':
     import fragments
     model = create_model()
-    for fragment in fragments.FRAGMENTS:
+    client  = MongoClient(fragments.CONNECTION)
+    database = client["ebl"]
+    fragmentarium = database["fragments"]
+  
+    for fragment in fragments.FRAGMENT:
+        
         _id = parse.quote(fragment)
         print(fragment)
         url = f"{BASE_URL}/{_id}/photo"
+        fragment_cursor = fragmentarium.find({"_id": _id}, {"signs":1})
+        for doc in fragment_cursor:
+            src = doc['signs']
+        src = src.split('\n')
         download_image(url, f"temp_images/{fragment}.jpg")
         img = mmcv.imread(f"temp_images/{fragment}.jpg", channel_order='rgb')
-        result = inference_detector(model, img)
+        pred = inference_detector(model, img)
+
+        print(pred)
+        print(src)
         os.remove(f"temp_images/{fragment}.jpg")
 
 
