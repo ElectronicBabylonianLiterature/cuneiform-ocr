@@ -2,10 +2,10 @@
 from urllib import parse
 import matplotlib
 import mmcv
-from bleualign.align import Aligner
+import json
 from mmdet.apis import inference_detector
 from recognition_model import Recognition
-
+from alignment import line_alignment
 # from mmcls import init_model, inference_model
 
 matplotlib.use("tkAgg")
@@ -98,7 +98,7 @@ if __name__ == '__main__':
     database = client["ebl"]
     fragmentarium = database["fragments"]
   
-    for fragment in fragments.FRAGMENT:
+    for fragment in fragments.FRAGMENTS:
         
         _id = parse.quote(fragment)
         print(fragment)
@@ -110,9 +110,10 @@ if __name__ == '__main__':
         download_image(url, f"temp_images/{fragment}.jpg")
         img = mmcv.imread(f"temp_images/{fragment}.jpg", channel_order='rgb')
         pred = inference_detector(model, img)
+        alignment_result = line_alignment(pred, src)
+        with open(f'alignment_results/{fragment}.json', 'w') as json_file:
+            json.dump(alignment_result, json_file)
 
-        print(pred)
-        print(src)
         os.remove(f"temp_images/{fragment}.jpg")
 
 
