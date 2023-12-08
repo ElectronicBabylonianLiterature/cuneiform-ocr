@@ -69,6 +69,14 @@ ValueError: class `CocoDataset` in mmdet/datasets/coco.py: need at least one arr
 Is because the category ids is not correct either edit the json or the config file
 
 
+## Baseline for automatic transliteration Alignment
+1. Train line detection model
+2. Assign each transliteration line to each detected line
+3. Train Object Localization model for sign localization
+4. Get location predictions for signs in detected lines
+5. Assign signs from transliteration line to predicted bounding boxes in detected lines
+
+### Line detection Model
 
 
 
