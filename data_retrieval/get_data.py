@@ -89,6 +89,7 @@ def group_signs_by_lines(signs, threshold):
         curr_center = calculate_center(*signs[i])
 
         distance = abs(curr_center[0] - prev_center[0])  # horizontal distance
+        print(distance)
 
         if distance < threshold:
             current_line.append(signs[i])
@@ -105,42 +106,49 @@ def group_signs_by_lines(signs, threshold):
 if __name__ == '__main__':
     client  = MongoClient(fragments.CONNECTION)
     database = client["ebl"]
+    images_id = 0
+    annotations_id = 0
     fragmentarium = database["fragments"]
     annotations = database["annotations"]
-    all_annotations = []
+    images = []
+    bbox_annotations = []
+    categories = [{"id": 0, "name" : "line"}]   
+
     with open('annotations.json', 'r') as file:
         finished_fragments = json.load(file)['finished']
         for fragment in tqdm.tqdm(finished_fragments):
+            images_id += 1
             print(fragment)
-            bbox_annotations = []
             url = f"{BASE_URL}/{fragment}/photo"
             download_image(url, f"data/{fragment}.jpeg")
+            image = read_image(f"data/{fragment}.jpeg")
             filename = f'{fragment}.jpeg'
             fragment_photo = read_image(f"data/{fragment}.jpeg")
             height, width = fragment_photo.shape[1], fragment_photo.shape[2]
+            image_instance = {"file_name": filename, "height": height, "width": width, "id": images_id}
+            images.append(image_instance)
             signs = get_annotations(annotations, fragment)
-            lines = group_signs_by_lines(signs, 10)
+            print(signs)
+            lines = group_signs_by_lines(signs, 2)
             union_bboxes = [calculate_union_bbox(line, height, width) for line in lines]
             # Filter out None values from the list
             filtered_bboxes = [bbox for bbox in union_bboxes if bbox is not None]
             for bbox in filtered_bboxes:
-                bbox = bbox[0]
-                bbox = {
-                    "x": int(bbox[0]),
-                    "y": int(bbox[1]),
-                    "width": int(bbox[2]),
-                    "height": int(bbox[3])
-                }
-                bbox_annotations.append(bbox)
-            image_data = {
-                "filename:": filename,
-                "width": width,
-                "height": height,
-                "annotations" : bbox_annotations
-            }
-            all_annotations.append(image_data)
+                image = draw_bounding_boxes(image, bbox, colors = (255,0,0), width=5)
+
+                annotations_id += 1
+                bbox = bbox[0].tolist()
+                bbox_instance = {"image_id": images_id, "category_id": 0, "bbox": bbox, "id": annotations_id}
+                bbox_annotations.append(bbox_instance)
+            img = ToPILImage()(image)
+            img.show()
+    coco_format = {
+        "images": images,
+        "annotations": bbox_annotations,
+        "categories": categories
+    }
     with open('line_annotations.json', 'w') as file:
-        json.dump(all_annotations, file, indent=4)
+        json.dump(coco_format, file, indent=4)
 
 
   
