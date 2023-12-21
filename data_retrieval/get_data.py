@@ -5,8 +5,10 @@ import fragments
 import json
 from PIL import Image
 import matplotlib.pyplot as plt
+from collections import Counter
 from torchvision.transforms.functional import crop
 from torchvision.transforms import ToTensor, ToPILImage
+import shutil
 from torchvision.io import read_image
 import torch
 from torchvision.utils import draw_bounding_boxes
@@ -72,7 +74,7 @@ def calculate_union_bbox(signs, height, width, shrink_factor=0.5, max_height = 3
     absolute_y = int(round(union_y / 100 * height))
     absolute_w = int(round(union_w / 100 * width))
     absolute_h = int(round(union_h / 100 * height))
-    bbox = [absolute_x, absolute_y, absolute_x + absolute_w, absolute_y + absolute_h]
+    bbox = [absolute_x, absolute_y, absolute_w, absolute_h]
     bbox = torch.tensor(bbox, dtype=torch.int)
     bbox = bbox.unsqueeze(0)
     return bbox
@@ -89,7 +91,6 @@ def group_signs_by_lines(signs, threshold):
         curr_center = calculate_center(*signs[i])
 
         distance = abs(curr_center[0] - prev_center[0])  # horizontal distance
-        print(distance)
 
         if distance < threshold:
             current_line.append(signs[i])
@@ -104,50 +105,47 @@ def group_signs_by_lines(signs, threshold):
 
 
 if __name__ == '__main__':
+    MODE = "test"
     client  = MongoClient(fragments.CONNECTION)
     database = client["ebl"]
     images_id = 0
     annotations_id = 0
     fragmentarium = database["fragments"]
+    lines_per_fragment = Counter()
     annotations = database["annotations"]
     images = []
     bbox_annotations = []
     categories = [{"id": 0, "name" : "line"}]   
 
-    with open('annotations.json', 'r') as file:
-        finished_fragments = json.load(file)['finished']
+    with open('annotations/train_fragments.json', 'r') as file:
+        finished_fragments = json.load(file)[MODE]
         for fragment in tqdm.tqdm(finished_fragments):
+            fragment = fragment[:-5]
             images_id += 1
-            print(fragment)
-            url = f"{BASE_URL}/{fragment}/photo"
-            download_image(url, f"data/{fragment}.jpeg")
-            image = read_image(f"data/{fragment}.jpeg")
             filename = f'{fragment}.jpeg'
-            fragment_photo = read_image(f"data/{fragment}.jpeg")
+            fragment_photo = read_image(f"data/CDLI_images/segments/{MODE}/{fragment}.jpeg")
             height, width = fragment_photo.shape[1], fragment_photo.shape[2]
             image_instance = {"file_name": filename, "height": height, "width": width, "id": images_id}
             images.append(image_instance)
             signs = get_annotations(annotations, fragment)
-            print(signs)
-            lines = group_signs_by_lines(signs, 2)
+            lines = group_signs_by_lines(signs, 10)
             union_bboxes = [calculate_union_bbox(line, height, width) for line in lines]
             # Filter out None values from the list
             filtered_bboxes = [bbox for bbox in union_bboxes if bbox is not None]
             for bbox in filtered_bboxes:
-                image = draw_bounding_boxes(image, bbox, colors = (255,0,0), width=5)
-
                 annotations_id += 1
                 bbox = bbox[0].tolist()
-                bbox_instance = {"image_id": images_id, "category_id": 0, "bbox": bbox, "id": annotations_id}
+                bbox_instance = {"image_id": images_id, "category_id": 0, "bbox": bbox, "id": annotations_id, "iscrowd": 0, "area" : bbox[2] * bbox[3]}
                 bbox_annotations.append(bbox_instance)
-            img = ToPILImage()(image)
-            img.show()
+            print(lines_per_fragment)
     coco_format = {
         "images": images,
         "annotations": bbox_annotations,
         "categories": categories
     }
-    with open('line_annotations.json', 'w') as file:
+
+
+    with open(f'annotations/{MODE}_line_annotations.json', 'w') as file:
         json.dump(coco_format, file, indent=4)
 
 
