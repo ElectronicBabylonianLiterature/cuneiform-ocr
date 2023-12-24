@@ -305,7 +305,7 @@ test_dataloader = dict(
                 meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
                            'scale_factor'))
         ]))
-
+"""
 val_evaluator = dict(
     type='CocoMetric',
     ann_file='data/coco/annotations/instances_val2017.json',
@@ -316,7 +316,7 @@ val_evaluator = dict(
     type='VOCMetric',
     iou_thrs=0.5,
 )
-"""
+
 
 test_evaluator = val_evaluator
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=12, val_interval=1)
