@@ -15,8 +15,8 @@ class CocoDataset(BaseDetDataset):
     """Dataset for COCO."""
     METAINFO = {
         'classes':
-        ('HA', 'A', 'TA', 'PAP', 'MEŠ', 'UD', 'I', 'MU', 'UB', 'IGI', 'SA', 'DI', 'AŠ', 'RI', 'TI', 'ŠU₂', 'RU', 'MA', '|U.KA|', 'LU₂', 'BA', 'AN', 'NI', 'UnclearSign', 'ŠU', 'U', 'ŠA₃', 'KA', 'DIŠ', '|U.5(DIŠ)|', 'DU', 'GIŠ', 'KU', 'AD', 'TE', 'TAR', 'KI', 'GAR', 'UŠ', 'KAK', 'BAD', 'ZE₂', 'SAG', 'SI', 'BI', 'MI', 'NE', 'LUGAL', 'NA', 'HI', 'IM', 'BU', '|U.GUD|', 'A₂', 'EN', 'ZU', '|U.U|', 'U₂', 'RA', 'LU', 'TU', 'HU', 'KUR', 'IŠ', 'PA', 'IG', 'LI', '|I.A|', 'ŠA', 'E', 'PI', 'MAŠ', 'UR', 'DA', 'LA', 'MIN', 'SAL', 'KAL', 'NU', 'E₂', 'KU₃', 'ŠE', 'SU', 'DIN', 'GI', 'ME', 'GAL', 'ZI', 'TUR', 'UN', 'DIM₂', 'GA', 'URU', 'AK', 'TUM', 'SAR', '|U.U.U|', '|UD×(U.U.U)|', '|HI×BAD|', '|HI×AŠ₂|', 'ZA', 'ŠEŠ', 'KID', 'AB', '|3×AN|'),
-        # palette is a list of color tuples, which is used for visualization.
+        ['LU₂', 'MU', 'NU', 'DIŠ', 'AN', 'UD', 'KUL', 'A', 'ŠU₂', 'GAR', 'AK', 'KI', 'UnclearSign', 'EN', 'ŠEŠ', 'MEŠ', 'BA', 'ŠID', 'U', 'AMAR', 'IGI', 'U₂', 'DIN', '|UD×(U.U.U)|', '|U.5(DIŠ)|', '|HI×BAD|', 'DU', 'HA', 'TA', 'PAP', 'I', 'GABA', 'SA', 'DI', 'AŠ', 'RI', 'TI', 'RU', 'MA', '|U.KA|', 'NI', 'ŠU', 'ŠA₃', 'KA', 'GIŠ', 'KU', 'AD', 'TE', 'TAR', 'UŠ', 'KAK', 'BAD', 'ZE₂', 'SAG', 'SI', 'BI', 'MI', 'NE', 'LUGAL', 'NA', 'HI', 'IM', 'BU', '|U.GUD|', 'A₂', 'ZU', '|U.U|', 'RA', 'MIN', 'DUN₃@g', 'PI', 'SAL', 'KAL', 'GI', 'KUR', 'ME', 'SU', 'E₂', 'KID', 'TUR', 'LA', 'ZA', 'DA', 'NAM', 'ZI', 'LU', 'E', 'ŠA', 'ŠE', 'GAL', 'LI', 'IB', 'DIM₂', 'GA', 'TUM', 'PA', 'HU', '|U.U.U|', 'MAŠ', 'GAN', 'TU', '|HI×AŠ₂|', 'KU₃', 'AB', 'IG', '|I.A|'],
+         # palette is a list of color tuples, which is used for visualization.
         'palette':
         [*[(220, 20, 60), (119, 11, 32), (0, 0, 142), (0, 0, 230), (106, 0, 228),
          (0, 60, 100), (0, 80, 100), (0, 0, 70), (0, 0, 192), (250, 170, 30),
@@ -37,7 +37,7 @@ class CocoDataset(BaseDetDataset):
          (166, 74, 118), (219, 142, 185), (79, 210, 114), (178, 90, 62),
          (65, 70, 15), (127, 167, 115), (59, 105, 106), (142, 108, 45),
          (196, 172, 0), (95, 54, 80), (128, 76, 255), (201, 57, 1),
-         (246, 0, 122), (191, 162, 208)], *[(191, 10, 208) for _ in range(25)]]
+         (246, 0, 122), (191, 162, 208)], *[(191, 10, 208) for _ in range(26)]]
     }
     """
     METAINFO = {

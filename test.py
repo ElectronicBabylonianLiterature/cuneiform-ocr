@@ -74,10 +74,11 @@ def main():
 
     classification_model, classes = classification_config(
         "configs/efficient_net.py",
-        "checkpoints/efficient_net/epoch_500.pth"
+        "checkpoints/efficient_net/epoch_200.pth"
     )
 
     runner.model = Recognition(detection_model, classification_model, classes, cfg)
+    """
     runner.model.eval()
     img = mmcv.imread('data/coco/val2017/BM.33016-0.jpg', channel_order='rgb')
     result = inference_detector(runner.model, img)
@@ -92,6 +93,7 @@ def main():
         wait_time=0,
     )
     visualizer.show()
+    """
     runner.test()
 
 

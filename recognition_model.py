@@ -72,7 +72,7 @@ class Recognition(nn.Module):
         #result[0].img_path.split("/")[-1].split(".")[:-1]
         # generate random string for name
         name = "".join([str(int(random() * 100)) for _ in range(100)])
-        self.do_line_detection(_centroids, labels, name)
+        #self.do_line_detection(_centroids, labels, name)
         return result
 
 
