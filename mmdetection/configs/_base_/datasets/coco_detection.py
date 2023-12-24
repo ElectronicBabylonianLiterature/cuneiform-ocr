@@ -22,6 +22,28 @@ train_pipeline = [
     dict(type='LoadImageFromFile', backend_args=backend_args),
     dict(type='LoadAnnotations', with_bbox=True),
     dict(type='Resize', scale=(1333, 800), keep_ratio=True),
+    dict(
+        type='RandomResize',
+        scale=(800, 800),
+        ratio_range=(0.75, 2.5),
+        keep_ratio=True),
+    dict(
+        type='RandomChoice',
+        transforms=[[{
+            'type': 'Resize',
+            'scale': 800,
+            'keep_ratio': True
+        }, {
+            'type': 'Pad',
+            'size': (800, 800)
+        }], {
+            'type': 'Resize',
+            'scale': 800,
+            'keep_ratio': False
+        }],
+        prob=[0.6, 0.4]),
+    dict(type='RandomFlip', prob=0.5, direction='horizontal'),
+    dict(type='RandomFlip', prob=0.5, direction='vertical'),
     dict(type='RandomFlip', prob=0.5),
     dict(type='PackDetInputs')
 ]

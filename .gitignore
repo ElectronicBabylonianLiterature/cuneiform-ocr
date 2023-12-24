@@ -10,8 +10,6 @@ work_dirs
 .idea
 *.pyc
 checkpoints_legacy
-*.pyc
-.idea
 data-recog
 data-detec
 mmdetection/data
