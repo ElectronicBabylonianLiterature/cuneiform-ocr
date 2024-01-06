@@ -163,7 +163,7 @@ class FCEPostprocessor(BaseTextDetPostProcessor):
         y_pred = reg_pred[:, :, 2 * self.fourier_degree + 1:]
 
         score_pred = (tr_pred[1]**self.alpha) * (tcl_pred[1]**self.beta)
-        tr_pred_mask = (score_pred) > self.score_thr
+        tr_pred_mask = (score_pred)  >  self.score_thr
         tr_mask = fill_hole(tr_pred_mask)
 
         tr_contours, _ = cv2.findContours(
