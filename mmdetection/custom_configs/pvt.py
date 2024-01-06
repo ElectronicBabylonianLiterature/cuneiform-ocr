@@ -1,19 +1,24 @@
-default_scope = 'mmdet'
+auto_scale_lr = dict(base_batch_size=16, enable=False)
+backend_args = None
+data_root = 'data/coco/'
+dataset_type = 'CocoDataset'
 
 default_hooks = dict(
-    timer=dict(type='IterTimerHook'),
-    logger=dict(type='LoggerHook', interval=50),
+    checkpoint=dict(interval=50, type='CheckpointHook'),
+    logger=dict(interval=50, type='LoggerHook'),
     param_scheduler=dict(type='ParamSchedulerHook'),
-    checkpoint=dict(type='CheckpointHook', interval=50),
     sampler_seed=dict(type='DistSamplerSeedHook'),
+    timer=dict(type='IterTimerHook'),
     visualization=dict(type='DetVisualizationHook'))
+
+default_scope = 'mmdet'
 
 env_cfg = dict(
     cudnn_benchmark=False,
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0),
     dist_cfg=dict(backend='nccl'),
 )
-
+launcher = 'none'
 vis_backends = [dict(type='LocalVisBackend')]
 visualizer = dict(
     type='DetLocalVisualizer', vis_backends=vis_backends, name='visualizer')
@@ -45,12 +50,6 @@ optim_wrapper = dict(
 #   - `enable` means enable scaling LR automatically
 #       or not by default.
 #   - `base_batch_size` = (8 GPUs) x (2 samples per GPU).
-auto_scale_lr = dict(enable=False, base_batch_size=16)
-
-# model settings
-# dataset settings
-dataset_type = 'CocoDataset'
-data_root = 'data/coco/'
 
 
 # Example to use different file client
@@ -66,7 +65,6 @@ data_root = 'data/coco/'
 #         './data/': 's3://openmmlab/datasets/detection/',
 #         'data/': 's3://openmmlab/datasets/detection/'
 #     }))
-backend_args = None
 
 albu_train_transforms = [
     dict(
@@ -240,69 +238,103 @@ val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
 
-
-
 model = dict(
-    type='RetinaNet',
-    data_preprocessor=dict(
-        type='DetDataPreprocessor',
-        mean=[123.675, 116.28, 103.53],
-        std=[58.395, 57.12, 57.375],
-        bgr_to_rgb=True,
-        pad_size_divisor=32),
     backbone=dict(
-        backbone=dict(
-        type='PyramidVisionTransformer',
-        num_layers=[2, 2, 2, 2],
-        init_cfg=dict(checkpoint='https://github.com/whai362/PVT/'
-                      'releases/download/v2/pvt_tiny.pth')),
+        init_cfg=dict(
+            checkpoint=
+            'https://github.com/whai362/PVT/releases/download/v2/pvt_tiny.pth'
+        ),
+        num_layers=[
+            2,
+            2,
+            2,
+            2,
+        ],
+        type='PyramidVisionTransformer'),
+    bbox_head=dict(
+        anchor_generator=dict(
+            octave_base_scale=4,
+            ratios=[
+                0.5,
+                1.0,
+                2.0,
+            ],
+            scales_per_octave=3,
+            strides=[
+                8,
+                16,
+                32,
+                64,
+                128,
+            ],
+            type='AnchorGenerator'),
+        bbox_coder=dict(
+            target_means=[
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            target_stds=[
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            ],
+            type='DeltaXYWHBBoxCoder'),
+        feat_channels=256,
+        in_channels=256,
+        loss_bbox=dict(loss_weight=1.0, type='L1Loss'),
+        loss_cls=dict(
+            alpha=0.25,
+            gamma=2.0,
+            loss_weight=1.0,
+            type='FocalLoss',
+            use_sigmoid=True),
+        num_classes=106,
+        stacked_convs=4,
+        type='RetinaHead'),
+    data_preprocessor=dict(
+        bgr_to_rgb=True,
+        mean=[
+            123.675,
+            116.28,
+            103.53,
+        ],
+        pad_size_divisor=32,
+        std=[
+            58.395,
+            57.12,
+            57.375,
+        ],
+        type='DetDataPreprocessor'),
     neck=dict(
-        type='FPN',
-        in_channels=[64, 128, 320, 512],
+        add_extra_convs='on_input',
+        in_channels=[
+            64,
+            128,
+            320,
+            512,
+        ],
+        num_outs=5,
         out_channels=256,
         start_level=1,
-        add_extra_convs='on_input',
-        num_outs=5),
-    bbox_head=dict(
-        type='RetinaHead',
-        num_classes=106,
-        in_channels=256,
-        stacked_convs=4,
-        feat_channels=256,
-        anchor_generator=dict(
-            type='AnchorGenerator',
-            octave_base_scale=4,
-            scales_per_octave=3,
-            ratios=[0.5, 1.0, 2.0],
-            strides=[8, 16, 32, 64, 128]),
-        bbox_coder=dict(
-            type='DeltaXYWHBBoxCoder',
-            target_means=[.0, .0, .0, .0],
-            target_stds=[1.0, 1.0, 1.0, 1.0]),
-        loss_cls=dict(
-            type='FocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
-            alpha=0.25,
-            loss_weight=1.0),
-        loss_bbox=dict(type='L1Loss', loss_weight=1.0)),
-    # model training and testing settings
-    train_cfg=dict(
-        assigner=dict(
-            type='MaxIoUAssigner',
-            pos_iou_thr=0.5,
-            neg_iou_thr=0.4,
-            min_pos_iou=0,
-            ignore_iof_thr=-1),
-        sampler=dict(
-            type='PseudoSampler'),  # Focal loss should use PseudoSampler
-        allowed_border=-1,
-        pos_weight=-1,
-        debug=False),
+        type='FPN'),
     test_cfg=dict(
-        nms_pre=1000,
+        max_per_img=100,
         min_bbox_size=0,
-        score_thr=0.05,
-        nms=dict(type='nms', iou_threshold=0.5),
-        max_per_img=100))
-)
+        nms=dict(iou_threshold=0.5, type='nms'),
+        nms_pre=1000,
+        score_thr=0.05),
+    train_cfg=dict(
+        allowed_border=-1,
+        assigner=dict(
+            ignore_iof_thr=-1,
+            min_pos_iou=0,
+            neg_iou_thr=0.4,
+            pos_iou_thr=0.5,
+            type='MaxIoUAssigner'),
+        debug=False,
+        pos_weight=-1,
+        sampler=dict(type='PseudoSampler')),
+    type='RetinaNet')
