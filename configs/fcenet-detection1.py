@@ -2,56 +2,80 @@ custom_imports= dict(imports=['fcenet'], allow_failed_imports=False)
 
 
 model = dict(
-    type="FCENet",
     backbone=dict(
-        type="ResNet",
         depth=50,
-        num_stages=4,
-        out_indices=(1, 2, 3),
         frozen_stages=-1,
-        norm_cfg=dict(type="BN", requires_grad=True),
-        init_cfg=dict(type="Pretrained", checkpoint="torchvision://resnet50"),
+        init_cfg=dict(checkpoint='torchvision://resnet50', type='Pretrained'),
+        norm_cfg=dict(requires_grad=True, type='BN'),
         norm_eval=True,
-        style="pytorch",
-        dcn=dict(type="DCNv2", deform_groups=2, fallback_on_stride=False),
-        stage_with_dcn=(False, True, True, True),
-    ),
-    neck=dict(
-        type="FPN",
-        in_channels=[512, 1024, 2048],
-        out_channels=256,
-        add_extra_convs="on_output",
-        num_outs=3,
-        relu_before_extra_convs=True,
-        act_cfg=None,
-    ),
-    det_head=dict(
-        type="FCEHead",
-        in_channels=256,
-        fourier_degree=5,
-        module_loss=dict(
-            type="FCEModuleLoss",
-            num_sample=50,
-            level_proportion_range=((0, 0.25), (0.2, 0.65), (0.55, 1.0)),
+        num_stages=4,
+        out_indices=(
+            1,
+            2,
+            3,
         ),
+        style='pytorch',
+        type='mmdet.ResNet'),
+    data_preprocessor=dict(
+        bgr_to_rgb=True,
+        mean=[
+            86.65888836888392,
+            67.92744567921709,
+            53.78325960605914,
+        ],
+        pad_size_divisor=32,
+        std=[
+            68.98970994105028,
+            57.20489382979894,
+            48.230552014910586,
+        ],
+        type='TextDetDataPreprocessor'),
+    det_head=dict(
+        fourier_degree=5,
+        in_channels=256,
+        module_loss=dict(
+            level_proportion_range=(
+                (
+                    0,
+                    0.25,
+                ),
+                (
+                    0.2,
+                    0.65,
+                ),
+                (
+                    0.55,
+                    1.0,
+                ),
+            ),
+            num_sample=50,
+            type='FCEModuleLoss'),
         postprocessor=dict(
-            type="FCEPostprocessor",
-            scales=(8, 16, 32),
-            text_repr_type="poly",
-            num_reconstr_points=50,
             alpha=1.0,
             beta=2.0,
+            num_reconstr_points=50,
+            scales=(
+                8,
+                16,
+                32,
+            ),
             score_thr=0.3,
-        ),
-    ),
-    data_preprocessor=dict(
-        type="TextDetDataPreprocessor",
-        mean=[86.65888836888392, 67.92744567921709, 53.78325960605914],
-        std=[68.98970994105028, 57.20489382979894, 48.230552014910586],
-        bgr_to_rgb=True,
-        pad_size_divisor=32,
-    ),
-)
+            text_repr_type='poly',
+            type='FCEPostprocessor'),
+        type='FCEHead'),
+    neck=dict(
+        act_cfg=None,
+        add_extra_convs='on_output',
+        in_channels=[
+            512,
+            1024,
+            2048,
+        ],
+        num_outs=3,
+        out_channels=256,
+        relu_before_extra_convs=True,
+        type='mmdet.FPN'),
+    type='FCENet')
 
 classes = ("null",)
 metainfo = {

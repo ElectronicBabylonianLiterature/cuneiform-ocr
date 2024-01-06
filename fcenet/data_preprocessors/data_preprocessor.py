@@ -6,6 +6,9 @@ import torch.nn as nn
 from mmdet.registry import MODELS
 from mmengine.model import ImgDataPreprocessor
 
+from utils import show_image
+
+
 @MODELS.register_module()
 class TextDetDataPreprocessor(ImgDataPreprocessor):
     """Image pre-processor for detection tasks.
@@ -83,6 +86,10 @@ class TextDetDataPreprocessor(ImgDataPreprocessor):
         """
         data = super().forward(data=data, training=training)
         inputs, data_samples = data['inputs'], data['data_samples']
+        # display image with is tensor [1,3,182272, 2272] and colors are inverted (require torch.flip)
+        #show_image(inputs)
+
+
 
         if data_samples is not None:
             batch_input_shape = tuple(inputs[0].size()[-2:])
