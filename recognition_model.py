@@ -51,7 +51,7 @@ class Recognition(nn.Module):
             x, y, w, h = list(map(int, [y, x, h, w]))
             _centroids.append([y + h / 2, x + w / 2])
 
-            crop = torchvision.transforms.functional.crop(data["inputs"][0], x, y, w, h)
+            crop = torchvision.transforms.functional.crop(data["inputs"][0], x-10, y-10, w+10, h+10)
             img = torchvision.transforms.Resize((380, 380))(crop)
             img = img.flip(0)
             img = img.float()

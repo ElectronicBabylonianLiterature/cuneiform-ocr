@@ -56,15 +56,16 @@ to config.
 - Replace all `"segmentation": [],` in train2017.json with `"segmentation": [[1,1,2,2,3,3,4,4]],` run 
 - runConfiguration/test_detection.py or run runConfiguration/browse_dataset.py
 
-
+## Bugs 
 error occurs at detection:
+```
     dataset = DATASETS.build(cfg.train_dataloader.dataset)
   File "/home/yunus/PycharmProjects/cuneiform-ocr-3/.venv/lib/python3.10/site-packages/mmengine/registry/registry.py", line 548, in build
     return self.build_func(cfg, *args, **kwargs, registry=self)
   File "/home/yunus/PycharmProjects/cuneiform-ocr-3/.venv/lib/python3.10/site-packages/mmengine/registry/build_functions.py", line 144, in build_from_cfg
     raise type(e)(
 ValueError: class `CocoDataset` in mmdet/datasets/coco.py: need at least one array to concatenate
-
+```
 
 Is because the category ids is not correct either edit the json or the config file
 
@@ -72,7 +73,8 @@ Is because the category ids is not correct either edit the json or the config fi
 
 
 
-Error occurs at detection:
+Error occurs at detection or browse_dataset.py:
+```
   File "/home/yunus/PycharmProjects/cuneiform-ocr-3/mmdetection/tools/analysis_tools/browse_dataset.py", line 89, in <module>
     main()
   File "/home/yunus/PycharmProjects/cuneiform-ocr-3/mmdetection/tools/analysis_tools/browse_dataset.py", line 56, in main
@@ -92,10 +94,10 @@ Error occurs at detection:
   File "/home/yunus/PycharmProjects/cuneiform-ocr-3/mmdetection/mmdet/datasets/transforms/loading.py", line 337, in _process_masks
     gt_mask = instance['mask']
 KeyError: 'mask'
-
+```
 replace "segmentation": [], with  "segmentation": [[1,1,2,2,3,3,4,4]],
 
-
+```
 Traceback (most recent call last):
   File "/home/yunus/PycharmProjects/cuneiform-text-detection/cuneiform-ocr/test.py", line 27, in <module>
     from mmdet.engine.hooks.utils import trigger_visualization_hook
@@ -103,6 +105,6 @@ Traceback (most recent call last):
     and mmcv_version < digit_version(mmcv_maximum_version)), \
         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 AssertionError: MMCV==2.1.0 is used but incompatible. Please install mmcv>=2.0.0rc4, <2.1.0.
-
+```
 
 Comment Out Assertion Statement

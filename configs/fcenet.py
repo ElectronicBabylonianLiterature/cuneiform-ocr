@@ -59,7 +59,7 @@ model = dict(
                 16,
                 32,
             ),
-            score_thr=0.3,
+            score_thr=0.7,
             text_repr_type='poly',
             type='FCEPostprocessor'),
         type='FCEHead'),
