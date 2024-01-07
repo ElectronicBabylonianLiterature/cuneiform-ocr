@@ -9,8 +9,9 @@ logs
 work_dirs
 .idea
 *.pyc
+datasets
 checkpoints_legacy
-data-recog
+datasets/data-recog
 data-detec
 mmdetection/data
 mmdetection/data-det

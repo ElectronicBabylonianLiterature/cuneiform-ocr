@@ -179,156 +179,48 @@ test_pipeline = [
         type='PackDetInputs'),
 ]
 train_cfg = dict(max_epochs=750, type='EpochBasedTrainLoop', val_interval=50)
-train_dataloader = dict(
-    batch_sampler=dict(type='AspectRatioBatchSampler'),
-    batch_size=2,
-    dataset=dict(
-        ann_file='annotations/instances_train2017.json',
-        backend_args=None,
-        data_prefix=dict(img='train2017/'),
-        data_root='data/coco/',
-        filter_cfg=dict(filter_empty_gt=False, min_size=32),
-        pipeline=[
-            dict(backend_args=None, type='LoadImageFromFile'),
-            dict(type='LoadAnnotations', with_bbox=True),
-            dict(prob=0.5, type='RandomFlip'),
+
+
+albu_train_transforms = [
+    dict(
+        type='ShiftScaleRotate',
+        shift_limit=0.0625,
+        scale_limit=0.0,
+        rotate_limit=0,
+        interpolation=1,
+        p=0.5),
+    dict(
+        type='RandomBrightnessContrast',
+        brightness_limit=[0.1, 0.3],
+        contrast_limit=[0.1, 0.3],
+        p=0.2),
+    dict(
+        type='OneOf',
+        transforms=[
             dict(
-                transforms=[
-                    [
-                        dict(
-                            keep_ratio=True,
-                            scales=[
-                                (
-                                    480,
-                                    1333,
-                                ),
-                                (
-                                    512,
-                                    1333,
-                                ),
-                                (
-                                    544,
-                                    1333,
-                                ),
-                                (
-                                    576,
-                                    1333,
-                                ),
-                                (
-                                    608,
-                                    1333,
-                                ),
-                                (
-                                    640,
-                                    1333,
-                                ),
-                                (
-                                    672,
-                                    1333,
-                                ),
-                                (
-                                    704,
-                                    1333,
-                                ),
-                                (
-                                    736,
-                                    1333,
-                                ),
-                                (
-                                    768,
-                                    1333,
-                                ),
-                                (
-                                    800,
-                                    1333,
-                                ),
-                            ],
-                            type='RandomChoiceResize'),
-                    ],
-                    [
-                        dict(
-                            keep_ratio=True,
-                            scales=[
-                                (
-                                    400,
-                                    4200,
-                                ),
-                                (
-                                    500,
-                                    4200,
-                                ),
-                                (
-                                    600,
-                                    4200,
-                                ),
-                            ],
-                            type='RandomChoiceResize'),
-                        dict(
-                            allow_negative_crop=True,
-                            crop_size=(
-                                384,
-                                600,
-                            ),
-                            crop_type='absolute_range',
-                            type='RandomCrop'),
-                        dict(
-                            keep_ratio=True,
-                            scales=[
-                                (
-                                    480,
-                                    1333,
-                                ),
-                                (
-                                    512,
-                                    1333,
-                                ),
-                                (
-                                    544,
-                                    1333,
-                                ),
-                                (
-                                    576,
-                                    1333,
-                                ),
-                                (
-                                    608,
-                                    1333,
-                                ),
-                                (
-                                    640,
-                                    1333,
-                                ),
-                                (
-                                    672,
-                                    1333,
-                                ),
-                                (
-                                    704,
-                                    1333,
-                                ),
-                                (
-                                    736,
-                                    1333,
-                                ),
-                                (
-                                    768,
-                                    1333,
-                                ),
-                                (
-                                    800,
-                                    1333,
-                                ),
-                            ],
-                            type='RandomChoiceResize'),
-                    ],
-                ],
-                type='RandomChoice'),
-            dict(type='PackDetInputs'),
+                type='RGBShift',
+                r_shift_limit=10,
+                g_shift_limit=10,
+                b_shift_limit=10,
+                p=1.0),
+            dict(
+                type='HueSaturationValue',
+                hue_shift_limit=20,
+                sat_shift_limit=30,
+                val_shift_limit=20,
+                p=1.0)
         ],
-        type='CocoDataset'),
-    num_workers=2,
-    persistent_workers=True,
-    sampler=dict(shuffle=True, type='DefaultSampler'))
+        p=0.1),
+    dict(type='JpegCompression', quality_lower=85, quality_upper=95, p=0.2),
+    dict(type='ChannelShuffle', p=0.1),
+    dict(
+        type='OneOf',
+        transforms=[
+            dict(type='Blur', blur_limit=3, p=1.0),
+            dict(type='MedianBlur', blur_limit=3, p=1.0)
+        ],
+        p=0.1),
+]
 train_pipeline = [
     dict(backend_args=None, type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
@@ -464,8 +356,51 @@ train_pipeline = [
             ],
         ],
         type='RandomChoice'),
+    dict(
+        type='RandomChoice',
+        transforms=[[
+            dict(
+                type='RandomCrop',
+                crop_type='absolute_range',
+                crop_size=(450, 600),
+                allow_negative_crop=True)],
+        []],
+        prob=[0.2, 0.8]),
+    dict(
+        type='Albu',
+        transforms=albu_train_transforms,
+        bbox_params=dict(
+            type='BboxParams',
+            format='pascal_voc',
+            label_fields=['gt_bboxes_labels', 'gt_ignore_flags'],
+            min_visibility=0.0,
+            filter_lost_elements=True),
+        keymap={
+            'img': 'image',
+            'gt_masks': 'masks',
+            'gt_bboxes': 'bboxes'
+        },
+        skip_img_without_anno=True),
+    dict(type='YOLOXHSVRandomAug'),
+    dict(type='RandomFlip', prob=0.5, direction='horizontal'),
+    dict(type='RandomFlip', prob=0.5, direction='vertical'),
+    dict(type='RandomFlip', prob=0.5),
     dict(type='PackDetInputs'),
 ]
+train_dataloader = dict(
+    batch_sampler=dict(type='AspectRatioBatchSampler'),
+    batch_size=2,
+    dataset=dict(
+        ann_file='annotations/instances_train2017.json',
+        backend_args=None,
+        data_prefix=dict(img='train2017/'),
+        data_root='data/coco/',
+        filter_cfg=dict(filter_empty_gt=False, min_size=32),
+        pipeline=train_pipeline,
+        type='CocoDataset'),
+    num_workers=2,
+    persistent_workers=True,
+    sampler=dict(shuffle=True, type='DefaultSampler'))
 val_cfg = dict(type='ValLoop')
 val_dataloader = dict(
     batch_size=1,
