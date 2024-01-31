@@ -1,5 +1,5 @@
 # Cuneiform OCR Data Preprocessing for Ebl Project (https://www.ebl.lmu.de/, https://github.com/ElectronicBabylonianLiterature
-## Data+Code is part of **Two-Stage Sign Detection for Cuneiform Tablets**
+## Data+Code is part of **Sign Detection for Cuneiform Tablets**
 
 ## Installation (for errors during installation see bottom of README.md)
 - Use mmdetection for task (library is very buggy and in general would not recommend maybe port code to detectron2 someday)
