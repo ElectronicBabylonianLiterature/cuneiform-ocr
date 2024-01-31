@@ -74,7 +74,7 @@ def main():
 
     classification_model, classes = classification_config(
         "configs/efficient_net.py",
-        "checkpoints/efficient_net/epoch_200.pth"
+        "checkpoints/efficient-net/efficient-net-24/epoch_300.pth"
     )
 
     runner.model = Recognition(detection_model, classification_model, classes, cfg)

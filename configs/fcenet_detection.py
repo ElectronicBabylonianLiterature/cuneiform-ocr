@@ -3,6 +3,7 @@ custom_imports= dict(imports=['fcenet'], allow_failed_imports=False)
 
 model = dict(
     backbone=dict(
+        dcn=dict(deform_groups=2, fallback_on_stride=False, type='DCNv2'),
         depth=50,
         frozen_stages=-1,
         init_cfg=dict(checkpoint='torchvision://resnet50', type='Pretrained'),
@@ -13,6 +14,12 @@ model = dict(
             1,
             2,
             3,
+        ),
+        stage_with_dcn=(
+            False,
+            True,
+            True,
+            True,
         ),
         style='pytorch',
         type='mmdet.ResNet'),
@@ -59,7 +66,7 @@ model = dict(
                 16,
                 32,
             ),
-            score_thr=0.7,
+            score_thr=0.3,
             text_repr_type='poly',
             type='FCEPostprocessor'),
         type='FCEHead'),
@@ -76,7 +83,6 @@ model = dict(
         relu_before_extra_convs=True,
         type='mmdet.FPN'),
     type='FCENet')
-
 
 metainfo = {
     'classes': ('null', ),
