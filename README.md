@@ -1,5 +1,5 @@
 # Cuneiform OCR Data Preprocessing for Ebl Project (https://www.ebl.lmu.de/, https://github.com/ElectronicBabylonianLiterature
-## Data+Code is part of Paper **Sign Detection for Cuneiform Tablets** please contact us for access to data on Zenodoo and paper as it is under currently under review.
+Data+Code is part of Paper **Sign Detection for Cuneiform Tablets** please contact us for access to data on Zenodoo and paper as it is under currently under review.
 
 
 ## Installation (for errors during installation see bottom of README.md)
