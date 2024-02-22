@@ -1,5 +1,6 @@
 # Cuneiform OCR Data Preprocessing for Ebl Project (https://www.ebl.lmu.de/, https://github.com/ElectronicBabylonianLiterature
-## Data+Code is part of **Sign Detection for Cuneiform Tablets**
+## Data+Code is part of Paper **Sign Detection for Cuneiform Tablets** please contact us for access to data on Zenodoo and paper as it is under currently under review.
+
 
 ## Installation (for errors during installation see bottom of README.md)
 - Use mmdetection for task (library is very buggy and in general would not recommend maybe port code to detectron2 someday)
@@ -28,11 +29,24 @@ pip install -v -e .
 - python3 mmdetection/tools/train.py configs/mask_rcnn.py
 - python3 mmdetection/tools/test.py configs/mask_rcnn.py checkpoints/mask_rcnn.pth
 
-## Data and Checkpoints
-- download https://drive.google.com/drive/folders/18i2T1aIqqsJw4I7Geh3oreevOCvmSVZI?usp=sharing and place in root
-- cuneiform-ocr/checkpoints
-- cuneiform-ocr/data
-- run run runConfiguration/test_recognition.py
+## Data and Checkpoints Two-Stage Model
+Data [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10693501.svg)](https://doi.org/10.5281/zenodo.10693501) download ready-for-training.tar.gz
+
+To evaluate two-stage model place coco-two-stage/data to cuneiform-ocr/data
+
+Checkpoints of efficient-net and fcenet have to downloaded and placed into checkpoints. cuneiform-ocr/config contains now similar configs as the ones downloaded from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10693501.svg)](https://doi.org/10.5281/zenodo.10693501) but no exactly the same. The config are adapted to work with mmdetection library. Originally fcenet is trained with mmocr and efficient-net with mmpretrain (previously mmcls). The configs in the zenodoo repository are configs from precisely those configs (mmocr/mmpretrain). The corresponding configs in  cuneiform-ocr/config are variants of those configs compatible with mmdetection. In case you train a new two-stage model and you want to evaluate it you have to make sure to copy paste the parts to cuneiform-ocr/config from the configs from mmocr/mmpretrain to make sure you can evaluate it. Subtle bugs (for example evaluation doesn't work because there is no data passed to the model) can happen if there are some errors. The main part in the modified config in cuneiform-ocr/config is the "model" section. Copying that from the mmocr/mmpretrain configs should be enough to that it can be used for two-stage evaluation in mmdetection. Also note that many models contains a threshold score like FCENET which has to be manually set to a value which has the maximum F1-Score to maximize performance.
+
+- To run evaluation on two-stage run cuneiform-ocr/test.py and pass configs + checkpoints (fcenet config and checkpoint as cli and efficient-net config and checkpoint in code)
+- For debugging, useful to use cuneiform-ocr/mmdetection/tools/analysis_tools/browse_dataset.py to display images + annotations after training pipeline transformation have been applied
+- recognition_model.py is the model which combines the two stage and performs line detection based on Ransac Regression Model
+- inference.py uses the two-stage model and ebl-ai public api to download images and create .txt output using the OCR Model and Line Detection
+  
+## Data and Checkpoints Single-Stage Model
+- To train single-stage detection place coco-recognition/data into cuneiform-ocr/mmdetection/data
+- Download detr-2024 config and checkpoint
+- Run cuneiform-ocr/mmdetection/tools/test.py
+
+Training and testing the single-stage model is just an application of mmdetection library. (One could also create a new repository just using mmdetection (make sure it is same version as here, please do not try to use newer version as library is very buggy and not likely not backward compatible) to train and test the single-stage model)
 
 ## For using browse_dataset or mmdetection only on detection (not classification or detection + classification)
 - Delete all classes in data/annotations/val2017.json rename to train2017.json
