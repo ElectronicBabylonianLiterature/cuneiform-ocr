@@ -1,6 +1,39 @@
 # Cuneiform OCR Data Preprocessing for Ebl Project (https://www.ebl.lmu.de/, https://github.com/ElectronicBabylonianLiterature
 Data+Code is part of Paper **Sign Detection for Cuneiform Tablets from Yunus Cobanoglu, Luis Sáenz, Ilya Khait, Enrique Jiménez** please contact us for access to data on Zenodoo [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10693601.svg)](https://doi.org/10.5281/zenodo.10693601) and paper as it is under currently under review.
 
+# General Information
+
+The Code and Data ([![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10693601.svg)](https://doi.org/10.5281/zenodo.10693601))  is used together with the following Github Repositories and deployed partially with the [eBL](https://www.ebl.lmu.de/) platform and part of the [eBL Organization on Github](https://github.com/ElectronicBabylonianLiterature).
+
+## Github Repositories
+
+### [cuneiform-ocr-data](https://github.com/ElectronicBabylonianLiterature/cuneiform-ocr-data)
+
+requires `raw-data` and `processed-data` and will convert the data in a ready for training format which is also available as `ready-for-training` here.
+
+ready-for-training contains:
+- coco-two-stage
+- coco-recognition
+- icdar2015
+- icdar2015-deebscripe
+- classification.tar
+
+### [cuneiform-ocr-classification-detection](https://github.com/ElectronicBabylonianLiterature/cuneiform-ocr-classification-detection)
+
+- requires  either `icdar2015` or `icdar2015-deebscribe` to train detection model or classification.tar to train classification model
+- requires checkpoints fcenet and efficient-net
+- may require pretrained weights for fcenet and efficient-net which can be download according to [mmocr](https://github.com/open-mmlab/mmocr) or [mmpretrain](https://github.com/open-mmlab/mmpretrain) documentation
+
+
+### [cuneiform-ocr](https://github.com/ElectronicBabylonianLiterature/cuneiform-ocr)
+
+- requires `coco-two-stage` for evaluating two-stage model or `coco-recognition` to train single-stage model
+- requires checkpoint detr for single-stage model
+
+### [ebl-ai-api](https://github.com/ElectronicBabylonianLiterature/ebl-ai-api)
+
+- requires checkpoint `ebl-ai-api` for only detection model (fcenet) and deployement in [eBL](https://www.ebl.lmu.de/)
+
 
 ## Installation (for errors during installation see bottom of README.md)
 - Use mmdetection for task (library is very buggy and in general would not recommend maybe port code to detectron2 someday)
