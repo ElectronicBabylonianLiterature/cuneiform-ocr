@@ -65,7 +65,7 @@ pip install -v -e .
 ## Single Stage Model and Two-Stage Model Setups (Important)
 For Two-Stage: in configs file (like `configs/fcenet.py`) `metainfo` is the field where the classes are specified. The final model output is a number which correspond to `sorted(classes)`. Metainfo will be copied over to `cuneiform-ocr/mmdetection/mmdet/datasets/coco.py` classes and palette (palette are the colored that the bounding boxes are displayed in).Classes are also specified in config/efficient_net.py
 
-For Single-Stage: Theoretically single stage setup for classes should work the same but it doesn't which seems like a bug. So metainfo from `mmdetection/custom_configs/detr.py` will not be copied over so you have to manually copy the classes to `cuneiform-ocr/mmdetection/mmdet/datasets/coco.py`. The classes are determined in the train_instances.json and test_instances.json (at the bottom) from the data folder (data-recognition).
+For Single-Stage: Theoretically single stage setup for classes should work the same but it doesn't which seems like a bug in mmdetection. So metainfo from `mmdetection/custom_configs/detr.py` will not be copied over so you have to manually copy the classes to `cuneiform-ocr/mmdetection/mmdet/datasets/coco.py`. The classes are determined in the train_instances.json and test_instances.json (at the bottom) from the data folder (data-recognition).
 
 ## Data and Checkpoints Two-Stage Model
 Data [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10693501.svg)](https://doi.org/10.5281/zenodo.10693501) download ready-for-training.tar.gz
