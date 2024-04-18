@@ -44,7 +44,7 @@ ready-for-training contains:
  ```python
 pip install -U openmim
 mim install mmengine
-`mim install "mmcv>=2.0.0"`
+mim install "mmcv>=2.0.0"
 ```
 - mmdetection is installed as in Step 1.a) in the link above
 ```python
