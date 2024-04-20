@@ -18,7 +18,7 @@ launcher = 'none'
 load_from = None
 log_level = 'INFO'
 log_processor = dict(by_epoch=True, type='LogProcessor', window_size=50)
-max_epochs = 750
+max_epochs = 1000
 model = dict(
     as_two_stage=True,
     backbone=dict(
@@ -116,7 +116,7 @@ param_scheduler = [
     dict(
         begin=0,
         by_epoch=True,
-        end=750,
+        end=max_epochs,
         gamma=0.1,
         milestones=[
             40,
@@ -178,7 +178,7 @@ test_pipeline = [
         ),
         type='PackDetInputs'),
 ]
-train_cfg = dict(max_epochs=750, type='EpochBasedTrainLoop', val_interval=50)
+train_cfg = dict(max_epochs=max_epochs, type='EpochBasedTrainLoop', val_interval=50)
 train_dataloader = dict(
     batch_sampler=dict(type='AspectRatioBatchSampler'),
     batch_size=2,
