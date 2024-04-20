@@ -366,6 +366,7 @@ train_pipeline = [
                 allow_negative_crop=True)],
         []],
         prob=[0.2, 0.8]),
+    """
     dict(
         type='Albu',
         transforms=albu_train_transforms,
@@ -381,6 +382,7 @@ train_pipeline = [
             'gt_bboxes': 'bboxes'
         },
         skip_img_without_anno=True),
+    """
     dict(type='YOLOXHSVRandomAug'),
     dict(type='RandomFlip', prob=0.5, direction='horizontal'),
     dict(type='RandomFlip', prob=0.5, direction='vertical'),
