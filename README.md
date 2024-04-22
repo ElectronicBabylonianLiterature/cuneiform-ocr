@@ -86,6 +86,12 @@ Checkpoints of efficient-net and fcenet have to downloaded and placed into check
 
 Training and testing the single-stage model is just an application of mmdetection library. (One could also create a new repository just using mmdetection (make sure it is same version as here, please do not try to use newer version as library is very buggy and not likely not backward compatible) to train and test the single-stage model)
 
+## Inference Single-Stage Model
+To inference Single-Stage Model do the following steps:
+* Download detr_more_transformations.py config and its checkpoint epoch_1000.pth from  [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10693501.svg)](https://doi.org/10.5281/zenodo.10693501)
+* Create folder checkpoint_config in the main directory, put config and checkpoint there
+* Run [Inference](https://github.com/ElectronicBabylonianLiterature/cuneiform-ocr/blob/main/inference_single_stage.ipynb)
+
 ## For using browse_dataset or mmdetection only on detection (not classification or detection + classification)
 - Delete all classes in data/annotations/val2017.json rename to train2017.json
 - create train2017 folder next to val2017 folder
