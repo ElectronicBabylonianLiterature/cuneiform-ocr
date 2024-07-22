@@ -1,5 +1,6 @@
-# Cuneiform OCR Data Preprocessing for [eBL Project](https://www.ebl.lmu.de/)
-Data+Code is part of Paper **Sign Detection for Cuneiform Tablets from Yunus Cobanoglu, Luis Sáenz, Ilya Khait, Enrique Jiménez** please contact us for access to data on Zenodo [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10693601.svg)](https://doi.org/10.5281/zenodo.10693601) and paper as it is under currently under review.
+# Cuneiform OCR for [eBL Project](https://www.ebl.lmu.de/)
+Data+Code is part of Paper [Sign Detection for Cuneiform Tablets from Yunus Cobanoglu, Luis Sáenz, Ilya Khait, Enrique Jiménez](https://www.degruyter.com/document/doi/10.1515/itit-2024-0028/html). <br/>
+Data on Zenodo [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10693601.svg)](https://doi.org/10.5281/zenodo.10693601).
 
 # General Information
 
@@ -166,3 +167,17 @@ AssertionError: MMCV==2.1.0 is used but incompatible. Please install mmcv>=2.0.0
 ```
 
 Comment Out Assertion Statement
+
+## Cite this paper
+```
+@article{CobanogluSáenzKhaitJiménez+2024,
+url = {https://doi.org/10.1515/itit-2024-0028},
+title = {Sign detection for cuneiform tablets},
+title = {},
+author = {Yunus Cobanoglu and Luis Sáenz and Ilya Khait and Enrique Jiménez},
+journal = {it - Information Technology},
+doi = {doi:10.1515/itit-2024-0028},
+year = {2024},
+lastchecked = {2024-06-01}
+}
+```
