@@ -181,3 +181,28 @@ year = {2024},
 lastchecked = {2024-06-01}
 }
 ```
+
+## 09.2025 Models
+The single stage model has been retrained in September 2025 following the original training procedure described in the "Data and Checkpoints Single-Stage Model" section. The model was trained using the configuration in `configs/detr.py` for 1000 epochs.
+The training dataset consisted of 1610 images of cuneiform tablets, with 1510 images used for training and 100 images reserved for testing.
+The retrained model checkpoint can be downloaded from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17223829.svg)](https://doi.org/10.5281/zenodo.17223829).
+
+The test results are as follow:
+
+```
+DONE (t=0.38s).
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.243
+ Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=1000 ] = 0.423
+ Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=1000 ] = 0.263
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=1000 ] = -1.000
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=1000 ] = 0.132
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=1000 ] = 0.260
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.299
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=300 ] = 0.299
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=1000 ] = 0.299
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=1000 ] = -1.000
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=1000 ] = 0.141
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=1000 ] = 0.321
+09/29 14:59:45 - mmengine - INFO - bbox_mAP_copypaste: 0.243 0.423 0.263 -1.000 0.132 0.260
+09/29 14:59:45 - mmengine - INFO - Epoch(test) [100/100]    coco/bbox_mAP: 0.2430  coco/bbox_mAP_50: 0.4230  coco/bbox_mAP_75: 0.2630  coco/bbox_mAP_s: -1.0000  coco/bbox_mAP_m: 0.1320  coco/bbox_mAP_l: 0.2600  data_time: 0.1616  time: 0.3406
+```
