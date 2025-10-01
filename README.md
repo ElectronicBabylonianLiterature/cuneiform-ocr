@@ -183,7 +183,9 @@ lastchecked = {2024-06-01}
 ```
 
 ## 09.2025 Models
-The single stage model has been retained in September 2025. The model checkpoint can be download from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17223829.svg)](https://doi.org/10.5281/zenodo.17223829).
+The single stage model has been retrained in September 2025 following the original training procedure described in the "Data and Checkpoints Single-Stage Model" section. The model was trained using the configuration in `configs/detr.py` for 1000 epochs.
+The training dataset consisted of 1610 images of cuneiform tablets, with 1510 images used for training and 100 images reserved for testing.
+The retrained model checkpoint can be downloaded from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17223829.svg)](https://doi.org/10.5281/zenodo.17223829).
 
 The test results are as follow:
 
