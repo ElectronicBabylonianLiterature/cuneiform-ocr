@@ -17,3 +17,7 @@ mmdetection/data
 mmdetection/data-det
 mmdetection/data-rec
 imgs/
+*/.ipynb_checkpoints/
+.vscode/
+valid_fragments.json
+log_*.log
