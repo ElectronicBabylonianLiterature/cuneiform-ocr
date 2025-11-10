@@ -18,7 +18,7 @@ Image.MAX_IMAGE_PIXELS = None
 # get thresholds and tag from environment variables
 tag = os.getenv('TAG', '0')
 THRESHOLD_CERTAIN = float(os.getenv('THRESHOLD', '0.8'))
-Y_THRESHOLD = int(os.getenv('Y_THRESHOLD', '35'))   
+Y_THRESHOLD = int(os.getenv('Y_THRESHOLD', '35'))
 
 if __name__ == "__main__":
     client = MongoClient("YOUR_MONGODB_URI")
@@ -65,14 +65,15 @@ if __name__ == "__main__":
             # Convert binary data to image and save as PNG
             try:
                 image = Image.open(io.BytesIO(binary_data))
-                image.save(f"{filename}")
+                filename_save = tag + filename
+                image.save(f"{filename_save}")
             except UnidentifiedImageError as e:
                 print(f"Skipping file {filename}: Image cannot be identified - {str(e)}")
                 continue  # Skip to the next file if the image is invalid
 
-            img = mmcv.imread(f"{filename}")
+            img = mmcv.imread(f"{filename_save}")
             cropped_images, crop_coordinates = divide_tablet_photo(img, visualize=False, logging=False, return_coordinates=True)
-            
+
             def line_signs(sorted_indexed_bounding_boxes, labels, classes):
                 lines = []
                 current_line = []
@@ -121,11 +122,11 @@ if __name__ == "__main__":
                 indexed_bounding_boxes = list(enumerate(certain_bboxes))
                 sorted_indexed_bounding_boxes = sorted(indexed_bounding_boxes, key=lambda item: (item[1][1], item[1][0]))
                 lined_signs, bounding_boxes_of_one_piece = line_signs(sorted_indexed_bounding_boxes, labels, classes)
-                
+
                 # Convert bounding boxes from small piece coordinates to original image coordinates
                 piece_offset_x = crop_coordinates[idx]['x']
                 piece_offset_y = crop_coordinates[idx]['y']
-                
+
                 # Transform each bbox to original image coordinates
                 transformed_bboxes = []
                 for bbox in bounding_boxes_of_one_piece:
@@ -137,7 +138,7 @@ if __name__ == "__main__":
                         bbox[3] + piece_offset_y   # y2
                     ]
                     transformed_bboxes.append(transformed_bbox)
-                
+
                 line_signs_results += lined_signs
                 bounding_boxes.extend(transformed_bboxes)
 
@@ -146,13 +147,13 @@ if __name__ == "__main__":
                 "filename": filename,
                 "ocredSignsCoordinates": bounding_boxes
             })
-            os.remove(filename)
+            os.remove(filename_save)
             count += 1
             if count in checkpoints:
                 with open(output_file_name, "w") as json_file:
                     json.dump(output_data, json_file, indent=4)
                 print(f"Checkpoint: Processed {count} files, saved to {output_file_name} " +  info)
-        
+
         except Exception as e:
             print(f"Skipping file {filename} due to error: {str(e)}")
             continue  # Skip the file and move to the next one in case of any error
