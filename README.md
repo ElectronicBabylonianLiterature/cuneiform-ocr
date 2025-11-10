@@ -79,7 +79,7 @@ Checkpoints of efficient-net and fcenet have to downloaded and placed into check
 - For debugging, useful to use cuneiform-ocr/mmdetection/tools/analysis_tools/browse_dataset.py to display images + annotations after training pipeline transformation have been applied
 - recognition_model.py is the model which combines the two stage and performs line detection based on Ransac Regression Model
 - inference.py uses the two-stage model and ebl-ai public api to download images and create .txt output using the OCR Model and Line Detection
-  
+
 ## Data and Checkpoints Single-Stage Model
 - To train single-stage detection place coco-recognition/data into cuneiform-ocr/mmdetection/data
 - Download detr-2024 config and checkpoint
@@ -103,7 +103,7 @@ To inference Single-Stage Model do the following steps:
             "name": "null"
         }]
 
-- add: 
+- add:
 metainfo = {
     'classes': ('null', ),
     'palette': [
@@ -112,10 +112,10 @@ metainfo = {
 }
 to config.
 - Replace all category ids in train2017.json with 0
-- Replace all `"segmentation": [],` in train2017.json with `"segmentation": [[1,1,2,2,3,3,4,4]],` run 
+- Replace all `"segmentation": [],` in train2017.json with `"segmentation": [[1,1,2,2,3,3,4,4]],` run
 - runConfiguration/test_detection.py or run runConfiguration/browse_dataset.py
 
-## Bugs 
+## Bugs
 error occurs at detection:
 ```
     dataset = DATASETS.build(cfg.train_dataloader.dataset)
@@ -182,27 +182,48 @@ lastchecked = {2024-06-01}
 }
 ```
 
-## 09.2025 Models
-The single stage model has been retrained in September 2025 following the original training procedure described in the "Data and Checkpoints Single-Stage Model" section. The model was trained using the configuration in `configs/detr.py` for 1000 epochs.
-The training dataset consisted of 1610 images of cuneiform tablets, with 1510 images used for training and 100 images reserved for testing.
-The retrained model checkpoint can be downloaded from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17223829.svg)](https://doi.org/10.5281/zenodo.17223829).
+## 10.2025 Models
 
-The test results are as follow:
+The single-stage model has been retrained in October 2025 following the original training procedure described in the "Data and Checkpoints Single-Stage Model" section.
 
+### Training Overview
+
+Due to dataset growth, two separate models were trained with different numbers of sign classes: a 173-class model (trained for 1000 epochs) and a 106-class model (trained for 960 epochs). Both models were trained using the configuration in `configs/detr.py`. The training dataset consisted of 1610 images of cuneiform tablets, with 1510 images used for training and 100 images reserved for testing.
+
+The retrained models checkpoints can be downloaded from [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17395154.svg)](https://doi.org/10.5281/zenodo.17395154).
+
+### 173-Class Model Test Results
 ```
-DONE (t=0.38s).
- Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.243
- Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=1000 ] = 0.423
- Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=1000 ] = 0.263
- Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=1000 ] = -1.000
- Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=1000 ] = 0.132
- Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=1000 ] = 0.260
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.299
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=300 ] = 0.299
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=1000 ] = 0.299
- Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=1000 ] = -1.000
- Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=1000 ] = 0.141
- Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=1000 ] = 0.321
-09/29 14:59:45 - mmengine - INFO - bbox_mAP_copypaste: 0.243 0.423 0.263 -1.000 0.132 0.260
-09/29 14:59:45 - mmengine - INFO - Epoch(test) [100/100]    coco/bbox_mAP: 0.2430  coco/bbox_mAP_50: 0.4230  coco/bbox_mAP_75: 0.2630  coco/bbox_mAP_s: -1.0000  coco/bbox_mAP_m: 0.1320  coco/bbox_mAP_l: 0.2600  data_time: 0.1616  time: 0.3406
+Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.265
+Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=1000 ] = 0.431
+Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=1000 ] = 0.302
+Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=1000 ] = -1.000
+Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=1000 ] = 0.131
+Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=1000 ] = 0.282
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.316
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=300 ] = 0.316
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=1000 ] = 0.316
+Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=1000 ] = -1.000
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=1000 ] = 0.140
+Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=1000 ] = 0.336
+10/18 12:59:17 - mmengine - INFO - bbox_mAP_copypaste: 0.265 0.431 0.302 -1.000 0.131 0.282
+10/18 12:59:17 - mmengine - INFO - Epoch(test) [100/100]    coco/bbox_mAP: 0.2650  coco/bbox_mAP_50: 0.4310  coco/bbox_mAP_75: 0.3020  coco/bbox_mAP_s: -1.0000  coco/bbox_mAP_m: 0.1310  coco/bbox_mAP_l: 0.2820  data_time: 0.0432  time: 0.4047
+```
+
+### 106-Class Model Test Results
+```
+Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.271
+Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=1000 ] = 0.454
+Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=1000 ] = 0.292
+Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=1000 ] = -1.000
+Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=1000 ] = 0.128
+Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=1000 ] = 0.292
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.325
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=300 ] = 0.325
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=1000 ] = 0.325
+Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=1000 ] = -1.000
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=1000 ] = 0.140
+Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=1000 ] = 0.349
+10/18 13:14:08 - mmengine - INFO - bbox_mAP_copypaste: 0.271 0.454 0.292 -1.000 0.128 0.292
+10/18 13:14:08 - mmengine - INFO - Epoch(test) [100/100]    coco/bbox_mAP: 0.2710  coco/bbox_mAP_50: 0.4540  coco/bbox_mAP_75: 0.2920  coco/bbox_mAP_s: -1.0000  coco/bbox_mAP_m: 0.1280  coco/bbox_mAP_l: 0.2920  data_time: 0.0385  time: 0.1442
 ```
