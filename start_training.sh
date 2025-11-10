@@ -8,20 +8,20 @@ set -x
 cd $HOME
 ls -la
 export PATH=$HOME/.local/bin:$PATH
-export PYTHONPATH=$HOME/cuneiform-ocr/mmdetection:$PYTHONPATH
+export PYTHONPATH=$HOME/erc-src/cuneiform-ocr/mmdetection:$PYTHONPATH
 pip install "numpy<2.0.0"
 
 # Create symlinks
-cd ~/cuneiform-ocr/
-ls -alh ~/cuneiform-ocr/
+cd ~/erc-src/cuneiform-ocr/
+ls -alh ~/erc-src/cuneiform-ocr/
 
-cd ~/cuneiform-ocr/mmdetection
+cd ~/erc-src/cuneiform-ocr/mmdetection
 rm data
 COCO_DATA="${COCO_DATA:-$HOME/ready-for-training/coco-recognition/data}"
 ln -s $COCO_DATA data
 echo "using COCO data from $COCO_DATA"
 sleep 2
-ls -alh ~/cuneiform-ocr/mmdetection
+ls -alh ~/erc-src/cuneiform-ocr/mmdetection
 
 # Verify installation
 python -c "import torch; print(torch.__version__)"
@@ -38,7 +38,7 @@ echo "Using $GPU_COUNT GPUs"
 # export CUDA_LAUNCH_BLOCKING=1
 
 # Run training
-cd ~/cuneiform-ocr/
+cd ~/erc-src/cuneiform-ocr
 cd mmdetection
 if [ $GPU_COUNT -gt 1 ]; then
     # multi-GPU training

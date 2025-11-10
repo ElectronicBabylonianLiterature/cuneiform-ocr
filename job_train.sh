@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p lrz-dgx-a100-80x8 
+#SBATCH -p lrz-v100x2  
 #SBATCH --gres=gpu:1
 #SBATCH -o log_%j.log                   # File to store standard output
 #SBATCH -e log_%j.log                   # File to store standard error
@@ -9,27 +9,15 @@
 echo "Start on $(hostname) at $(date)"  # Run outside of srun
 
 export PATH=$HOME/.local/bin:$PATH
-export PYTHONPATH=$HOME/cuneiform-ocr/mmdetection:$PYTHONPATH
+export PYTHONPATH=$HOME/erc-src/cuneiform-ocr/mmdetection:$PYTHONPATH
 
-cd $HOME/cuneiform-ocr/
+cd $HOME/erc-src/cuneiform-ocr/
 
 srun set_up_env.sh        # Run inside of srun
 
 # === setup training data ===
 
 export COCO_DATA= # path to COCO data, e.g. $HOME/ready-for-training/coco-recognition/data
-
-# =======================
-
-
-echo "Start on $(hostname) at $(date)"  # Run outside of srun
-
-export PATH=$HOME/.local/bin:$PATH
-export PYTHONPATH=$HOME/cuneiform-ocr/mmdetection:$PYTHONPATH
-
-cd $HOME/cuneiform-ocr/
-
-srun set_up_env.sh        # Run inside of srun
 
 # === download data ===
 # cd $HOME
@@ -38,7 +26,7 @@ srun set_up_env.sh        # Run inside of srun
 # git checkout re-train-ocr-model
 # git pull
 
-export COCO_DATA=$HOME/coco-recognitioin-2025-09-25/data-coco
+export COCO_DATA=$HOME/erc-work-data/coco-recognition-2025-09/data/
 # =======================
 
 

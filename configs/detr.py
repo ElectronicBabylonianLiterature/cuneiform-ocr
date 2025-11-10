@@ -49,7 +49,7 @@ backend_args = None
 data_root = 'data/coco/'
 dataset_type = 'CocoDataset'
 default_hooks = dict(
-    checkpoint=dict(interval=50, type='CheckpointHook'),
+    checkpoint=dict(interval=10, type='CheckpointHook'),
     logger=dict(interval=50, type='LoggerHook'),
     param_scheduler=dict(type='ParamSchedulerHook'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
@@ -90,7 +90,7 @@ model = dict(
             type='FocalLoss',
             use_sigmoid=True),
         loss_iou=dict(loss_weight=2.0, type='GIoULoss'),
-        num_classes=106,
+        num_classes=173,
         sync_cls_avg_factor=True,
         type='DeformableDETRHead'),
     data_preprocessor=dict(
@@ -224,10 +224,10 @@ test_pipeline = [
         ),
         type='PackDetInputs'),
 ]
-train_cfg = dict(max_epochs=1000, type='EpochBasedTrainLoop', val_interval=50)
+train_cfg = dict(max_epochs=1000, type='EpochBasedTrainLoop', val_interval=10)
 train_dataloader = dict(
     batch_sampler=dict(type='AspectRatioBatchSampler'),
-    batch_size=8,
+    batch_size=2,
     dataset=dict(
         ann_file='annotations/instances_train2017.json',
         backend_args=None,
