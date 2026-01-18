@@ -8,11 +8,14 @@ import os
 import requests
 import numpy as np
 import cv2
-from PIL import Image
+from typing import List, Dict
+from PIL import Image, ImageDraw, ImageFont
 from pymongo import MongoClient
 from mmdet.apis import init_detector, inference_detector
 from mmdet.utils import register_all_modules
 from data_processing.divide_photos import divide_tablet_photo
+
+from abc import ABC, abstractmethod
 
 # Allow large image processing
 Image.MAX_IMAGE_PIXELS = None
@@ -127,47 +130,90 @@ def parse_api_signs(signs_text):
             lines.append(line_signs)
     return lines
 
+
+
 # ============ Detection ============
-def detect_signs(model, img):
-    """Run detection model on image, return filtered detections"""
-    cropped_images, crop_coordinates = divide_tablet_photo(img, visualize=False, logging=False, return_coordinates=True)
+class BaseDetector(ABC):
+    def __init__(self, model, classes: List[str], score_threshold: float = 0.5):
+        self.model = model
+        self.classes = classes
+        self.score_threshold = score_threshold
     
-    all_detections = []
-    for idx, img_piece in enumerate(cropped_images):
-        result = inference_detector(model, img_piece)
+    @abstractmethod
+    def detect(self, img) -> List[Dict]:
+        pass
+    
+    def _filter_detections(self, labels, bboxes, scores) -> List[Dict]:
+        mask = scores > self.score_threshold
+        labels = labels[mask]
+        bboxes = bboxes[mask]
+        scores = scores[mask]
+        
+        detections = []
+        for i in range(len(labels)):
+            bbox = bboxes[i]
+            abz_name = self.classes[labels[i]]
+            sign_name = abz_to_sign_name(abz_name)
+            detections.append({
+                'bbox': [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+                'abz_name': abz_name,
+                'sign_name': sign_name,
+                'score': float(scores[i])
+            })
+        
+        return detections
+
+class SingleImageDetector(BaseDetector):
+    def detect(self, img) -> List[Dict]:
+        result = inference_detector(self.model, img)
         OCR_result = result.pred_instances.cpu()
         
         labels = OCR_result['labels'].numpy()
         bboxes = OCR_result['bboxes'].numpy()
         scores = OCR_result['scores'].numpy()
         
-        # Filter by score
-        mask = scores > SCORE_THRESHOLD
-        labels = labels[mask]
-        bboxes = bboxes[mask]
-        scores = scores[mask]
+        return self._filter_detections(labels, bboxes, scores)
+
+class TabletImageDetector(BaseDetector):
+    def __init__(self, model, classes: List[str], score_threshold: float = 0.5, 
+                 visualize_crop: bool = False, logging_crop: bool = False):
+        super().__init__(model, classes, score_threshold)
+        self.visualize_crop = visualize_crop
+        self.logging_crop = logging_crop
+    
+    def detect(self, img) -> List[Dict]:
+        cropped_images, crop_coordinates = divide_tablet_photo(
+            img, 
+            visualize=self.visualize_crop, 
+            logging=self.logging_crop, 
+            return_coordinates=True
+        )
         
-        # Transform to original image coordinates
-        piece_offset_x = crop_coordinates[idx]['x']
-        piece_offset_y = crop_coordinates[idx]['y']
+        # Create single image detector for processing cropped pieces
+        single_detector = SingleImageDetector(self.model, self.classes, self.score_threshold)
         
-        for i in range(len(labels)):
-            bbox = bboxes[i]
-            abz_name = CLASSES[labels[i]]
-            sign_name = abz_to_sign_name(abz_name)
-            all_detections.append({
-                'bbox': [
+        all_detections = []
+        
+        # Process each cropped piece
+        for idx, img_piece in enumerate(cropped_images):
+            # Use SingleImageDetector to detect signs in the cropped piece
+            piece_detections = single_detector.detect(img_piece)
+            
+            # Transform to original image coordinates
+            piece_offset_x = crop_coordinates[idx]['x']
+            piece_offset_y = crop_coordinates[idx]['y']
+            
+            for det in piece_detections:
+                bbox = det['bbox']
+                det['bbox'] = [
                     bbox[0] + piece_offset_x,
                     bbox[1] + piece_offset_y,
                     bbox[2] + piece_offset_x,
                     bbox[3] + piece_offset_y
-                ],
-                'sign_name': sign_name,
-                'abz_name': abz_name,
-                'score': float(scores[i])
-            })
-    
-    return all_detections
+                ]
+                all_detections.append(det)
+        
+        return all_detections
 
 def group_detections_into_lines(detections):
     """Group detections into lines based on y-coordinate"""
@@ -313,51 +359,119 @@ def align_signs(detected_lines, text_lines, avg_width, avg_height):
     return aligned_signs
 
 # ============ Visualization ============
-def draw_boxes(img, boxes, color, label_key='sign_name'):
-    """Draw bounding boxes on image"""
-    img_vis = img.copy()
-    for box in boxes:
-        bbox = box['bbox']
-        if bbox is None:
-            continue
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        cv2.rectangle(img_vis, (x1, y1), (x2, y2), color, 2)
-        label = box.get(label_key, '')
-        cv2.putText(img_vis, label[:10], (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    return img_vis
+class BboxVisualizer:
+    def __init__(self, boxes_color=(0, 255, 0)):
+        self.boxes_color = boxes_color
+        self.label_key = 'sign_name'
+        self.color_func = None
+        self.visualized_result = None
+
+    def draw_boxes(self, img, boxes):
+        img_vis = img.copy()
+        
+        # First, draw all rectangles using OpenCV
+        for box in boxes:
+            bbox = box['bbox']
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            
+            # Determine color: use color_func if provided, otherwise use default color
+            box_color = self.color_func(box) if self.color_func else self.boxes_color
+            box_color = tuple(reversed(box_color))  # Convert RGB to BGR for OpenCV
+            
+            # Draw rectangle using OpenCV (BGR color)
+            cv2.rectangle(img_vis, (x1, y1), (x2, y2), box_color, 2)
+        
+        # Convert to PIL for text drawing (supports Unicode)
+        img_pil = Image.fromarray(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        
+        # Try to load a Unicode-supporting font, fallback to default
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 90)
+        except:
+            font = ImageFont.load_default()
+        
+        # Draw labels using PIL
+        for box in boxes:
+            bbox = box['bbox']
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            
+            # Draw label using PIL (RGB color, supports Unicode)
+            label = box.get(self.label_key, '')[:10]
+            if label:
+                # Get text size
+                bbox_text = draw.textbbox((0, 0), label, font=font)
+                text_width = bbox_text[2] - bbox_text[0]
+                text_height = bbox_text[3] - bbox_text[1]
+                
+                # Draw black background
+                draw.rectangle([x1, y1-text_height-10, x1+text_width+4, y1-2], fill=(0, 0, 0))
+                # Draw white text
+                draw.text((x1+2, y1-text_height-8), label, font=font, fill=(255, 255, 255))
+        
+        # Convert back to OpenCV format
+        img_vis = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        self.visualized_result = img_vis
+        return img_vis
+    
+    def display_result(self, vis_opt = "save", path=None):
+        # vis_opt: "save" or "show"
+        if vis_opt == "show" and self.visualized_result is not None:
+            cv2.imshow('Visualization', self.visualized_result)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        elif vis_opt == "save" and self.visualized_result is not None:
+            if path is None:
+                print("visualization path not provided, saving to 'visualization_result.jpg'")
+                path = 'visualization_result.jpg'
+            cv2.imwrite(path, self.visualized_result)
+        else:
+            print("No visualization result to display or save.")
+
+class TextVisualizer:
+    def __init__(self, text_lines):
+        self.text_lines = text_lines
+    def write_text_file(self, filepath, fragment_id):
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(f"Fragment: {fragment_id}\n")
+            f.write("=" * 50 + "\n")
+            f.write("Text lines (converted from ABZ to sign names):\n")
+            for i, line in enumerate(self.text_lines):
+                f.write(f"Line {i+1}: {' '.join(line)}\n")
+
 
 def visualize_results(fragment_id, img, gt_boxes, detections, text_lines, aligned_signs, output_dir):
     """Create and save visualization results"""
     os.makedirs(output_dir, exist_ok=True)
     
+    
     # 1. Ground truth boxes
     if gt_boxes:
-        vis_gt = draw_boxes(img, gt_boxes, (0, 255, 0))  # green
+        bbox_visualizer = BboxVisualizer(boxes_color=(0, 255, 0))
+        vis_gt = bbox_visualizer.draw_boxes(img, gt_boxes)  # green
         cv2.imwrite(os.path.join(output_dir, f"{fragment_id}_1_ground_truth.jpg"), vis_gt)
     
     # 2. Detection results
-    vis_det = draw_boxes(img, detections, (255, 0, 0))  # blue
+    bbox_visualizer = BboxVisualizer(boxes_color=(255, 0, 0))
+    vis_det = bbox_visualizer.draw_boxes(img, detections)  # blue
     cv2.imwrite(os.path.join(output_dir, f"{fragment_id}_2_detections.jpg"), vis_det)
     
     # 3. Print text conversion (ABZ -> sign names)
-    text_file = os.path.join(output_dir, f"{fragment_id}_3_text_conversion.txt")
-    with open(text_file, 'w') as f:
-        f.write(f"Fragment: {fragment_id}\n")
-        f.write("=" * 50 + "\n")
-        f.write("Text lines (converted from ABZ to sign names):\n")
-        for i, line in enumerate(text_lines):
-            f.write(f"Line {i+1}: {' '.join(line)}\n")
+    text_visualizer = TextVisualizer(text_lines)
+    text_filepath = os.path.join(output_dir, f"{fragment_id}_3_text_signs.txt")
+    text_visualizer.write_text_file(text_filepath, fragment_id)
     
     # 4. Aligned bounding boxes
-    aligned_with_boxes = [s for s in aligned_signs if s['bbox'] is not None]
     # Color: located=blue, interpolated=red
-    vis_aligned = img.copy()
-    for sign in aligned_with_boxes:
-        bbox = sign['bbox']
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        color = (0, 0, 255) if sign.get('interpolated') else (255, 0, 0)  # red for interpolated, blue for located
-        cv2.rectangle(vis_aligned, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(vis_aligned, sign['sign_name'][:8], (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    def get_aligned_color(sign):
+        return (0, 0, 255) if sign.get('interpolated') else (255, 0, 0)
+    
+    bbox_visualizer = BboxVisualizer(color_func=get_aligned_color)
+    vis_aligned = bbox_visualizer.draw_boxes(img, aligned_signs, label_key='sign_name')
     cv2.imwrite(os.path.join(output_dir, f"{fragment_id}_4_aligned.jpg"), vis_aligned)
     
     print(f"Saved visualizations to {output_dir}/{fragment_id}_*.jpg/txt")
@@ -392,7 +506,8 @@ def process_fragment(model, fragment_id):
     print(f"  Text lines: {len(text_lines)}, total signs: {total_text_signs}")
     
     # Detect signs
-    detections = detect_signs(model, img)
+    detector = TabletImageDetector(model, CLASSES, SCORE_THRESHOLD, visualize_crop=False, logging_crop=False)
+    detections = detector.detect(img)
     print(f"  Detected signs (score > {SCORE_THRESHOLD}): {len(detections)}")
     
     # Compute average dimensions
