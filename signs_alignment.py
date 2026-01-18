@@ -6,9 +6,11 @@ Aligns detected signs with unlocated text signs from ebl API.
 import json
 import os
 import requests
+import copy
 import numpy as np
 import cv2
 from typing import List, Dict
+from dataclasses import dataclass, field
 from PIL import Image, ImageDraw, ImageFont
 from pymongo import MongoClient
 from mmdet.apis import init_detector, inference_detector
@@ -16,6 +18,7 @@ from mmdet.utils import register_all_modules
 from data_processing.divide_photos import divide_tablet_photo
 
 from abc import ABC, abstractmethod
+import matplotlib.pyplot as plt
 
 # Allow large image processing
 Image.MAX_IMAGE_PIXELS = None
@@ -174,14 +177,29 @@ class SingleImageDetector(BaseDetector):
         
         return self._filter_detections(labels, bboxes, scores)
 
+
+@dataclass
+class SingleImage:
+    img: np.ndarray
+    detections: List[Dict] = field(default_factory=list)
+    
+    def __len__(self):
+        return len(self.detections)
+
+
 class TabletImageDetector(BaseDetector):
     def __init__(self, model, classes: List[str], score_threshold: float = 0.5, 
-                 visualize_crop: bool = False, logging_crop: bool = False):
+                 visualize_crop: bool = False, logging_crop: bool = False, keep_crops: bool = False):
         super().__init__(model, classes, score_threshold)
         self.visualize_crop = visualize_crop
         self.logging_crop = logging_crop
+        self.keep_crops = keep_crops
+        self.cropped_images = []  
     
     def detect(self, img) -> List[Dict]:
+        if self.keep_crops:
+            self.cropped_images = [] # reset cropped for each detection
+
         cropped_images, crop_coordinates = divide_tablet_photo(
             img, 
             visualize=self.visualize_crop, 
@@ -198,6 +216,10 @@ class TabletImageDetector(BaseDetector):
         for idx, img_piece in enumerate(cropped_images):
             # Use SingleImageDetector to detect signs in the cropped piece
             piece_detections = single_detector.detect(img_piece)
+
+            if self.keep_crops:
+                # Deep copy to avoid modifying stored detections when transforming coordinates
+                self.cropped_images.append(SingleImage(img=img_piece, detections=copy.deepcopy(piece_detections)))
             
             # Transform to original image coordinates
             piece_offset_x = crop_coordinates[idx]['x']
@@ -214,6 +236,10 @@ class TabletImageDetector(BaseDetector):
                 all_detections.append(det)
         
         return all_detections
+    
+    def get_cropped_images(self) -> List[SingleImage]:
+        return self.cropped_images
+    
 
 def group_detections_into_lines(detections):
     """Group detections into lines based on y-coordinate"""
@@ -424,6 +450,13 @@ class BboxVisualizer:
             cv2.imshow('Visualization', self.visualized_result)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
+        elif vis_opt == "draw":
+            # draw using plt
+            import matplotlib.pyplot as plt
+            if self.visualized_result is not None:
+                plt.imshow(cv2.cvtColor(self.visualized_result, cv2.COLOR_BGR2RGB))
+                plt.axis('off')
+                plt.show()
         elif vis_opt == "save" and self.visualized_result is not None:
             if path is None:
                 print("visualization path not provided, saving to 'visualization_result.jpg'")
@@ -442,6 +475,64 @@ class TextVisualizer:
             f.write("Text lines (converted from ABZ to sign names):\n")
             for i, line in enumerate(self.text_lines):
                 f.write(f"Line {i+1}: {' '.join(line)}\n")
+
+class HeatmapVisualizer:
+    def __init__(self):
+        self.visualized_result = None
+        self.fig = None
+    
+    
+    def draw_heatmap(self, img, heatmap, channels=(0, 1, 2), detection = None):
+        fig, axes = plt.subplots(2, 2, figsize=(15, 15))
+        
+        if detection is not None:
+            bbox_viz = BboxVisualizer(boxes_color=(255, 0, 0))
+            bbox_viz.draw_boxes(img, detection)
+            axes[0, 0].imshow(cv2.cvtColor(bbox_viz.visualized_result, cv2.COLOR_BGR2RGB))
+            axes[0, 0].set_title('Detection with Bounding Box')
+            axes[0, 0].axis('off')
+        else:
+            # Show original image
+            axes[0, 0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            axes[0, 0].set_title('Original Image')
+            axes[0, 0].axis('off')
+        
+        # visualize heatmap channels
+        for i in range(min(len(channels), 3)):  # Max 3 channels to fit in 2x2 grid
+            row = (i + 1) // 2
+            col = (i + 1) % 2
+            
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            heatmap_channel = heatmap[:, :, channels[i]]
+            
+            # Create heatmap overlay
+            axes[row, col].imshow(img_rgb, alpha=0.5)
+            im = axes[row, col].imshow(heatmap_channel, cmap='hot', alpha=0.6, vmin=0, vmax=1)
+            axes[row, col].set_title(f'Class {channels[i]}: {CLASSES[channels[i]] if channels[i] < len(CLASSES) else "Unknown"}, abz_name: {abz_to_sign_name(CLASSES[channels[i]]) if channels[i] < len(CLASSES) else "Unknown"}, sign_name: {abz_to_sign_name(CLASSES[channels[i]]) if channels[i] < len(CLASSES) else "Unknown"}')
+            axes[row, col].axis('off')
+            plt.colorbar(im, ax=axes[row, col], fraction=0.046)
+        
+        plt.tight_layout()
+        self.fig = fig
+        self.visualized_result = fig
+        return fig
+
+    def display_result(self, vis_opt = "save", path=None):
+        import matplotlib.pyplot as plt
+        
+        if vis_opt == "show" and self.visualized_result is not None:
+            plt.show()
+        elif vis_opt == "draw" and self.visualized_result is not None:
+            plt.show()
+        elif vis_opt == "save" and self.visualized_result is not None:
+            if path is None:
+                print("heatmap visualization path not provided, saving to 'heatmap_visualization_result.jpg'")
+                path = 'heatmap_visualization_result.jpg'
+            self.fig.savefig(path, dpi=150, bbox_inches='tight')
+            print(f"Heatmap visualization saved to {path}")
+            plt.close(self.fig)
+        else:
+            print("No heatmap visualization result to display or save.")
 
 
 def visualize_results(fragment_id, img, gt_boxes, detections, text_lines, aligned_signs, output_dir):
