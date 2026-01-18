@@ -481,11 +481,30 @@ class HeatmapVisualizer:
         self.visualized_result = None
         self.fig = None
     
-    
-    def draw_heatmap(self, img, heatmap, channels=(0, 1, 2), detection = None):
-        fig, axes = plt.subplots(2, 2, figsize=(15, 15))
+    def draw_heatmap(self, img, heatmap, channels=(0, 1, 2), detection = None, texts = None):
+        # Close previous figure to prevent memory leakage
+        if self.fig is not None:
+            plt.close(self.fig)
         
-        if detection is not None:
+        fig, axes = plt.subplots(2, 2, figsize=(15, 15))
+
+        if texts is not None:
+            background_img = np.ones((heatmap.shape[0],  heatmap.shape[1], 3), dtype=np.uint8) * 255
+            img = background_img
+            # Display white background first
+            axes[0, 0].imshow(background_img)
+            axes[0, 0].set_title('Text Lines')
+            axes[0, 0].axis('off')
+            # Display text on the first subplot using normalized axes coordinates
+            # Start from top (0.95) and go down
+            text_y_start = 0.95
+            text_y_step = 0.85 / max(len(texts), 1)  # Distribute evenly in the available space
+            for i, line in enumerate(texts):
+                line_text = ' '.join(line)
+                axes[0, 0].text(0.05, text_y_start - i * text_y_step, line_text, 
+                               fontsize=10, color='black', family='monospace',
+                               transform=axes[0, 0].transAxes, verticalalignment='top')
+        elif detection is not None:
             bbox_viz = BboxVisualizer(boxes_color=(255, 0, 0))
             bbox_viz.draw_boxes(img, detection)
             axes[0, 0].imshow(cv2.cvtColor(bbox_viz.visualized_result, cv2.COLOR_BGR2RGB))
@@ -503,6 +522,7 @@ class HeatmapVisualizer:
             col = (i + 1) % 2
             
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img_rgb = cv2.resize(img_rgb, (heatmap.shape[1], heatmap.shape[0]))
             heatmap_channel = heatmap[:, :, channels[i]]
             
             # Create heatmap overlay
