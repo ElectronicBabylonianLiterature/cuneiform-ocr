@@ -280,6 +280,284 @@ def compute_avg_dimensions(detections):
     
     return np.mean(widths), np.mean(heights)
 
+# ============ Heatmap-based Alignment ============
+def create_2d_gaussian(center_x, center_y, width, height, sigma_x, sigma_y):
+    """Create a 2D Gaussian centered at (center_x, center_y)"""
+    x = np.arange(0, width)
+    y = np.arange(0, height)
+    xx, yy = np.meshgrid(x, y)
+    
+    gaussian = np.exp(-((xx - center_x)**2 / (2 * sigma_x**2) + 
+                        (yy - center_y)**2 / (2 * sigma_y**2)))
+    return gaussian
+
+def create_detection_heatmap(detections, img_shape, classes, scale_factor=10, avg_width=None, avg_height=None):
+    """
+    Create heatmap from detections.
+    
+    Args:
+        detections: List of detection dicts with 'bbox', 'abz_name'
+        img_shape: Tuple of (height, width) of the image
+        classes: List of class names (ABZ)
+        scale_factor: Scale factor to reduce heatmap size
+        avg_width: Average sign width (computed from detections if None)
+        avg_height: Average sign height (computed from detections if None)
+    
+    Returns:
+        heatmap: numpy array of shape (height/scale, width/scale, num_classes)
+        influence_radius: The influence radius used
+        sigma: The sigma value used for Gaussian
+    """
+    img_height, img_width = img_shape[:2]
+    num_classes = len(classes)
+    
+    # Use a smaller scale for heatmap to reduce memory
+    heatmap_height = img_height // scale_factor
+    heatmap_width = img_width // scale_factor
+    
+    # Initialize heatmap with reduced size
+    heatmap = np.zeros((heatmap_height, heatmap_width, num_classes), dtype=np.float32)
+    
+    # Compute influence radius based on average dimensions (scaled)
+    if avg_width is None or avg_height is None:
+        avg_width, avg_height = compute_avg_dimensions(detections)
+    
+    influence_radius = (avg_width + avg_height) / 2 * 1.5 / scale_factor
+    sigma_x = influence_radius / 3  # ~99.7% of Gaussian within 3 sigma
+    sigma_y = influence_radius / 3
+    
+    # Generate heatmap for each detection
+    for det in detections:
+        # Get bounding box and class
+        x1, y1, x2, y2 = det['bbox']
+        class_id = classes.index(det['abz_name']) 
+        
+        # Compute center and scale to heatmap coordinates
+        center_x = (x1 + x2) / 2 / scale_factor
+        center_y = (y1 + y2) / 2 / scale_factor
+        
+        # Generate 2D Gaussian and add to corresponding class channel
+        gaussian = create_2d_gaussian(center_x, center_y, heatmap_width, heatmap_height, sigma_x, sigma_y)
+        heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], gaussian)
+    
+    return heatmap, influence_radius, sigma_x
+
+def create_text_heatmap(text_lines, classes, avg_width, avg_height, scale_factor=10):
+    """
+    Create heatmap from text lines with synthetic sign positions.
+    
+    Args:
+        text_lines: List of lines, each line is list of sign names
+        classes: List of class names (ABZ)
+        avg_width: Average sign width
+        avg_height: Average sign height
+        scale_factor: Scale factor to reduce heatmap size
+    
+    Returns:
+        heatmap: numpy array of shape (height/scale, width/scale, num_classes)
+        margin: The margin used
+        influence_radius: The influence radius used
+        sigma: The sigma value used for Gaussian
+    """
+    num_classes = len(classes)
+    
+    # Determine grid dimensions for text_lines
+    max_row_length = max(len(line) for line in text_lines) if text_lines else 1
+    num_rows = len(text_lines)
+    
+    # Calculate heatmap dimensions with margins
+    margin_width = avg_width
+    margin_height = avg_height
+    margin = max(margin_width, margin_height)  # Use the larger margin for both directions
+    heatmap_width_text = int(max_row_length * avg_width + 2 * margin)
+    heatmap_height_text = int(num_rows * avg_height + 2 * margin)
+    
+    # Use the same scale factor
+    heatmap_width_text_scaled = heatmap_width_text // scale_factor
+    heatmap_height_text_scaled = heatmap_height_text // scale_factor
+    
+    # Initialize heatmap
+    heatmap_text = np.zeros((heatmap_height_text_scaled, heatmap_width_text_scaled, num_classes), dtype=np.float32)
+    
+    # Gaussian parameters
+    influence_radius_text = (avg_width + avg_height) / 2 * 1.5 / scale_factor
+    sigma_x_text = influence_radius_text / 3
+    sigma_y_text = influence_radius_text / 3
+    
+    # Generate heatmap for each sign in text_lines
+    for row_idx, line in enumerate(text_lines):
+        for col_idx, sign_name in enumerate(line):
+            # Find class_id for this sign_name
+            class_id = None
+            for i, abz_name in enumerate(classes):
+                if abz_to_sign_name(abz_name) == sign_name:
+                    class_id = i
+                    break
+            
+            if class_id is None:
+                continue
+            
+            # Calculate center position in original coordinates
+            center_y_orig = margin + row_idx * avg_height + avg_height / 2
+            center_x_orig = margin + col_idx * avg_width + avg_width / 2
+            
+            # Scale to heatmap coordinates
+            center_x_scaled = center_x_orig / scale_factor
+            center_y_scaled = center_y_orig / scale_factor
+            
+            # Generate 2D Gaussian and add to corresponding class channel
+            gaussian_text = create_2d_gaussian(center_x_scaled, center_y_scaled, 
+                                              heatmap_width_text_scaled, heatmap_height_text_scaled, 
+                                              sigma_x_text, sigma_y_text)
+            heatmap_text[:, :, class_id] = np.maximum(heatmap_text[:, :, class_id], gaussian_text)
+    
+    return heatmap_text, margin, influence_radius_text, sigma_x_text
+
+def match_heatmaps_ncc(detection_heatmap, text_heatmap, scale_factor=10):
+    """
+    Use normalized cross-correlation to find the best match position of detection heatmap in text heatmap.
+    
+    Args:
+        detection_heatmap: numpy array of shape (h1, w1, num_classes)
+        text_heatmap: numpy array of shape (h2, w2, num_classes)
+        scale_factor: Scale factor used when creating heatmaps
+    
+    Returns:
+        top_left_scaled: Tuple (x, y) of match position in scaled coordinates
+        max_val: Correlation value of the best match
+        top_left_original: Tuple (x, y) of match position in original coordinates
+    """
+    num_classes = detection_heatmap.shape[2]
+    
+    # Check if detection heatmap is larger than text heatmap
+    # If so, we cannot perform template matching - return center position with low score
+    if (detection_heatmap.shape[0] > text_heatmap.shape[0] or 
+        detection_heatmap.shape[1] > text_heatmap.shape[1]):
+        # Return center of text heatmap as the match position with low confidence
+        center_y = text_heatmap.shape[0] // 2
+        center_x = text_heatmap.shape[1] // 2
+        top_left_scaled = (center_x - detection_heatmap.shape[1] // 2, 
+                          center_y - detection_heatmap.shape[0] // 2)
+        # Clamp to valid range
+        top_left_scaled = (max(0, top_left_scaled[0]), max(0, top_left_scaled[1]))
+        top_left_original = (top_left_scaled[0] * scale_factor, top_left_scaled[1] * scale_factor)
+        return top_left_scaled, 0.1, top_left_original  # Low confidence score
+    
+    # Initialize combined correlation result
+    combined_result = None
+    valid_channels = 0
+    
+    # Calculate NCC for each class channel
+    for class_idx in range(num_classes):
+        # Extract single channel
+        template_channel = detection_heatmap[:, :, class_idx]
+        target_channel = text_heatmap[:, :, class_idx]
+        
+        # Skip if both template and target are empty (all zeros)
+        if template_channel.max() == 0 and target_channel.max() == 0:
+            continue
+        
+        # Normalize the template and target for this channel
+        template_norm = cv2.normalize(template_channel, None, 0, 1, cv2.NORM_MINMAX).astype(np.float32)
+        target_norm = cv2.normalize(target_channel, None, 0, 1, cv2.NORM_MINMAX).astype(np.float32)
+        
+        # Calculate normalized cross-correlation for this channel
+        result_channel = cv2.matchTemplate(target_norm, template_norm, cv2.TM_CCORR_NORMED)
+        
+        # Accumulate results with equal weights
+        if combined_result is None:
+            combined_result = result_channel
+        else:
+            combined_result += result_channel
+        valid_channels += 1
+    
+    # Check if we have any valid channels
+    if combined_result is None or valid_channels == 0:
+        # No valid matching, return center position with low score
+        center_y = text_heatmap.shape[0] // 2
+        center_x = text_heatmap.shape[1] // 2
+        top_left_scaled = (center_x - detection_heatmap.shape[1] // 2, 
+                          center_y - detection_heatmap.shape[0] // 2)
+        top_left_scaled = (max(0, top_left_scaled[0]), max(0, top_left_scaled[1]))
+        top_left_original = (top_left_scaled[0] * scale_factor, top_left_scaled[1] * scale_factor)
+        return top_left_scaled, 0.1, top_left_original
+    
+    # Average the combined result (equal weights for all valid channels)
+    combined_result = combined_result / valid_channels
+    
+    # Find the location of the best match in the combined result
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(combined_result)
+    top_left_scaled = max_loc  # (x, y) in scaled coordinates
+    
+    # Convert to original (unscaled) coordinates
+    top_left_original = (top_left_scaled[0] * scale_factor, top_left_scaled[1] * scale_factor)
+    
+    return top_left_scaled, max_val, top_left_original
+
+def create_text_based_detections(text_lines, classes, match_position_x, match_position_y, 
+                                   margin, avg_width, avg_height, image_bounds):
+    """
+    Create text-based detections by assigning sign centers from text image into detection region.
+    
+    Args:
+        text_lines: List of lines, each line is list of sign names
+        classes: List of class names (ABZ)
+        match_position_x: X coordinate of matched position in text heatmap (original coords)
+        match_position_y: Y coordinate of matched position in text heatmap (original coords)
+        margin: Margin used in text heatmap
+        avg_width: Average sign width
+        avg_height: Average sign height
+        image_bounds: Tuple (width, height) of target image bounds
+    
+    Returns:
+        detection_with_texts: List of detection dicts with 'bbox', 'abz_name', 'sign_name', 'score', 'center'
+    """
+    img_width, img_height = image_bounds
+    detection_with_texts = []
+    
+    # Iterate through text_lines to find signs that fall within the image region
+    for row_idx, line in enumerate(text_lines):
+        for col_idx, sign_name in enumerate(line):
+            # Calculate center position in original text heatmap coordinates
+            center_y_orig_text = margin + row_idx * avg_height + avg_height / 2
+            center_x_orig_text = margin + col_idx * avg_width + avg_width / 2
+            
+            # Convert to coordinates relative to the matched position
+            center_x_rel = center_x_orig_text - match_position_x
+            center_y_rel = center_y_orig_text - match_position_y
+            
+            # Check if this center falls within the image bounds
+            if (0 <= center_x_rel < img_width and 
+                0 <= center_y_rel < img_height):
+                
+                # Create bbox using avg_width and avg_height
+                x1 = center_x_rel - avg_width / 2
+                y1 = center_y_rel - avg_height / 2
+                x2 = center_x_rel + avg_width / 2
+                y2 = center_y_rel + avg_height / 2
+                
+                # Find the ABZ name for this sign
+                abz_name = None
+                for abz in classes:
+                    if abz_to_sign_name(abz) == sign_name:
+                        abz_name = abz
+                        break
+                
+                if abz_name is None:
+                    continue
+                
+                # Create detection dict
+                detection = {
+                    'bbox': [x1, y1, x2, y2],
+                    'abz_name': abz_name,
+                    'sign_name': sign_name,
+                    'score': 1.0,  # Set high confidence for text-based detections
+                    'center': (center_x_rel, center_y_rel)
+                }
+                detection_with_texts.append(detection)
+    
+    return detection_with_texts
+
 # ============ Alignment Algorithm ============
 def align_signs(detected_lines, text_lines, avg_width, avg_height):
     """
