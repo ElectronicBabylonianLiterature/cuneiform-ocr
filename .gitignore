@@ -21,3 +21,5 @@ imgs/
 .vscode/
 valid_fragments.json
 log_*.log
+alignment_results/
+alignment_results_heatmap/
