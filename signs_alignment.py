@@ -32,17 +32,31 @@ Y_THRESHOLD = 35  # for grouping signs into lines
 OUTPUT_DIR = "alignment_results"
 SAMPLE_LIMIT = 5  # number of samples to process
 
+# ============ Class Names ============
+# class names list from model
+# model.dataset_meta["classes"]
+CLASSES_NAME = ['TU', '|U.GUD|', 'TUM', 'LA', 'TA', 'GAR', 'GAL', 'I', 'TI', 'LI', 'ZA', 'A', 'DI', 'MI', 'RI', 'IŠ', 'BA', 'LU', 'TE', 'DA', '|GUD×KUR|', 'MA', 'E₂', 'DIŠ', 'MU', 'DU', 'ŠU₂', 'EN', 'KUL', 'SI', '|I.A|', 'HI', 'MUŠ₃', 'AN', 'NA', 'BAD', 'AMAR', 'UD', 'UnclearSign', '|HI×BAD|', '|UD×(U.U.U)|', 'AB', 'AK', 'LUGAL', 'DIN', 'KI', 'DUN₃@g', 'KU₃', 'AŠ', 'IGI', 'U₂', 'ŠA₃', 'BI', 'GUR', 'ŠE', 'ZI', 'GA', 'SILA₃', 'ŠID', '|SAL.TUG₂|', 'SU', 'KAK', 'MAŠ', 'TUR', 'ŠEŠ', 'LU₂', 'IA₂', 'UR', 'KAL', '|ŠEŠ.KI|', 'ZU', 'ŠU', 'NE', 'IM', 'RA', '|U.U|', 'ZAG', '|DIŠ.DIŠ.DIŠ|', 'GA₂', 'IN', 'KIN', 'TAR', 'MAH', 'LAL', 'KID', 'GABA', 'KA', 'RU', 'ŠA', '|HI×NUN|', 'ME', 'BU', 'NI', 'IG', 'MES', 'PA', 'SAG', 'U', 'E', 'GUM', 'GIŠ', '|U.KA|', 'LUM', '|HI×AŠ₂|', 'HA', 'UŠ', '|U.U.U|', 'MIN', 'NAM', 'NU', 'AL', 'AB₂', 'IB', 'UM', 'KU', 'SUR', 'MEŠ', 'TUG₂', 'TAG', 'DIM', 'BAL', 'IR', 'ERIN₂', 'PAP', 'SA', '|PIRIG×ZA|', 'UB', 'URU', '|U.5(DIŠ)|', 'DAM', 'GAR₃', '|EN.ZU|', 'ZE₂', 'AD', 'APIN', 'EL', 'PI', 'AŠ@z', 'DAR', 'DUB', 'SAR', 'GUD', 'A₂', 'KUR', 'ARAD', '|IGI.DIB|', '6(DIŠ)', 'AŠ₂', 'IL', 'HU', 'NUN', 'SAL', 'GI', 'EŠ₂', 'UN', 'TIL', 'NIM', 'TAB', 'SUM', '|3×AN|', '|NINDA₂×ŠE|', 'MAŠ₂', 'GI₄', 'GAN', 'DIM₂', 'GU', 'MAR', 'MUŠ', 'BAR', '|IGI.RI|', 'TUK', '|UD.DU|', '|LAGAB.LAGAB|']
+
 # ABZ class names from model
-CLASSES = ['ABZ58', 'ABZ441', 'ABZ207', 'ABZ55', 'ABZ139', 'ABZ597', 'ABZ343', 'ABZ142', 'ABZ73', 'ABZ59', 'ABZ586', 'ABZ579', 'ABZ457', 'ABZ427', 'ABZ86', 'ABZ212', 'ABZ5', 'ABZ537', 'ABZ376', 'ABZ335', 'ABZ170', 'ABZ342', 'ABZ324', 'ABZ480', 'ABZ61', 'ABZ206', 'ABZ545', 'ABZ99', 'ABZ72', 'ABZ112', 'ABZ142a', 'ABZ396', 'ABZ103', 'ABZ13', 'ABZ70', 'ABZ69', 'ABZ437', 'ABZ381', 'X', 'ABZ279', 'ABZ52', 'ABZ128', 'ABZ97', 'ABZ151', 'ABZ465', 'ABZ461', 'ABZ595', 'ABZ468', 'ABZ1', 'ABZ449', 'ABZ318', 'ABZ384', 'ABZ214', 'ABZ111', 'ABZ367', 'ABZ84', 'ABZ319', 'ABZ62', 'ABZ314', 'ABZ556', 'ABZ7', 'ABZ230', 'ABZ74', 'ABZ144', 'ABZ331', 'ABZ330', 'ABZ598a', 'ABZ575', 'ABZ322', 'NoABZ0', 'ABZ6', 'ABZ354', 'ABZ172', 'ABZ399', 'ABZ328', 'ABZ471', 'ABZ332', 'ABZ593', 'ABZ233', 'ABZ148', 'ABZ538', 'ABZ12', 'ABZ57', 'ABZ481', 'ABZ313', 'ABZ167', 'ABZ15', 'ABZ68', 'ABZ353', 'ABZ398', 'ABZ532', 'ABZ371', 'ABZ231', 'ABZ80', 'ABZ314', 'ABZ295', 'ABZ115', 'ABZ411', 'ABZ308', 'ABZ191', 'ABZ296', 'ABZ412', 'ABZ565', 'ABZ401', 'ABZ589', 'ABZ211', 'ABZ472', 'ABZ570', 'ABZ79', 'ABZ75', 'ABZ298', 'ABZ420', 'ABZ535', 'ABZ134', 'ABZ536', 'ABZ101', 'ABZ533', 'ABZ536', 'ABZ126', 'ABZ94', 'ABZ9', 'ABZ232', 'ABZ393', 'ABZ60', 'ABZ104', 'ABZ131', 'ABZ306', 'ABZ38', 'ABZ470', 'ABZ557', 'ABZ333', 'NoABZ0', 'ABZ147', 'ABZ145', 'ABZ56', 'ABZ564', 'ABZ383', 'ABZ360', 'ABZ114', 'ABZ138', 'ABZ331e+152i', 'ABZ297', 'ABZ334', 'ABZ366', 'ABZ50', 'ABZ455', 'ABZ598b', 'ABZ339', 'ABZ205', 'ABZ78', 'ABZ87', 'ABZ554', 'ABZ85', 'ABZ536', 'ABZ312', 'ABZ69', 'ABZ433', 'ABZ124', 'ABZ164', 'ABZ129a', 'NoABZ0', 'ABZ76', 'ABZ326', 'ABZ143', 'ABZ440', 'ABZ559', 'ABZ307', 'ABZ374', 'ABZ74', 'ABZ451', 'ABZ574', 'NoABZ0', 'ABZ529']
+CLASSES_ABZ = ['ABZ58', 'ABZ441', 'ABZ207', 'ABZ55', 'ABZ139', 'ABZ597', 'ABZ343', 'ABZ142', 'ABZ73', 'ABZ59', 'ABZ586', 'ABZ579', 'ABZ457', 'ABZ427', 'ABZ86', 'ABZ212', 'ABZ5', 'ABZ537', 'ABZ376', 'ABZ335', 'ABZ170', 'ABZ342', 'ABZ324', 'ABZ480', 'ABZ61', 'ABZ206', 'ABZ545', 'ABZ99', 'ABZ72', 'ABZ112', 'ABZ142a', 'ABZ396', 'ABZ103', 'ABZ13', 'ABZ70', 'ABZ69', 'ABZ437', 'ABZ381', 'X', 'ABZ279', 'ABZ52', 'ABZ128', 'ABZ97', 'ABZ151', 'ABZ465', 'ABZ461', 'ABZ595', 'ABZ468', 'ABZ1', 'ABZ449', 'ABZ318', 'ABZ384', 'ABZ214', 'ABZ111', 'ABZ367', 'ABZ84', 'ABZ319', 'ABZ62', 'ABZ314', 'ABZ556', 'ABZ7', 'ABZ230', 'ABZ74', 'ABZ144', 'ABZ331', 'ABZ330', 'ABZ598a', 'ABZ575', 'ABZ322', 'NoABZ0', 'ABZ6', 'ABZ354', 'ABZ172', 'ABZ399', 'ABZ328', 'ABZ471', 'ABZ332', 'ABZ593', 'ABZ233', 'ABZ148', 'ABZ538', 'ABZ12', 'ABZ57', 'ABZ481', 'ABZ313', 'ABZ167', 'ABZ15', 'ABZ68', 'ABZ353', 'ABZ398', 'ABZ532', 'ABZ371', 'ABZ231', 'ABZ80', 'ABZ314', 'ABZ295', 'ABZ115', 'ABZ411', 'ABZ308', 'ABZ191', 'ABZ296', 'ABZ412', 'ABZ565', 'ABZ401', 'ABZ589', 'ABZ211', 'ABZ472', 'ABZ570', 'ABZ79', 'ABZ75', 'ABZ298', 'ABZ420', 'ABZ535', 'ABZ134', 'ABZ536', 'ABZ101', 'ABZ533', 'ABZ536', 'ABZ126', 'ABZ94', 'ABZ9', 'ABZ232', 'ABZ393', 'ABZ60', 'ABZ104', 'ABZ131', 'ABZ306', 'ABZ38', 'ABZ470', 'ABZ557', 'ABZ333', 'NoABZ0', 'ABZ147', 'ABZ145', 'ABZ56', 'ABZ564', 'ABZ383', 'ABZ360', 'ABZ114', 'ABZ138', 'ABZ331e+152i', 'ABZ297', 'ABZ334', 'ABZ366', 'ABZ50', 'ABZ455', 'ABZ598b', 'ABZ339', 'ABZ205', 'ABZ78', 'ABZ87', 'ABZ554', 'ABZ85', 'ABZ536', 'ABZ312', 'ABZ69', 'ABZ433', 'ABZ124', 'ABZ164', 'ABZ129a', 'NoABZ0', 'ABZ76', 'ABZ326', 'ABZ143', 'ABZ440', 'ABZ559', 'ABZ307', 'ABZ374', 'ABZ74', 'ABZ451', 'ABZ574', 'NoABZ0', 'ABZ529']
 
 # ============ MongoDB Connection for ABZ -> Sign Name ============
-client = MongoClient("")
+# get MongoDB connection string from ...
+uri = os.getenv('MONGODB_URI', 'YOUR_MONGODB_URI')
+client = MongoClient(uri)
 db = client['ebl']
 signs_collection = db['signs']
 
 class SignNameConverter:
-    def __init__(self, sign=None):
+    def __init__(self, sign=None, expected_type=None):
+        if expected_type not in (None, 'ABZ', 'SIGN', 'INDEX'):
+            raise ValueError("expected type must be one of None, 'ABZ', 'SIGN', 'INDEX'")
         if sign != None:
+            if expected_type:
+                name_type = self._check_name_type(sign)
+                if name_type != expected_type:
+                    print(f"Warning: sign type of sign '{sign}' mismatch. Expected {expected_type}, got {name_type}. Setting to 'X'.")
+                    sign = "X"
             self._set_signs(sign)
     
     def get_abz(self):
@@ -51,6 +65,8 @@ class SignNameConverter:
         return self.sign_name
     def get_sign_idx(self):
         return self.sign_idx
+    def set_signs(self, sign):
+        self._set_signs(sign)
 
     def _set_signs(self, sign):
         self.original_sign = sign
@@ -58,55 +74,58 @@ class SignNameConverter:
         if sign_type == 'ABZ':
             self.abz = sign
             self.sign_name = self._convert_abz_to_sign_name(sign)
-            if self.abz in CLASSES:
-                self.sign_idx = CLASSES.index(self.abz)
+            if self.abz in CLASSES_ABZ:
+                self.sign_idx = CLASSES_ABZ.index(self.abz)
             else:
-                self.sign_idx = -1 # outside of known classes, which only possible for annotated signs, not detected ones
+                self.sign_idx = -1 # outside of known CLASSES_ABZ, which only possible for annotated signs, not detected ones
         elif sign_type == 'SIGN':
             self.sign_name = sign
             self.abz = self._convert_sign_name_to_abz(sign)
-            if self.abz in CLASSES:
-                self.sign_idx = CLASSES.index(self.abz)
+            if self.abz in CLASSES_ABZ:
+                self.sign_idx = CLASSES_ABZ.index(self.abz)
             else:
-                self.sign_idx = -1 # outside of known classes, which only possible for annotated signs, not detected ones
+                self.sign_idx = -1 # outside of known CLASSES_ABZ, which only possible for annotated signs, not detected ones
         elif sign_type == 'INDEX':
             self.sign_idx = sign
-            self.abz = CLASSES[self.sign_idx]
+            self.abz = CLASSES_ABZ[self.sign_idx]
             self.sign_name = self._convert_abz_to_sign_name(self.abz)
         else:
             raise TypeError
 
     @staticmethod
-    def _build_abz_to_sign_mapping():
+    def _build_mappings():
+
         abz_to_sign = {}
-        for doc in signs_collection.find({}):
-            sign_name = doc['_id']
-            for entry in doc.get('lists', []):
-                if entry['name'] == 'ABZ':
-                    abz_key = 'ABZ' + entry['number']
-                    if abz_key not in abz_to_sign:
-                        abz_to_sign[abz_key] = sign_name
+        sign_to_abz = {}
+        
+        # Build mappings from the parallel arrays
+        for abz_name, sign_name in zip(CLASSES_ABZ, CLASSES_NAME):
+            # Only add if not already present (handles duplicates by keeping first occurrence)
+            if abz_name not in abz_to_sign:
+                abz_to_sign[abz_name] = sign_name
+            if sign_name not in sign_to_abz:
+                sign_to_abz[sign_name] = abz_name
+        
         abz_to_sign['X'] = 'UnclearSign'
         abz_to_sign['NoABZ0'] = 'UnclearSign'
-        return abz_to_sign
+        sign_to_abz['UnclearSign'] = 'X'
+
+        return abz_to_sign, sign_to_abz
     
-    ABZ_TO_SIGN = _build_abz_to_sign_mapping.__func__()
+    ABZ_TO_SIGN, SIGN_TO_ABZ = _build_mappings.__func__()
     
     def _check_name_type(self, sign):
         if isinstance(sign, int):
             return 'INDEX'
-        if sign.startswith('ABZ') or sign.startswith('NoABZ'):
+        if sign.startswith('ABZ') or sign.startswith('NoABZ') or sign == 'X':
             return 'ABZ'
         return 'SIGN'
-    
+    1
     def _convert_abz_to_sign_name(self, sign):
         return self.ABZ_TO_SIGN.get(sign, 'UnclearSign')
 
     def _convert_sign_name_to_abz(self, sign_name):
-        for abz, name in self.ABZ_TO_SIGN.items():
-            if name == sign_name:
-                return abz
-        return 'X'
+        return self.SIGN_TO_ABZ.get(sign_name, 'X')
 
 def abz_to_sign_name(abz):
     converter = SignNameConverter(abz)
@@ -175,7 +194,7 @@ def parse_api_signs(signs_text):
             if '/' in token:
                 token = token.split('/')[0]  # take first alternative
             # Convert ABZ to sign name
-            converter = SignNameConverter(token)
+            converter = SignNameConverter(token, expected_type='ABZ')
             line_signs.append(converter.get_sign_name())
         if line_signs:
             lines.append(line_signs)
@@ -185,9 +204,9 @@ def parse_api_signs(signs_text):
 
 # ============ Detection ============
 class BaseDetector(ABC):
-    def __init__(self, model, classes: List[str], score_threshold: float = 0.5):
+    def __init__(self, model, CLASSES_ABZ: List[str], score_threshold: float = 0.5):
         self.model = model
-        self.classes = classes
+        self.CLASSES_ABZ = CLASSES_ABZ
         self.score_threshold = score_threshold
     
     @abstractmethod
@@ -203,7 +222,7 @@ class BaseDetector(ABC):
         detections = []
         for i in range(len(labels)):
             bbox = bboxes[i]
-            abz_name = self.classes[labels[i]]
+            abz_name = self.CLASSES_ABZ[labels[i]]
             converter = SignNameConverter(abz_name)
             detections.append({
                 'bbox': [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
@@ -236,9 +255,9 @@ class SingleImage:
 
 
 class TabletImageDetector(BaseDetector):
-    def __init__(self, model, classes: List[str], score_threshold: float = 0.5, 
+    def __init__(self, model, CLASSES_ABZ: List[str], score_threshold: float = 0.5, 
                  visualize_crop: bool = False, logging_crop: bool = False, keep_crops: bool = False):
-        super().__init__(model, classes, score_threshold)
+        super().__init__(model, CLASSES_ABZ, score_threshold)
         self.visualize_crop = visualize_crop
         self.logging_crop = logging_crop
         self.keep_crops = keep_crops
@@ -256,7 +275,7 @@ class TabletImageDetector(BaseDetector):
         )
         
         # Create single image detector for processing cropped pieces
-        single_detector = SingleImageDetector(self.model, self.classes, self.score_threshold)
+        single_detector = SingleImageDetector(self.model, self.CLASSES_ABZ, self.score_threshold)
         
         all_detections = []
         
@@ -338,16 +357,16 @@ def create_2d_gaussian(center_x, center_y, width, height, sigma_x, sigma_y):
                         (yy - center_y)**2 / (2 * sigma_y**2)))
     return gaussian
 
-def create_detection_heatmap(detections, img_shape, classes, scale_factor=10, avg_width=None, avg_height=None):
+def create_detection_heatmap(detections, img_shape, CLASSES_ABZ, scale_factor=10, avg_width=None, avg_height=None):
     img_height, img_width = img_shape[:2]
-    num_classes = len(classes)
+    num_CLASSES_ABZ = len(CLASSES_ABZ)
     
     # Use a smaller scale for heatmap to reduce memory
     heatmap_height = img_height // scale_factor
     heatmap_width = img_width // scale_factor
     
     # Initialize heatmap with reduced size
-    heatmap = np.zeros((heatmap_height, heatmap_width, num_classes), dtype=np.float32)
+    heatmap = np.zeros((heatmap_height, heatmap_width, num_CLASSES_ABZ), dtype=np.float32)
     
     # Compute influence radius based on average dimensions (scaled)
     if avg_width is None or avg_height is None:
@@ -361,7 +380,7 @@ def create_detection_heatmap(detections, img_shape, classes, scale_factor=10, av
     for det in detections:
         # Get bounding box and class
         x1, y1, x2, y2 = det['bbox']
-        class_id = classes.index(det['abz_name']) 
+        class_id = CLASSES_ABZ.index(det['abz_name']) 
         
         # Compute center and scale to heatmap coordinates
         center_x = (x1 + x2) / 2 / scale_factor
@@ -373,8 +392,8 @@ def create_detection_heatmap(detections, img_shape, classes, scale_factor=10, av
     
     return heatmap, influence_radius, sigma_x
 
-def create_text_heatmap(text_lines, classes, avg_width, avg_height, scale_factor=10):
-    num_classes = len(classes)
+def create_text_heatmap(text_lines, CLASSES_ABZ, avg_width, avg_height, scale_factor=10):
+    num_CLASSES_ABZ = len(CLASSES_ABZ)
     
     # Determine grid dimensions for text_lines
     max_row_length = max(len(line) for line in text_lines) if text_lines else 1
@@ -392,7 +411,7 @@ def create_text_heatmap(text_lines, classes, avg_width, avg_height, scale_factor
     heatmap_height_text_scaled = heatmap_height_text // scale_factor
     
     # Initialize heatmap
-    heatmap_text = np.zeros((heatmap_height_text_scaled, heatmap_width_text_scaled, num_classes), dtype=np.float32)
+    heatmap_text = np.zeros((heatmap_height_text_scaled, heatmap_width_text_scaled, num_CLASSES_ABZ), dtype=np.float32)
     
     # Gaussian parameters
     influence_radius_text = (avg_width + avg_height) / 2 * 1.5 / scale_factor
@@ -401,7 +420,7 @@ def create_text_heatmap(text_lines, classes, avg_width, avg_height, scale_factor
     
     # Build sign_name to class_id lookup (do this once instead of in nested loops)
     sign_name_to_class_id = {}
-    for i, abz_name in enumerate(classes):
+    for i, abz_name in enumerate(CLASSES_ABZ):
         converter = SignNameConverter(abz_name)
         sign_name_to_class_id[converter.get_sign_name()] = i
     
@@ -431,7 +450,7 @@ def create_text_heatmap(text_lines, classes, avg_width, avg_height, scale_factor
     return heatmap_text, margin, influence_radius_text, sigma_x_text
 
 def match_heatmaps_ncc(detection_heatmap, text_heatmap, scale_factor=10):
-    num_classes = detection_heatmap.shape[2]
+    num_CLASSES_ABZ = detection_heatmap.shape[2]
     
     # Check if detection heatmap is larger than text heatmap
     # If so, we cannot perform template matching - return center position with low score
@@ -452,7 +471,7 @@ def match_heatmaps_ncc(detection_heatmap, text_heatmap, scale_factor=10):
     valid_channels = 0
     
     # Calculate NCC for each class channel
-    for class_idx in range(num_classes):
+    for class_idx in range(num_CLASSES_ABZ):
         # Extract single channel
         template_channel = detection_heatmap[:, :, class_idx]
         target_channel = text_heatmap[:, :, class_idx]
@@ -498,16 +517,13 @@ def match_heatmaps_ncc(detection_heatmap, text_heatmap, scale_factor=10):
     
     return top_left_scaled, max_val, top_left_original
 
-def create_text_based_detections(text_lines, classes, match_position_x, match_position_y, 
+def create_text_based_detections(text_lines, CLASSES_ABZ, match_position_x, match_position_y, 
                                    margin, avg_width, avg_height, image_bounds):
     img_width, img_height = image_bounds
     detection_with_texts = []
     
     # Build sign_name to abz_name lookup (do this once instead of in nested loops)
-    sign_name_to_abz = {}
-    for abz in classes:
-        converter = SignNameConverter(abz)
-        sign_name_to_abz[converter.get_sign_name()] = abz
+    sign_name_converter = SignNameConverter()
     
     # Iterate through text_lines to find signs that fall within the image region
     for row_idx, line in enumerate(text_lines):
@@ -531,7 +547,8 @@ def create_text_based_detections(text_lines, classes, match_position_x, match_po
                 y2 = center_y_rel + avg_height / 2
                 
                 # Find the ABZ name for this sign using the lookup
-                abz_name = sign_name_to_abz.get(sign_name)
+                sign_name_converter.set_signs(sign_name)
+                abz_name = sign_name_converter.get_abz()
                 
                 if abz_name is None:
                     continue
@@ -793,8 +810,8 @@ class HeatmapVisualizer:
             # Create heatmap overlay
             axes[row, col].imshow(img_rgb, alpha=0.5)
             im = axes[row, col].imshow(heatmap_channel, cmap='hot', alpha=0.6, vmin=0, vmax=1)
-            if channels[i] < len(CLASSES):
-                converter = SignNameConverter(CLASSES[channels[i]])
+            if channels[i] < len(CLASSES_ABZ):
+                converter = SignNameConverter(CLASSES_ABZ[channels[i]])
                 title = f'Class {channels[i]}: {converter.get_abz()} → {converter.get_sign_name()}'
             else:
                 title = f'Class {channels[i]}: Unknown'
@@ -887,7 +904,7 @@ def process_fragment(model, fragment_id):
     print(f"  Text lines: {len(text_lines)}, total signs: {total_text_signs}")
     
     # Detect signs
-    detector = TabletImageDetector(model, CLASSES, SCORE_THRESHOLD, visualize_crop=False, logging_crop=False)
+    detector = TabletImageDetector(model, CLASSES_ABZ, SCORE_THRESHOLD, visualize_crop=False, logging_crop=False)
     detections = detector.detect(img)
     print(f"  Detected signs (score > {SCORE_THRESHOLD}): {len(detections)}")
     
@@ -937,33 +954,4 @@ if __name__ == "__main__":
     print("Cuneiform Signs Alignment")
     print("=" * 60)
     
-    # Initialize model
-    print("Loading detection model...")
-    register_all_modules()
-    model = init_detector(CONFIG_FILE, CHECKPOINT_FILE, device='cuda:0')
-    print("Model loaded.")
-    
-    # Get available fragments
-    fragments = get_available_fragments()
-    print(f"Found {len(fragments)} fragments with both image and annotation")
-    
-    # Process samples
-    results = []
-    for i, fragment_id in enumerate(fragments[:SAMPLE_LIMIT]):
-        result = process_fragment(model, fragment_id)
-        if result:
-            results.append(result)
-    
-    # Print summary
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    for r in results:
-        print(f"  {r['fragment_id']}: GT={r['gt_count']}, Text={r['text_signs']}, "
-              f"Det={r['detected']}, Located={r['located']}, Interp={r['interpolated']}")
-    
-    # Save results
-    with open(os.path.join(OUTPUT_DIR, "alignment_summary.json"), 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print(f"\nResults saved to {OUTPUT_DIR}/")
+    print("procedure not exists")

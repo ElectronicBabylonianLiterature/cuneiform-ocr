@@ -20,7 +20,7 @@ from data_processing.divide_photos import divide_tablet_photo
 
 # Import from signs_alignment.py
 from signs_alignment import (
-    CLASSES, ABZ_TO_SIGN, abz_to_sign_name,
+    CLASSES_ABZ, ABZ_TO_SIGN, abz_to_sign_name,
     load_ground_truth, load_image, get_signs_from_api, parse_api_signs,
     TabletImageDetector, SingleImage, SingleImageDetector,
     compute_avg_dimensions,
@@ -75,7 +75,7 @@ def transform_subtablet_detections_to_full(cropped_images: List[SingleImage],
     return all_detections
 
 
-def align_signs_heatmap(img, detections, text_lines, classes, scale_factor=10):
+def align_signs_heatmap(img, detections, text_lines, CLASSES_ABZ, scale_factor=10):
     """
     Align detected signs with text signs using heatmap-based method.
     
@@ -83,7 +83,7 @@ def align_signs_heatmap(img, detections, text_lines, classes, scale_factor=10):
         img: Full tablet image
         detections: List of detection dicts with 'bbox', 'abz_name', etc.
         text_lines: List of lines, each line is list of sign names
-        classes: List of class names (ABZ)
+        CLASSES_ABZ: List of class names (ABZ)
         scale_factor: Scale factor for heatmap
     
     Returns:
@@ -98,12 +98,12 @@ def align_signs_heatmap(img, detections, text_lines, classes, scale_factor=10):
     
     # Create detection heatmap
     detection_heatmap, _, _ = create_detection_heatmap(
-        detections, img.shape, classes, scale_factor, avg_width, avg_height
+        detections, img.shape, CLASSES_ABZ, scale_factor, avg_width, avg_height
     )
     
     # Create text heatmap
     text_heatmap, margin, _, _ = create_text_heatmap(
-        text_lines, classes, avg_width, avg_height, scale_factor
+        text_lines, CLASSES_ABZ, avg_width, avg_height, scale_factor
     )
     
     # Match heatmaps
@@ -121,7 +121,7 @@ def align_signs_heatmap(img, detections, text_lines, classes, scale_factor=10):
     # Create text-based detections
     img_height, img_width = img.shape[:2]
     aligned_detections = create_text_based_detections(
-        text_lines, classes, top_left_x_text, top_left_y_text, 
+        text_lines, CLASSES_ABZ, top_left_x_text, top_left_y_text, 
         margin, avg_width, avg_height, (img_width, img_height)
     )
     
@@ -233,7 +233,7 @@ def process_fragment_heatmap(model, fragment_id, scale_factor=10):
     
     # Detect signs using TabletImageDetector with crop
     # We need to keep the cropped images to process each sub-tablet separately
-    detector = TabletImageDetector(model, CLASSES, SCORE_THRESHOLD, 
+    detector = TabletImageDetector(model, CLASSES_ABZ, SCORE_THRESHOLD, 
                                      visualize_crop=False, logging_crop=False, keep_crops=True)
     
     # Get cropped images with detections in sub-tablet coordinates
@@ -243,7 +243,7 @@ def process_fragment_heatmap(model, fragment_id, scale_factor=10):
     
     # Detect on each cropped image separately
     from signs_alignment import SingleImageDetector
-    single_detector = SingleImageDetector(model, CLASSES, SCORE_THRESHOLD)
+    single_detector = SingleImageDetector(model, CLASSES_ABZ, SCORE_THRESHOLD)
     
     cropped_with_detections = []
     all_detections_full = []  # All detections in full tablet coordinates
@@ -281,7 +281,7 @@ def process_fragment_heatmap(model, fragment_id, scale_factor=10):
         
         # Align signs for this sub-tablet
         aligned_detections, alignment_info = align_signs_heatmap(
-            crop_data.img, crop_data.detections, text_lines, CLASSES, scale_factor
+            crop_data.img, crop_data.detections, text_lines, CLASSES_ABZ, scale_factor
         )
         
         # Transform aligned detections to full tablet coordinates
