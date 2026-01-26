@@ -98,12 +98,12 @@ def align_signs_heatmap(img, detections, text_lines, CLASSES_ABZ, scale_factor=1
     
     # Create detection heatmap
     detection_heatmap, _, _ = create_detection_heatmap(
-        detections, img.shape, CLASSES_ABZ, scale_factor, avg_width, avg_height
+        detections, img.shape, CLASSES_ABZ, scale_factor, avg_width, avg_height, method='rectangle_blur'
     )
     
     # Create text heatmap
     text_heatmap, margin, _, _ = create_text_heatmap(
-        text_lines, CLASSES_ABZ, avg_width, avg_height, scale_factor
+        text_lines, CLASSES_ABZ, avg_width, avg_height, scale_factor,method='rectangle_blur'
     )
     
     # Match heatmaps

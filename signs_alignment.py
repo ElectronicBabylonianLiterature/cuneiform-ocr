@@ -580,8 +580,16 @@ class SubTablet:
         return result
     
     def create_heatmap(self, CLASSES_ABZ: List[str], scale_factor: int = None,
-                       img_shape: tuple = None) -> np.ndarray:
-        """Generate heatmap from sign_boxes"""
+                       img_shape: tuple = None, method: str = 'gaussian') -> np.ndarray:
+        """
+        Generate heatmap from sign_boxes.
+        
+        Args:
+            CLASSES_ABZ: List of class names
+            scale_factor: Scale factor for heatmap
+            img_shape: Image shape override
+            method: 'gaussian' or 'rectangle_blur'
+        """
         if scale_factor is None:
             scale_factor = self.scale_factor
         else:
@@ -616,15 +624,31 @@ class SubTablet:
             center_x = sb.cx / scale_factor
             center_y = sb.cy / scale_factor
             
-            # Use anisotropic Gaussian based on this sign box's dimensions
-            sigma_x = sb.width * 1.5 / scale_factor / 3
-            sigma_y = sb.height * 1.5 / scale_factor / 3
+            if method == 'gaussian':
+                # Use anisotropic Gaussian based on this sign box's dimensions
+                sigma_x = sb.width * 4 / scale_factor / 3
+                sigma_y = sb.height * 4 / scale_factor / 3
+                
+                # Generate 2D Gaussian
+                response = create_2d_gaussian(center_x, center_y, 
+                                              heatmap_width, heatmap_height, 
+                                              sigma_x, sigma_y,
+                                              avg_width=self.avg_width / scale_factor,
+                                              avg_height=self.avg_height / scale_factor)
+            elif method == 'rectangle_blur':
+                # Use rectangle + Gaussian blur
+                bbox_width_scaled = sb.width / scale_factor
+                bbox_height_scaled = sb.height / scale_factor
+                sigma_blur = (bbox_width_scaled + bbox_height_scaled) / 4
+                
+                response = create_2d_rectangle_blur(center_x, center_y,
+                                                    heatmap_width, heatmap_height,
+                                                    bbox_width_scaled, bbox_height_scaled,
+                                                    sigma_blur=sigma_blur)
+            else:
+                raise ValueError(f"Unknown method: {method}")
             
-            # Generate 2D Gaussian
-            gaussian = create_2d_gaussian(center_x, center_y, 
-                                          heatmap_width, heatmap_height, 
-                                          sigma_x, sigma_y)
-            heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], gaussian)
+            heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], response)
         
         self.heatmap = heatmap
         return heatmap
@@ -1151,17 +1175,107 @@ def compute_avg_dimensions(detections):
     return np.mean(widths), np.mean(heights)
 
 # ============ Heatmap-based Alignment ============
-def create_2d_gaussian(center_x, center_y, width, height, sigma_x, sigma_y):
-    """Create a 2D Gaussian centered at (center_x, center_y)"""
+def create_2d_gaussian(center_x, center_y, width, height, sigma_x, sigma_y, 
+                       avg_width=None, avg_height=None, scale_coefficient=None):
+    """
+    Create a normalized 2D Gaussian centered at (center_x, center_y).
+    The peak value decreases with larger sigma to prevent large signs from dominating the heatmap.
+    
+    Args:
+        center_x, center_y: Center position
+        width, height: Heatmap dimensions
+        sigma_x, sigma_y: Gaussian standard deviations
+        avg_width, avg_height: Average sign dimensions (optional, for auto scaling)
+        scale_coefficient: Manual scaling coefficient (optional, overrides auto scaling)
+    """
     x = np.arange(0, width)
     y = np.arange(0, height)
     xx, yy = np.meshgrid(x, y)
     
-    gaussian = np.exp(-((xx - center_x)**2 / (2 * sigma_x**2) + 
-                        (yy - center_y)**2 / (2 * sigma_y**2)))
+    # Normalized 2D Gaussian: base normalization is 1/(2*pi*sigma_x*sigma_y)
+    base_normalization = 1.0 / (2 * np.pi * sigma_x * sigma_y)
+    
+    # Calculate scaling coefficient to maintain reasonable gradient magnitudes
+    if scale_coefficient is None:
+        if avg_width is not None and avg_height is not None:
+            # Scale by pi * avg_width * avg_height * 4 (4 is the sigma coefficient)
+            # Then divide by a constant to keep peak values around 1
+            scale_up = np.pi * avg_width * avg_height * 4
+            scale_down = 4.0  # Adjustable constant to control peak magnitude
+            scale_coefficient = scale_up / scale_down
+        else:
+            scale_coefficient = 1.0
+    
+    # Apply normalization and scaling
+    normalization_factor = base_normalization * scale_coefficient
+    
+    gaussian = normalization_factor * np.exp(-((xx - center_x)**2 / (2 * sigma_x**2) + 
+                                                (yy - center_y)**2 / (2 * sigma_y**2)))
+    
+    # No upper limit - let values distribute naturally based on sign size
+    # Smaller signs (smaller sigma) will have higher peaks, which is desirable
+    
     return gaussian
 
-def create_detection_heatmap(detections, img_shape, CLASSES_ABZ, scale_factor=10, avg_width=None, avg_height=None):
+def create_2d_rectangle_blur(center_x, center_y, width, height, bbox_width, bbox_height, 
+                             sigma_blur=2.0):
+    """
+    Create a rectangular region for a sign, then apply Gaussian blur.
+    This is a simpler alternative to Gaussian heatmap generation.
+    
+    Args:
+        center_x, center_y: Center position in heatmap coordinates
+        width, height: Heatmap dimensions
+        bbox_width, bbox_height: Bounding box dimensions in heatmap coordinates
+        sigma_blur: Sigma for Gaussian blur (controls spread)
+    
+    Returns:
+        Blurred rectangular heatmap channel
+    """
+    # Create empty heatmap
+    heatmap_channel = np.zeros((int(height), int(width)), dtype=np.float32)
+    
+    # Calculate rectangle bounds
+    x1 = int(center_x - bbox_width / 2)
+    y1 = int(center_y - bbox_height / 2)
+    x2 = int(center_x + bbox_width / 2)
+    y2 = int(center_y + bbox_height / 2)
+    
+    # Clamp to heatmap bounds
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(int(width), x2)
+    y2 = min(int(height), y2)
+    
+    # Fill rectangle with 1.0
+    if x1 < x2 and y1 < y2:
+        heatmap_channel[y1:y2, x1:x2] = 1.0
+    
+    # Apply Gaussian blur to spread the response
+    # kernel_size should be odd and proportional to sigma
+    kernel_size = int(sigma_blur * 6) + 1
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    
+    heatmap_channel = cv2.GaussianBlur(heatmap_channel, (kernel_size, kernel_size), sigma_blur)
+    
+    return heatmap_channel
+
+def create_detection_heatmap(detections, img_shape, CLASSES_ABZ, scale_factor=10, avg_width=None, avg_height=None, method='gaussian'):
+    """
+    Create heatmap from detections using specified method.
+    
+    Args:
+        detections: List of detection dictionaries
+        img_shape: Original image shape
+        CLASSES_ABZ: List of class names
+        scale_factor: Scale factor for heatmap
+        avg_width, avg_height: Average sign dimensions
+        method: 'gaussian' or 'rectangle_blur'
+    
+    Returns:
+        heatmap, influence_radius, sigma (or blur_sigma for rectangle_blur)
+    """
     img_height, img_width = img_shape[:2]
     num_CLASSES_ABZ = len(CLASSES_ABZ)
     
@@ -1177,6 +1291,7 @@ def create_detection_heatmap(detections, img_shape, CLASSES_ABZ, scale_factor=10
         avg_width, avg_height = compute_avg_dimensions(detections)
     
     influence_radius = (avg_width + avg_height) / 2 * 1.5 / scale_factor  # for reference
+    sigma_or_blur = 0
     
     # Generate heatmap for each detection
     for det in detections:
@@ -1191,18 +1306,51 @@ def create_detection_heatmap(detections, img_shape, CLASSES_ABZ, scale_factor=10
         # Compute center and scale to heatmap coordinates
         center_x = (x1 + x2) / 2 / scale_factor
         center_y = (y1 + y2) / 2 / scale_factor
+        bbox_width_scaled = bbox_width / scale_factor
+        bbox_height_scaled = bbox_height / scale_factor
         
-        # Use anisotropic Gaussian based on this bbox's dimensions
-        sigma_x = bbox_width * 1.5 / scale_factor / 3  # ~99.7% of Gaussian within 3 sigma
-        sigma_y = bbox_height * 1.5 / scale_factor / 3
+        if method == 'gaussian':
+            # Use anisotropic Gaussian based on this bbox's dimensions
+            sigma_x = bbox_width * 4 / scale_factor / 3  # ~99.7% of Gaussian within 3 sigma
+            sigma_y = bbox_height * 4 / scale_factor / 3
+            sigma_or_blur = sigma_x  # return for reference
+            
+            # Generate 2D Gaussian and add to corresponding class channel
+            response = create_2d_gaussian(center_x, center_y, heatmap_width, heatmap_height, 
+                                         sigma_x, sigma_y,
+                                         avg_width=avg_width / scale_factor,
+                                         avg_height=avg_height / scale_factor)
+        elif method == 'rectangle_blur':
+            # Use rectangle + Gaussian blur
+            # sigma_blur proportional to average bbox size
+            sigma_blur = (bbox_width_scaled + bbox_height_scaled) / 6
+            sigma_or_blur = sigma_blur  # return for reference
+            
+            response = create_2d_rectangle_blur(center_x, center_y, 
+                                                heatmap_width, heatmap_height,
+                                                bbox_width_scaled, bbox_height_scaled,
+                                                sigma_blur=sigma_blur)
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'gaussian' or 'rectangle_blur'")
         
-        # Generate 2D Gaussian and add to corresponding class channel
-        gaussian = create_2d_gaussian(center_x, center_y, heatmap_width, heatmap_height, sigma_x, sigma_y)
-        heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], gaussian)
+        heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], response)
     
-    return heatmap, influence_radius, sigma_x
+    return heatmap, influence_radius, sigma_or_blur
 
-def create_text_heatmap(text_lines, CLASSES_ABZ, avg_width, avg_height, scale_factor=10):
+def create_text_heatmap(text_lines, CLASSES_ABZ, avg_width, avg_height, scale_factor=10, method='gaussian'):
+    """
+    Create heatmap from text lines using specified method.
+    
+    Args:
+        text_lines: List of text lines (each line is a list of sign names)
+        CLASSES_ABZ: List of class names
+        avg_width, avg_height: Average sign dimensions
+        scale_factor: Scale factor for heatmap
+        method: 'gaussian' or 'rectangle_blur'
+    
+    Returns:
+        heatmap_text, margin, influence_radius, sigma (or blur_sigma)
+    """
     num_CLASSES_ABZ = len(CLASSES_ABZ)
     
     # Determine grid dimensions for text_lines
@@ -1223,10 +1371,20 @@ def create_text_heatmap(text_lines, CLASSES_ABZ, avg_width, avg_height, scale_fa
     # Initialize heatmap
     heatmap_text = np.zeros((heatmap_height_text_scaled, heatmap_width_text_scaled, num_CLASSES_ABZ), dtype=np.float32)
     
-    # Gaussian parameters - use anisotropic Gaussian
-    sigma_x_text = avg_width * 1.5 / scale_factor / 3
-    sigma_y_text = avg_height * 1.5 / scale_factor / 3
-    influence_radius_text = (avg_width + avg_height) / 2 * 1.5 / scale_factor  # for reference
+    # Parameters for heatmap generation
+    influence_radius_text = (avg_width + avg_height) / 2 * 4 / scale_factor  # for reference
+    
+    if method == 'gaussian':
+        # Gaussian parameters - use anisotropic Gaussian
+        sigma_x_text = avg_width * 4 / scale_factor / 3
+        sigma_y_text = avg_height * 4 / scale_factor / 3
+        sigma_or_blur = sigma_x_text
+    elif method == 'rectangle_blur':
+        # Rectangle + blur parameters
+        sigma_blur_text = (avg_width + avg_height) / 4 / scale_factor
+        sigma_or_blur = sigma_blur_text
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'gaussian' or 'rectangle_blur'")
     
     # Build sign_name to class_id lookup (do this once instead of in nested loops)
     sign_name_to_class_id = {}
@@ -1251,13 +1409,25 @@ def create_text_heatmap(text_lines, CLASSES_ABZ, avg_width, avg_height, scale_fa
             center_x_scaled = center_x_orig / scale_factor
             center_y_scaled = center_y_orig / scale_factor
             
-            # Generate 2D Gaussian and add to corresponding class channel
-            gaussian_text = create_2d_gaussian(center_x_scaled, center_y_scaled, 
+            if method == 'gaussian':
+                # Generate 2D Gaussian and add to corresponding class channel
+                response = create_2d_gaussian(center_x_scaled, center_y_scaled, 
                                               heatmap_width_text_scaled, heatmap_height_text_scaled, 
-                                              sigma_x_text, sigma_y_text)
-            heatmap_text[:, :, class_id] = np.maximum(heatmap_text[:, :, class_id], gaussian_text)
+                                              sigma_x_text, sigma_y_text,
+                                              avg_width=avg_width / scale_factor,
+                                              avg_height=avg_height / scale_factor)
+            elif method == 'rectangle_blur':
+                # Generate rectangle + blur
+                bbox_width_scaled = avg_width / scale_factor
+                bbox_height_scaled = avg_height / scale_factor
+                response = create_2d_rectangle_blur(center_x_scaled, center_y_scaled,
+                                                    heatmap_width_text_scaled, heatmap_height_text_scaled,
+                                                    bbox_width_scaled, bbox_height_scaled,
+                                                    sigma_blur=sigma_blur_text)
+            
+            heatmap_text[:, :, class_id] = np.maximum(heatmap_text[:, :, class_id], response)
     
-    return heatmap_text, margin, influence_radius_text, sigma_x_text
+    return heatmap_text, margin, influence_radius_text, sigma_or_blur
 
 def match_heatmaps_ncc(detection_heatmap, text_heatmap, scale_factor=10):
     num_CLASSES_ABZ = detection_heatmap.shape[2]
@@ -1619,14 +1789,19 @@ class HeatmapVisualizer:
             img_rgb = cv2.resize(img_rgb, (heatmap.shape[1], heatmap.shape[0]))
             heatmap_channel = heatmap[:, :, channels[i]]
             
+            # Use fixed vmax for comparability across different heatmaps
+            # Set to a reasonable value based on expected peak intensities
+            vmax_fixed = 1.0  # Adjustable - increase if peaks are typically higher
+            channel_max = heatmap_channel.max()
+            
             # Create heatmap overlay
             axes[row, col].imshow(img_rgb, alpha=0.5)
-            im = axes[row, col].imshow(heatmap_channel, cmap='hot', alpha=0.6, vmin=0, vmax=1)
+            im = axes[row, col].imshow(heatmap_channel, cmap='hot', alpha=0.6, vmin=0, vmax=vmax_fixed)
             if channels[i] < len(CLASSES_ABZ):
                 converter = SignNameConverter(CLASSES_ABZ[channels[i]])
-                title = f'Class {channels[i]}: {converter.get_abz()} → {converter.get_sign_name()}'
+                title = f'Class {channels[i]}: {converter.get_abz()} → {converter.get_sign_name()}\nmax={channel_max:.3f} (vmax={vmax_fixed})'
             else:
-                title = f'Class {channels[i]}: Unknown'
+                title = f'Class {channels[i]}: Unknown\nmax={channel_max:.3f} (vmax={vmax_fixed})'
             axes[row, col].set_title(title)
             axes[row, col].axis('off')
             plt.colorbar(im, ax=axes[row, col], fraction=0.046)
