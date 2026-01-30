@@ -33,104 +33,11 @@ Y_THRESHOLD = 35  # for grouping signs into lines
 OUTPUT_DIR = "alignment_results"
 SAMPLE_LIMIT = 5  # number of samples to process
 
-# ============ Class Names ============
-# class names list from model
-# model.dataset_meta["classes"]
-CLASSES_NAME = ['TU', '|U.GUD|', 'TUM', 'LA', 'TA', 'GAR', 'GAL', 'I', 'TI', 'LI', 'ZA', 'A', 'DI', 'MI', 'RI', 'IŠ', 'BA', 'LU', 'TE', 'DA', '|GUD×KUR|', 'MA', 'E₂', 'DIŠ', 'MU', 'DU', 'ŠU₂', 'EN', 'KUL', 'SI', '|I.A|', 'HI', 'MUŠ₃', 'AN', 'NA', 'BAD', 'AMAR', 'UD', 'UnclearSign', '|HI×BAD|', '|UD×(U.U.U)|', 'AB', 'AK', 'LUGAL', 'DIN', 'KI', 'DUN₃@g', 'KU₃', 'AŠ', 'IGI', 'U₂', 'ŠA₃', 'BI', 'GUR', 'ŠE', 'ZI', 'GA', 'SILA₃', 'ŠID', '|SAL.TUG₂|', 'SU', 'KAK', 'MAŠ', 'TUR', 'ŠEŠ', 'LU₂', 'IA₂', 'UR', 'KAL', '|ŠEŠ.KI|', 'ZU', 'ŠU', 'NE', 'IM', 'RA', '|U.U|', 'ZAG', '|DIŠ.DIŠ.DIŠ|', 'GA₂', 'IN', 'KIN', 'TAR', 'MAH', 'LAL', 'KID', 'GABA', 'KA', 'RU', 'ŠA', '|HI×NUN|', 'ME', 'BU', 'NI', 'IG', 'MES', 'PA', 'SAG', 'U', 'E', 'GUM', 'GIŠ', '|U.KA|', 'LUM', '|HI×AŠ₂|', 'HA', 'UŠ', '|U.U.U|', 'MIN', 'NAM', 'NU', 'AL', 'AB₂', 'IB', 'UM', 'KU', 'SUR', 'MEŠ', 'TUG₂', 'TAG', 'DIM', 'BAL', 'IR', 'ERIN₂', 'PAP', 'SA', '|PIRIG×ZA|', 'UB', 'URU', '|U.5(DIŠ)|', 'DAM', 'GAR₃', '|EN.ZU|', 'ZE₂', 'AD', 'APIN', 'EL', 'PI', 'AŠ@z', 'DAR', 'DUB', 'SAR', 'GUD', 'A₂', 'KUR', 'ARAD', '|IGI.DIB|', '6(DIŠ)', 'AŠ₂', 'IL', 'HU', 'NUN', 'SAL', 'GI', 'EŠ₂', 'UN', 'TIL', 'NIM', 'TAB', 'SUM', '|3×AN|', '|NINDA₂×ŠE|', 'MAŠ₂', 'GI₄', 'GAN', 'DIM₂', 'GU', 'MAR', 'MUŠ', 'BAR', '|IGI.RI|', 'TUK', '|UD.DU|', '|LAGAB.LAGAB|']
 
-# ABZ class names from model
-CLASSES_ABZ = ['ABZ58', 'ABZ441', 'ABZ207', 'ABZ55', 'ABZ139', 'ABZ597', 'ABZ343', 'ABZ142', 'ABZ73', 'ABZ59', 'ABZ586', 'ABZ579', 'ABZ457', 'ABZ427', 'ABZ86', 'ABZ212', 'ABZ5', 'ABZ537', 'ABZ376', 'ABZ335', 'ABZ170', 'ABZ342', 'ABZ324', 'ABZ480', 'ABZ61', 'ABZ206', 'ABZ545', 'ABZ99', 'ABZ72', 'ABZ112', 'ABZ142a', 'ABZ396', 'ABZ103', 'ABZ13', 'ABZ70', 'ABZ69', 'ABZ437', 'ABZ381', 'X', 'ABZ279', 'ABZ52', 'ABZ128', 'ABZ97', 'ABZ151', 'ABZ465', 'ABZ461', 'ABZ595', 'ABZ468', 'ABZ1', 'ABZ449', 'ABZ318', 'ABZ384', 'ABZ214', 'ABZ111', 'ABZ367', 'ABZ84', 'ABZ319', 'ABZ62', 'ABZ314', 'ABZ556', 'ABZ7', 'ABZ230', 'ABZ74', 'ABZ144', 'ABZ331', 'ABZ330', 'ABZ598a', 'ABZ575', 'ABZ322', 'NoABZ0', 'ABZ6', 'ABZ354', 'ABZ172', 'ABZ399', 'ABZ328', 'ABZ471', 'ABZ332', 'ABZ593', 'ABZ233', 'ABZ148', 'ABZ538', 'ABZ12', 'ABZ57', 'ABZ481', 'ABZ313', 'ABZ167', 'ABZ15', 'ABZ68', 'ABZ353', 'ABZ398', 'ABZ532', 'ABZ371', 'ABZ231', 'ABZ80', 'ABZ314', 'ABZ295', 'ABZ115', 'ABZ411', 'ABZ308', 'ABZ191', 'ABZ296', 'ABZ412', 'ABZ565', 'ABZ401', 'ABZ589', 'ABZ211', 'ABZ472', 'ABZ570', 'ABZ79', 'ABZ75', 'ABZ298', 'ABZ420', 'ABZ535', 'ABZ134', 'ABZ536', 'ABZ101', 'ABZ533', 'ABZ536', 'ABZ126', 'ABZ94', 'ABZ9', 'ABZ232', 'ABZ393', 'ABZ60', 'ABZ104', 'ABZ131', 'ABZ306', 'ABZ38', 'ABZ470', 'ABZ557', 'ABZ333', 'NoABZ0', 'ABZ147', 'ABZ145', 'ABZ56', 'ABZ564', 'ABZ383', 'ABZ360', 'ABZ114', 'ABZ138', 'ABZ331e+152i', 'ABZ297', 'ABZ334', 'ABZ366', 'ABZ50', 'ABZ455', 'ABZ598b', 'ABZ339', 'ABZ205', 'ABZ78', 'ABZ87', 'ABZ554', 'ABZ85', 'ABZ536', 'ABZ312', 'ABZ69', 'ABZ433', 'ABZ124', 'ABZ164', 'ABZ129a', 'NoABZ0', 'ABZ76', 'ABZ326', 'ABZ143', 'ABZ440', 'ABZ559', 'ABZ307', 'ABZ374', 'ABZ74', 'ABZ451', 'ABZ574', 'NoABZ0', 'ABZ529']
 
-# ============ MongoDB Connection for ABZ -> Sign Name ============
-# get MongoDB connection string from ...
-uri = os.getenv('MONGODB_URI', 'YOUR_MONGODB_URI')
-client = MongoClient(uri)
-db = client['ebl']
-signs_collection = db['signs']
 
-class SignNameConverter:
-    def __init__(self, sign=None, expected_type=None):
-        if expected_type not in (None, 'ABZ', 'SIGN', 'INDEX'):
-            raise ValueError("expected type must be one of None, 'ABZ', 'SIGN', 'INDEX'")
-        if sign != None:
-            if expected_type:
-                name_type = self._check_name_type(sign)
-                if name_type != expected_type:
-                    print(f"Warning: sign type of sign '{sign}' mismatch. Expected {expected_type}, got {name_type}. Setting to 'X'.")
-                    sign = "X"
-            self._set_signs(sign)
-    
-    def get_abz(self):
-        return self.abz 
-    def get_sign_name(self):
-        return self.sign_name
-    def get_sign_idx(self):
-        return self.sign_idx
-    def set_signs(self, sign):
-        self._set_signs(sign)
 
-    def _set_signs(self, sign):
-        self.original_sign = sign
-        sign_type = self._check_name_type(sign=self.original_sign)
-        if sign_type == 'ABZ':
-            self.abz = sign
-            self.sign_name = self._convert_abz_to_sign_name(sign)
-            if self.abz in CLASSES_ABZ:
-                self.sign_idx = CLASSES_ABZ.index(self.abz)
-            else:
-                self.sign_idx = -1 # outside of known CLASSES_ABZ, which only possible for annotated signs, not detected ones
-        elif sign_type == 'SIGN':
-            self.sign_name = sign
-            self.abz = self._convert_sign_name_to_abz(sign)
-            if self.abz in CLASSES_ABZ:
-                self.sign_idx = CLASSES_ABZ.index(self.abz)
-            else:
-                self.sign_idx = -1 # outside of known CLASSES_ABZ, which only possible for annotated signs, not detected ones
-        elif sign_type == 'INDEX':
-            self.sign_idx = sign
-            self.abz = CLASSES_ABZ[self.sign_idx]
-            self.sign_name = self._convert_abz_to_sign_name(self.abz)
-        else:
-            raise TypeError
 
-    @staticmethod
-    def _build_mappings():
-
-        abz_to_sign = {}
-        sign_to_abz = {}
-        
-        # Build mappings from the parallel arrays
-        for abz_name, sign_name in zip(CLASSES_ABZ, CLASSES_NAME):
-            # Only add if not already present (handles duplicates by keeping first occurrence)
-            if abz_name not in abz_to_sign:
-                abz_to_sign[abz_name] = sign_name
-            if sign_name not in sign_to_abz:
-                sign_to_abz[sign_name] = abz_name
-        
-        abz_to_sign['X'] = 'UnclearSign'
-        abz_to_sign['NoABZ0'] = 'UnclearSign'
-        sign_to_abz['UnclearSign'] = 'X'
-
-        return abz_to_sign, sign_to_abz
-    
-    ABZ_TO_SIGN, SIGN_TO_ABZ = _build_mappings.__func__()
-    
-    def _check_name_type(self, sign):
-        if isinstance(sign, int):
-            return 'INDEX'
-        if sign.startswith('ABZ') or sign.startswith('NoABZ') or sign == 'X':
-            return 'ABZ'
-        return 'SIGN'
-    1
-    def _convert_abz_to_sign_name(self, sign):
-        return self.ABZ_TO_SIGN.get(sign, 'UnclearSign')
-
-    def _convert_sign_name_to_abz(self, sign_name):
-        return self.SIGN_TO_ABZ.get(sign_name, 'X')
-
-def abz_to_sign_name(abz):
-    converter = SignNameConverter(abz)
-    return converter.get_sign_name()     
     
 
 # ============ Data Loading ============
@@ -265,55 +172,8 @@ def parse_api_signs(signs_text):
 
 
 # ============ Detection ============
-class BaseDetector(ABC):
-    def __init__(self, model, CLASSES_ABZ: List[str], score_threshold: float = 0.5):
-        self.model = model
-        self.CLASSES_ABZ = CLASSES_ABZ
-        self.score_threshold = score_threshold
-    
-    @abstractmethod
-    def detect(self, img) -> List[Dict]:
-        pass
-    
-    def _filter_detections(self, labels, bboxes, scores) -> List[Dict]:
-        mask = scores > self.score_threshold
-        labels = labels[mask]
-        bboxes = bboxes[mask]
-        scores = scores[mask]
-        
-        detections = []
-        for i in range(len(labels)):
-            bbox = bboxes[i]
-            abz_name = self.CLASSES_ABZ[labels[i]]
-            converter = SignNameConverter(abz_name)
-            detections.append({
-                'bbox': [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
-                'abz_name': abz_name,
-                'sign_name': converter.get_sign_name(),
-                'score': float(scores[i])
-            })
-        
-        return detections
-
-class SingleImageDetector(BaseDetector):
-    def detect(self, img) -> List[Dict]:
-        result = inference_detector(self.model, img)
-        OCR_result = result.pred_instances.cpu()
-        
-        labels = OCR_result['labels'].numpy()
-        bboxes = OCR_result['bboxes'].numpy()
-        scores = OCR_result['scores'].numpy()
-        
-        return self._filter_detections(labels, bboxes, scores)
 
 
-@dataclass
-class SingleImage:
-    img: np.ndarray
-    detections: List[Dict] = field(default_factory=list)
-    
-    def __len__(self):
-        return len(self.detections)
 
 
 # ============ Sub-Tablet Data Structure ============
@@ -1078,62 +938,7 @@ class ElasticChainOptimizer:
         plt.show()
 
 
-class TabletImageDetector(BaseDetector):
-    def __init__(self, model, CLASSES_ABZ: List[str], score_threshold: float = 0.5, 
-                 visualize_crop: bool = False, logging_crop: bool = False, keep_crops: bool = False):
-        super().__init__(model, CLASSES_ABZ, score_threshold)
-        self.visualize_crop = visualize_crop
-        self.logging_crop = logging_crop
-        self.keep_crops = keep_crops
-        self.cropped_images = []
-        self.crop_coordinates = []  # Store crop coordinates for GT transformation
-    
-    def detect(self, img) -> List[Dict]:
-        if self.keep_crops:
-            self.cropped_images = [] # reset cropped for each detection
 
-        cropped_images, crop_coordinates = divide_tablet_photo(
-            img, 
-            visualize=self.visualize_crop, 
-            logging=self.logging_crop, 
-            return_coordinates=True
-        )
-        
-        # Store crop coordinates
-        self.crop_coordinates = crop_coordinates
-        
-        # Create single image detector for processing cropped pieces
-        single_detector = SingleImageDetector(self.model, self.CLASSES_ABZ, self.score_threshold)
-        
-        all_detections = []
-        
-        # Process each cropped piece
-        for idx, img_piece in enumerate(cropped_images):
-            # Use SingleImageDetector to detect signs in the cropped piece
-            piece_detections = single_detector.detect(img_piece)
-
-            if self.keep_crops:
-                # Deep copy to avoid modifying stored detections when transforming coordinates
-                self.cropped_images.append(SingleImage(img=img_piece, detections=copy.deepcopy(piece_detections)))
-            
-            # Transform to original image coordinates
-            piece_offset_x = crop_coordinates[idx]['x']
-            piece_offset_y = crop_coordinates[idx]['y']
-            
-            for det in piece_detections:
-                bbox = det['bbox']
-                det['bbox'] = [
-                    bbox[0] + piece_offset_x,
-                    bbox[1] + piece_offset_y,
-                    bbox[2] + piece_offset_x,
-                    bbox[3] + piece_offset_y
-                ]
-                all_detections.append(det)
-        
-        return all_detections
-    
-    def get_cropped_images(self) -> List[SingleImage]:
-        return self.cropped_images
     
 
 def group_detections_into_lines(detections):
