@@ -3,6 +3,18 @@ Elastic Chain Optimizer for sign alignment refinement.
 
 Uses gradient-based optimization to align text-based sign positions
 with detection heatmap evidence.
+
+Key insight: detection bounding-box *locations* are often more reliable
+than their *class labels*. A class-agnostic "existence map" captures
+the spatial probability that *any* sign exists at a position,
+allowing the optimizer to snap signs to detected locations even when
+the per-class label disagrees.
+
+The data loss is therefore split into two parts:
+    L_data = (1 - alpha_geo) * L_semantic  +  alpha_geo * L_geometric
+where
+    L_semantic  = -mean_i ScoreMap[class_i](x_i, y_i)   (per-class)
+    L_geometric = -mean_i H_agnostic(x_i, y_i)          (class-agnostic)
 """
 
 import numpy as np
@@ -15,12 +27,27 @@ from .sign import CLASSES_ABZ as DEFAULT_CLASSES_ABZ
 from .tablet import SignBox, SubTablet
 
 
+def build_agnostic_heatmap(heatmap: np.ndarray) -> np.ndarray:
+    """
+    Build a class-agnostic existence map by taking the channel-wise max.
+
+    Args:
+        heatmap: (H, W, C) numpy array – per-class heatmap.
+
+    Returns:
+        (H, W) numpy array where each pixel is the max across all classes.
+    """
+    return np.max(heatmap, axis=2)
+
+
 class ElasticChainOptimizer:
     """
     Elastic Chain Model for refining text-aligned bounding boxes.
     
     Uses gradient-based optimization to minimize an energy function that combines:
-    - L_data: Heatmap matching score (signs should be at high-response positions)
+    - L_data: Heatmap matching score, decomposed into
+        - L_semantic:  per-class heatmap response  (weight: 1-alpha_geo)
+        - L_geometric: class-agnostic existence map (weight: alpha_geo)
     - L_seq: Sequential constraint (signs in a row should be tightly distributed)
     - L_smooth: Height consistency (adjacent signs should have similar heights)
     - L_anchor: Line baseline constraint (signs shouldn't deviate too far from row baseline)
@@ -35,6 +62,7 @@ class ElasticChainOptimizer:
                  lambda_seq: float = 0.1,
                  lambda_smooth: float = 0.05,
                  lambda_anchor: float = 0.02,
+                 alpha_geo: float = 0.7,
                  prior_aspect_ratio: float = 1.15,
                  device: str = None):
         """
@@ -47,6 +75,9 @@ class ElasticChainOptimizer:
             lambda_seq: Weight for sequential constraint
             lambda_smooth: Weight for height smoothness
             lambda_anchor: Weight for baseline anchor
+            alpha_geo: Geometric (class-agnostic) weight inside L_data.
+                       L_data = (1-alpha_geo)*L_semantic + alpha_geo*L_geometric.
+                       Default 0.7 gives heavy weight to existence evidence.
             prior_aspect_ratio: Prior width/height ratio for signs
             device: Torch device ('cuda' or 'cpu')
         """
@@ -57,6 +88,7 @@ class ElasticChainOptimizer:
         self.lambda_seq = lambda_seq
         self.lambda_smooth = lambda_smooth
         self.lambda_anchor = lambda_anchor
+        self.alpha_geo = alpha_geo
         self.prior_aspect_ratio = prior_aspect_ratio
         
         if device is None:
@@ -64,8 +96,12 @@ class ElasticChainOptimizer:
         else:
             self.device = device
         
-        # Convert heatmap to torch tensor
+        # Convert per-class heatmap to torch tensor  (H, W, C)
         self.heatmap = torch.from_numpy(detection_heatmap).float().to(self.device)
+        
+        # Build and store class-agnostic existence map  (H, W)
+        agnostic_np = build_agnostic_heatmap(detection_heatmap)
+        self.heatmap_agnostic = torch.from_numpy(agnostic_np).float().to(self.device)
         
         # Get rows of sign boxes
         self.rows = sub_tablet_text.get_rows()
@@ -109,8 +145,35 @@ class ElasticChainOptimizer:
         self.loss_history = []
         self.loss_components_history = []
     
-    def compute_data_loss(self) -> torch.Tensor:
-        """L_data = -sum_i ScoreMap[class_i](x_i, y_i), using grid_sample."""
+    def _sample_heatmap_at_positions(self, heatmap_2d: torch.Tensor) -> torch.Tensor:
+        """
+        Bilinear-sample a 2-D map (H, W) at current sign center positions.
+        Returns a 1-D tensor of sampled values (one per sign).
+        """
+        heatmap_h, heatmap_w = heatmap_2d.shape
+        # Prepare (1, 1, H, W) for grid_sample
+        map_4d = heatmap_2d.unsqueeze(0).unsqueeze(0)
+
+        scores = []
+        for i in range(self.num_signs):
+            cx = self.params[i, 0] / self.scale_factor
+            cy = self.params[i, 1] / self.scale_factor
+
+            norm_x = (cx / (heatmap_w - 1)) * 2 - 1
+            norm_y = (cy / (heatmap_h - 1)) * 2 - 1
+            norm_x = torch.clamp(norm_x, -1, 1)
+            norm_y = torch.clamp(norm_y, -1, 1)
+
+            grid = torch.stack([norm_x, norm_y]).view(1, 1, 1, 2)
+            val = F.grid_sample(map_4d, grid, mode='bilinear',
+                                padding_mode='border', align_corners=True)
+            scores.append(val.squeeze())
+
+        return torch.stack(scores)
+
+    # ---- Semantic loss (per-class) ----
+    def compute_semantic_loss(self) -> torch.Tensor:
+        """L_semantic = -mean_i ScoreMap[class_i](x_i, y_i)."""
         loss = torch.tensor(0.0, device=self.device)
         valid_count = 0
         
@@ -138,6 +201,25 @@ class ElasticChainOptimizer:
             valid_count += 1
         
         return loss / max(1, valid_count)
+
+    # ---- Geometric loss (class-agnostic) ----
+    def compute_geometric_loss(self) -> torch.Tensor:
+        """L_geometric = -mean_i H_agnostic(x_i, y_i)."""
+        scores = self._sample_heatmap_at_positions(self.heatmap_agnostic)
+        return -scores.mean()
+
+    # ---- Combined data loss ----
+    def compute_data_loss(self) -> torch.Tensor:
+        """
+        L_data = (1 - alpha_geo) * L_semantic + alpha_geo * L_geometric
+
+        When alpha_geo = 0  → pure per-class matching (old behaviour).
+        When alpha_geo = 1  → pure existence-map matching.
+        Default alpha_geo = 0.7 heavily relies on geometric evidence.
+        """
+        L_sem = self.compute_semantic_loss()
+        L_geo = self.compute_geometric_loss()
+        return (1.0 - self.alpha_geo) * L_sem + self.alpha_geo * L_geo
     
     def compute_seq_loss(self) -> torch.Tensor:
         """L_seq: adjacent signs in a row should be tightly distributed."""
@@ -203,7 +285,9 @@ class ElasticChainOptimizer:
     
     def compute_total_loss(self) -> tuple:
         """Compute total loss and return all components."""
-        L_data = self.compute_data_loss()
+        L_sem = self.compute_semantic_loss()
+        L_geo = self.compute_geometric_loss()
+        L_data = (1.0 - self.alpha_geo) * L_sem + self.alpha_geo * L_geo
         L_seq = self.compute_seq_loss()
         L_smooth = self.compute_smooth_loss()
         L_anchor = self.compute_anchor_loss()
@@ -213,7 +297,7 @@ class ElasticChainOptimizer:
                    self.lambda_smooth * L_smooth +
                    self.lambda_anchor * L_anchor)
         
-        return L_total, L_data, L_seq, L_smooth, L_anchor
+        return L_total, L_data, L_seq, L_smooth, L_anchor, L_sem, L_geo
     
     def optimize(self, num_iterations: int = 100, lr: float = 1.0,
                  verbose: bool = True, log_every: int = 10) -> SubTablet:
@@ -235,10 +319,11 @@ class ElasticChainOptimizer:
             print(f"Starting optimization with {self.num_signs} signs, {self.num_rows} rows")
             print(f"Lambdas: data={self.lambda_data}, seq={self.lambda_seq}, "
                   f"smooth={self.lambda_smooth}, anchor={self.lambda_anchor}")
+            print(f"alpha_geo={self.alpha_geo} (data = {1-self.alpha_geo:.2f}*semantic + {self.alpha_geo:.2f}*geometric)")
         
         for iteration in range(num_iterations):
             optimizer.zero_grad()
-            L_total, L_data, L_seq, L_smooth, L_anchor = self.compute_total_loss()
+            L_total, L_data, L_seq, L_smooth, L_anchor, L_sem, L_geo = self.compute_total_loss()
             L_total.backward()
             optimizer.step()
             
@@ -251,6 +336,8 @@ class ElasticChainOptimizer:
             self.loss_components_history.append({
                 'total': L_total.item(),
                 'data': L_data.item(),
+                'semantic': L_sem.item(),
+                'geometric': L_geo.item(),
                 'seq': L_seq.item(),
                 'smooth': L_smooth.item(),
                 'anchor': L_anchor.item()
@@ -258,8 +345,9 @@ class ElasticChainOptimizer:
             
             if verbose and (iteration % log_every == 0 or iteration == num_iterations - 1):
                 print(f"Iter {iteration:4d}: L_total={L_total.item():.4f}, "
-                      f"L_data={L_data.item():.4f}, L_seq={L_seq.item():.4f}, "
-                      f"L_smooth={L_smooth.item():.4f}, L_anchor={L_anchor.item():.4f}")
+                      f"L_data={L_data.item():.4f} (sem={L_sem.item():.4f}, geo={L_geo.item():.4f}), "
+                      f"L_seq={L_seq.item():.4f}, L_smooth={L_smooth.item():.4f}, "
+                      f"L_anchor={L_anchor.item():.4f}")
         
         return self.get_optimized_subtablet()
     
@@ -300,20 +388,22 @@ class ElasticChainOptimizer:
         initial = self.initial_params.cpu().numpy()
         return current - initial
     
-    def plot_loss_history(self, figsize: tuple = (12, 4)):
+    def plot_loss_history(self, figsize: tuple = (16, 4)):
         """Plot loss history."""
         if not self.loss_components_history:
             print("No optimization history available")
             return
         
-        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        fig, axes = plt.subplots(1, 3, figsize=figsize)
         
+        # 1. Total loss
         axes[0].plot(self.loss_history)
         axes[0].set_xlabel('Iteration')
         axes[0].set_ylabel('Total Loss')
         axes[0].set_title('Total Loss over Iterations')
         axes[0].grid(True)
         
+        # 2. Main components
         for comp in ['data', 'seq', 'smooth', 'anchor']:
             values = [h[comp] for h in self.loss_components_history]
             axes[1].plot(values, label=f'L_{comp}')
@@ -322,6 +412,17 @@ class ElasticChainOptimizer:
         axes[1].set_title('Loss Components over Iterations')
         axes[1].legend()
         axes[1].grid(True)
+        
+        # 3. Semantic vs Geometric breakdown
+        sem_vals = [h.get('semantic', h.get('data', 0)) for h in self.loss_components_history]
+        geo_vals = [h.get('geometric', 0) for h in self.loss_components_history]
+        axes[2].plot(sem_vals, label='L_semantic (per-class)')
+        axes[2].plot(geo_vals, label='L_geometric (agnostic)')
+        axes[2].set_xlabel('Iteration')
+        axes[2].set_ylabel('Loss')
+        axes[2].set_title(f'Data Loss Decomposition (α_geo={self.alpha_geo:.2f})')
+        axes[2].legend()
+        axes[2].grid(True)
         
         plt.tight_layout()
         plt.show()

@@ -59,6 +59,7 @@ from .tablet import (
 
 from .optimizer import (
     ElasticChainOptimizer,
+    build_agnostic_heatmap,
 )
 
 __all__ = [
@@ -109,4 +110,5 @@ __all__ = [
     
     # Optimization
     'ElasticChainOptimizer',
+    'build_agnostic_heatmap',
 ]
