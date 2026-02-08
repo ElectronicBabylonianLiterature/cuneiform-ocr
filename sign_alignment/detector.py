@@ -1,7 +1,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Optional, Union
 import copy
 
 from mmdet.apis import init_detector, inference_detector
@@ -13,6 +13,7 @@ import numpy as np
 from data_processing.divide_photos import divide_tablet_photo
 
 from .sign import SignResolver
+from .bounding_box import BoundingBox, Detection
 
 @dataclass
 class ModelConfig():
@@ -23,23 +24,30 @@ class ModelConfig():
 @dataclass
 class SingleImage:
     img: np.ndarray
-    detections: List[Dict] = field(default_factory=list)
+    detections: Detection = field(default_factory=list)
     
     def __len__(self):
         return len(self.detections)
 
 class BaseDetector(ABC):
-    def __init__(self, model_config: ModelConfig, score_threshold: float = 0.5):
-        print("Initializing detector, loading model...")
-        register_all_modules()
-        model_config.device = self._select_device(model_config.device)
-        print(f"Using device: {model_config.device}")
-        self.model = init_detector(model_config.config_file, model_config.checkpoint_file, device=model_config.device)
-
+    def __init__(self, model_config: Optional[ModelConfig] = None, score_threshold: float = 0.5, model = None):
         self.score_threshold = score_threshold
+        
+        if model is not None:
+            # Use provided model directly
+            self.model = model
+        elif model_config is not None:
+            # Load model from config
+            print("Initializing detector, loading model...")
+            register_all_modules()
+            model_config.device = self._select_device(model_config.device)
+            print(f"Using device: {model_config.device}")
+            self.model = init_detector(model_config.config_file, model_config.checkpoint_file, device=model_config.device)
+        else:
+            raise ValueError("Either model_config or model must be provided")
     
     @abstractmethod
-    def detect(self, img) -> List[Dict]:
+    def detect(self, img) -> Detection:
         pass
     
     def _select_device(self, device: str):
@@ -48,7 +56,7 @@ class BaseDetector(ABC):
             device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         return device
 
-    def _filter_detections(self, labels, bboxes, scores) -> List[Dict]:
+    def _filter_detections(self, labels, bboxes, scores) -> Detection:
         mask = scores > self.score_threshold
         labels = labels[mask]
         bboxes = bboxes[mask]
@@ -58,17 +66,19 @@ class BaseDetector(ABC):
         for i in range(len(labels)):
             bbox = bboxes[i]
             sign = SignResolver.from_idx(labels[i])
-            detections.append({
-                'bbox': [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
-                'abz_name': sign.abz,
-                'sign_name': sign.name,
-                'score': float(scores[i])
-            })
+            detections.append(BoundingBox(
+                x1=float(bbox[0]),
+                y1=float(bbox[1]),
+                x2=float(bbox[2]),
+                y2=float(bbox[3]),
+                score=float(scores[i]),
+                sign=sign
+            ))
         
         return detections
 
 class SingleImageDetector(BaseDetector):
-    def detect(self, img) -> List[Dict]:
+    def detect(self, img) -> Detection:
         result = inference_detector(self.model, img)
         OCR_result = result.pred_instances.cpu()
         
@@ -88,7 +98,7 @@ class TabletImageDetector(BaseDetector):
         self.cropped_images = []
         self.crop_coordinates = []  # Store crop coordinates for GT transformation
     
-    def detect(self, img) -> List[Dict]:
+    def detect(self, img) -> Detection:
         if self.keep_crops:
             self.cropped_images = [] # reset cropped for each detection
 
@@ -102,8 +112,8 @@ class TabletImageDetector(BaseDetector):
         # Store crop coordinates
         self.crop_coordinates = crop_coordinates
         
-        # Create single image detector for processing cropped pieces
-        single_detector = SingleImageDetector(self.model, self.score_threshold)
+        # Create single image detector using the already-loaded model
+        single_detector = SingleImageDetector(model=self.model, score_threshold=self.score_threshold)
         
         all_detections = []
         
@@ -121,14 +131,16 @@ class TabletImageDetector(BaseDetector):
             piece_offset_y = crop_coordinates[idx]['y']
             
             for det in piece_detections:
-                bbox = det['bbox']
-                det['bbox'] = [
-                    bbox[0] + piece_offset_x,
-                    bbox[1] + piece_offset_y,
-                    bbox[2] + piece_offset_x,
-                    bbox[3] + piece_offset_y
-                ]
-                all_detections.append(det)
+                # Transform BoundingBox coordinates
+                transformed_det = BoundingBox(
+                    x1=det.x1 + piece_offset_x,
+                    y1=det.y1 + piece_offset_y,
+                    x2=det.x2 + piece_offset_x,
+                    y2=det.y2 + piece_offset_y,
+                    score=det.score,
+                    sign=det.sign
+                )
+                all_detections.append(transformed_det)
         
         return all_detections
     

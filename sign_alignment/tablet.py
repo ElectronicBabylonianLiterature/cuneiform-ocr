@@ -1,0 +1,307 @@
+"""
+SubTablet data structures for sign alignment.
+
+Provides SignBox and SubTablet classes for organizing sign bounding boxes,
+generating heatmaps, and performing coordinate transformations.
+"""
+
+import numpy as np
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from .sign import Sign, SignResolver, CLASSES_ABZ
+from .bounding_box import BoundingBox, Detection
+from .heatmap import (
+    create_2d_gaussian, 
+    create_2d_rectangle_blur,
+    compute_avg_dimensions,
+)
+
+
+@dataclass
+class SignBox:
+    """
+    Represents a single sign bounding box with center-based representation.
+    Stored as (cx, cy, w, h) with conversion to [x1, y1, x2, y2].
+    """
+    sign: Sign
+    score: float = 1.0
+    cx: float = 0.0
+    cy: float = 0.0
+    width: float = 0.0
+    height: float = 0.0
+    row_idx: int = -1
+    col_idx: int = -1
+    
+    @property
+    def sign_name(self) -> str:
+        return self.sign.name
+    
+    @property
+    def abz_name(self) -> str:
+        return self.sign.abz
+
+    @classmethod
+    def from_bbox(cls, bbox: List[float], sign: Sign,
+                  score: float = 1.0, row_idx: int = -1, col_idx: int = -1) -> 'SignBox':
+        """Create from [x1, y1, x2, y2] format."""
+        x1, y1, x2, y2 = bbox
+        return cls(
+            sign=sign, score=score,
+            cx=(x1 + x2) / 2, cy=(y1 + y2) / 2,
+            width=x2 - x1, height=y2 - y1,
+            row_idx=row_idx, col_idx=col_idx
+        )
+    
+    @classmethod
+    def from_center(cls, cx: float, cy: float, width: float, height: float,
+                    sign: Sign, score: float = 1.0,
+                    row_idx: int = -1, col_idx: int = -1) -> 'SignBox':
+        """Create from center format."""
+        return cls(sign=sign, score=score, cx=cx, cy=cy,
+                   width=width, height=height,
+                   row_idx=row_idx, col_idx=col_idx)
+    
+    @classmethod
+    def from_detection(cls, det: BoundingBox, row_idx: int = -1, col_idx: int = -1) -> 'SignBox':
+        """Create from a BoundingBox detection."""
+        return cls(
+            sign=det.sign, score=det.score,
+            cx=(det.x1 + det.x2) / 2, cy=(det.y1 + det.y2) / 2,
+            width=det.x2 - det.x1, height=det.y2 - det.y1,
+            row_idx=row_idx, col_idx=col_idx
+        )
+    
+    @property
+    def x1(self) -> float:
+        return self.cx - self.width / 2
+    
+    @property
+    def y1(self) -> float:
+        return self.cy - self.height / 2
+    
+    @property
+    def x2(self) -> float:
+        return self.cx + self.width / 2
+    
+    @property
+    def y2(self) -> float:
+        return self.cy + self.height / 2
+    
+    @property
+    def bbox(self) -> List[float]:
+        """Return [x1, y1, x2, y2]."""
+        return [self.x1, self.y1, self.x2, self.y2]
+    
+    @property
+    def center(self) -> tuple:
+        return (self.cx, self.cy)
+    
+    def to_bounding_box(self) -> BoundingBox:
+        """Convert to BoundingBox for visualizer compatibility."""
+        return BoundingBox(
+            x1=self.x1, y1=self.y1, x2=self.x2, y2=self.y2,
+            score=self.score, sign=self.sign
+        )
+    
+    def translate(self, dx: float, dy: float) -> 'SignBox':
+        """Return translated copy."""
+        return SignBox(
+            sign=self.sign, score=self.score,
+            cx=self.cx + dx, cy=self.cy + dy,
+            width=self.width, height=self.height,
+            row_idx=self.row_idx, col_idx=self.col_idx
+        )
+    
+    def copy(self) -> 'SignBox':
+        """Return a deep copy."""
+        return SignBox(
+            sign=self.sign, score=self.score,
+            cx=self.cx, cy=self.cy,
+            width=self.width, height=self.height,
+            row_idx=self.row_idx, col_idx=self.col_idx
+        )
+
+
+@dataclass
+class SubTablet:
+    """
+    Represents a sub-tablet region with image, sign boxes, and heatmap.
+    """
+    img: Optional[np.ndarray] = None
+    sign_boxes: List[SignBox] = field(default_factory=list)
+    heatmap: Optional[np.ndarray] = None
+    
+    name: str = ""
+    scale_factor: int = 10
+    avg_width: float = 80.0
+    avg_height: float = 80.0
+    margin: float = 0.0
+    origin_x: float = 0.0
+    origin_y: float = 0.0
+    
+    def __len__(self):
+        return len(self.sign_boxes)
+    
+    @property
+    def shape(self) -> tuple:
+        if self.img is not None:
+            return self.img.shape[:2]
+        elif self.sign_boxes:
+            max_x = max(sb.cx + sb.width / 2 for sb in self.sign_boxes)
+            max_y = max(sb.cy + sb.height / 2 for sb in self.sign_boxes)
+            return (int(max_y + self.margin), int(max_x + self.margin))
+        return (0, 0)
+    
+    @classmethod
+    def from_detections(cls, img: np.ndarray, detections: Detection,
+                        name: str = "detection",
+                        avg_width: float = None, avg_height: float = None) -> 'SubTablet':
+        """Create from image and BoundingBox detections."""
+        sign_boxes = [SignBox.from_detection(det) for det in detections]
+        
+        if avg_width is None or avg_height is None:
+            computed_w, computed_h = compute_avg_dimensions(detections)
+            avg_width = avg_width or computed_w
+            avg_height = avg_height or computed_h
+        
+        return cls(img=img, sign_boxes=sign_boxes, name=name,
+                   avg_width=avg_width, avg_height=avg_height)
+    
+    @classmethod
+    def from_text_lines(cls, text_lines: List[List[str]],
+                        avg_width: float, avg_height: float,
+                        margin: float = None,
+                        name: str = "full_text") -> 'SubTablet':
+        """Create from text lines with uniform grid layout."""
+        if margin is None:
+            margin = max(avg_width, avg_height)
+        
+        sign_boxes = []
+        for row_idx, line in enumerate(text_lines):
+            for col_idx, sign_name in enumerate(line):
+                cx = margin + col_idx * avg_width + avg_width / 2
+                cy = margin + row_idx * avg_height + avg_height / 2
+                
+                sign = SignResolver.resolve(sign_name, expected_type='SIGN')
+                
+                sb = SignBox.from_center(
+                    cx=cx, cy=cy, width=avg_width, height=avg_height,
+                    sign=sign, row_idx=row_idx, col_idx=col_idx
+                )
+                sign_boxes.append(sb)
+        
+        return cls(img=None, sign_boxes=sign_boxes, name=name,
+                   avg_width=avg_width, avg_height=avg_height, margin=margin)
+    
+    def to_detection_list(self) -> Detection:
+        """Convert sign_boxes to BoundingBox list for visualizer compatibility."""
+        return [sb.to_bounding_box() for sb in self.sign_boxes]
+    
+    def get_sign_boxes_in_bounds(self, width: float, height: float,
+                                  offset_x: float = 0, offset_y: float = 0) -> List[SignBox]:
+        """Get sign boxes whose centers fall within specified bounds."""
+        result = []
+        for sb in self.sign_boxes:
+            rel_cx = sb.cx - offset_x
+            rel_cy = sb.cy - offset_y
+            if 0 <= rel_cx < width and 0 <= rel_cy < height:
+                translated = sb.translate(-offset_x, -offset_y)
+                result.append(translated)
+        return result
+    
+    def create_heatmap(self, classes_abz: List[str] = None, 
+                       scale_factor: int = None,
+                       img_shape: tuple = None, 
+                       method: str = 'gaussian') -> np.ndarray:
+        """Generate heatmap from sign_boxes."""
+        if classes_abz is None:
+            classes_abz = CLASSES_ABZ
+        if scale_factor is None:
+            scale_factor = self.scale_factor
+        else:
+            self.scale_factor = scale_factor
+        
+        if img_shape is not None:
+            img_height, img_width = img_shape[:2]
+        elif self.img is not None:
+            img_height, img_width = self.img.shape[:2]
+        else:
+            height, width = self.shape
+            img_height, img_width = height, width
+        
+        num_classes = len(classes_abz)
+        heatmap_height = img_height // scale_factor
+        heatmap_width = img_width // scale_factor
+        heatmap = np.zeros((heatmap_height, heatmap_width, num_classes), dtype=np.float32)
+        
+        for sb in self.sign_boxes:
+            if sb.abz_name in classes_abz:
+                class_id = classes_abz.index(sb.abz_name)
+            else:
+                continue
+            
+            center_x = sb.cx / scale_factor
+            center_y = sb.cy / scale_factor
+            
+            if method == 'gaussian':
+                sigma_x = sb.width * 4 / scale_factor / 3
+                sigma_y = sb.height * 4 / scale_factor / 3
+                response = create_2d_gaussian(center_x, center_y,
+                                              heatmap_width, heatmap_height,
+                                              sigma_x, sigma_y,
+                                              avg_width=self.avg_width / scale_factor,
+                                              avg_height=self.avg_height / scale_factor)
+            elif method == 'rectangle_blur':
+                bbox_w_scaled = sb.width / scale_factor
+                bbox_h_scaled = sb.height / scale_factor
+                sigma_blur = (bbox_w_scaled + bbox_h_scaled) / 4
+                response = create_2d_rectangle_blur(center_x, center_y,
+                                                    heatmap_width, heatmap_height,
+                                                    bbox_w_scaled, bbox_h_scaled,
+                                                    sigma_blur=sigma_blur)
+            else:
+                raise ValueError(f"Unknown method: {method}")
+            
+            heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], response)
+        
+        self.heatmap = heatmap
+        return heatmap
+    
+    def extract_sub_region(self, offset_x: float, offset_y: float,
+                           width: float, height: float,
+                           img: np.ndarray = None,
+                           name: str = "sub_region") -> 'SubTablet':
+        """Extract a sub-region with coordinate transformation."""
+        sub_sign_boxes = self.get_sign_boxes_in_bounds(width, height, offset_x, offset_y)
+        
+        return SubTablet(
+            img=img, sign_boxes=sub_sign_boxes, name=name,
+            avg_width=self.avg_width, avg_height=self.avg_height,
+            margin=self.margin, origin_x=offset_x, origin_y=offset_y
+        )
+    
+    def copy(self) -> 'SubTablet':
+        """Return a deep copy."""
+        return SubTablet(
+            img=self.img.copy() if self.img is not None else None,
+            sign_boxes=[sb.copy() for sb in self.sign_boxes],
+            heatmap=self.heatmap.copy() if self.heatmap is not None else None,
+            name=self.name, scale_factor=self.scale_factor,
+            avg_width=self.avg_width, avg_height=self.avg_height,
+            margin=self.margin, origin_x=self.origin_x, origin_y=self.origin_y
+        )
+    
+    def get_rows(self) -> List[List[SignBox]]:
+        """Group sign boxes by row_idx."""
+        if not self.sign_boxes:
+            return []
+        
+        rows_dict = {}
+        for sb in self.sign_boxes:
+            rows_dict.setdefault(sb.row_idx, []).append(sb)
+        
+        for row_idx in rows_dict:
+            rows_dict[row_idx].sort(key=lambda sb: sb.col_idx)
+        
+        return [rows_dict[k] for k in sorted(rows_dict.keys())]
