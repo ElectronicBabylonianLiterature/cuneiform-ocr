@@ -15,16 +15,25 @@ The data loss is therefore split into two parts:
 where
     L_semantic  = -mean_i ScoreMap[class_i](x_i, y_i)   (per-class)
     L_geometric = -mean_i H_agnostic(x_i, y_i)          (class-agnostic)
+
+Additionally, an IoU-based shape regression loss encourages the optimised
+bounding boxes to match the *shape* (aspect ratio and area) of detector
+outputs for the same class. For every class c that appears in both the
+text-aligned signs and the detection list the loss is:
+    L_iou = 1 - mean_c  GlobalIoU_c
+where GlobalIoU_c is the IoU between the *union* of all optimised boxes
+of class c and the *union* of all detected boxes of class c.
 """
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from .sign import CLASSES_ABZ as DEFAULT_CLASSES_ABZ
 from .tablet import SignBox, SubTablet
+from .bounding_box import BoundingBox, Detection
 
 
 def build_agnostic_heatmap(heatmap: np.ndarray) -> np.ndarray:
@@ -48,6 +57,7 @@ class ElasticChainOptimizer:
     - L_data: Heatmap matching score, decomposed into
         - L_semantic:  per-class heatmap response  (weight: 1-alpha_geo)
         - L_geometric: class-agnostic existence map (weight: alpha_geo)
+    - L_iou: Per-class global IoU between optimised and detected boxes
     - L_seq: Sequential constraint (signs in a row should be tightly distributed)
     - L_smooth: Height consistency (adjacent signs should have similar heights)
     - L_anchor: Line baseline constraint (signs shouldn't deviate too far from row baseline)
@@ -56,9 +66,11 @@ class ElasticChainOptimizer:
     def __init__(self, 
                  sub_tablet_text: SubTablet,
                  detection_heatmap: np.ndarray,
+                 detection_boxes: Optional[Detection] = None,
                  classes_abz: List[str] = None,
                  scale_factor: int = 10,
                  lambda_data: float = 1.0,
+                 lambda_iou: float = 0.0,
                  lambda_seq: float = 0.1,
                  lambda_smooth: float = 0.05,
                  lambda_anchor: float = 0.02,
@@ -69,9 +81,11 @@ class ElasticChainOptimizer:
         Args:
             sub_tablet_text: SubTablet with text-aligned sign boxes to optimize
             detection_heatmap: Heatmap from detection results (H, W, num_classes)
+            detection_boxes: List of BoundingBox from detection (for IoU loss)
             classes_abz: List of ABZ class names (defaults to CLASSES_ABZ)
             scale_factor: Scale factor used in heatmap
             lambda_data: Weight for data term (heatmap matching)
+            lambda_iou: Weight for IoU-based shape regression loss
             lambda_seq: Weight for sequential constraint
             lambda_smooth: Weight for height smoothness
             lambda_anchor: Weight for baseline anchor
@@ -85,6 +99,7 @@ class ElasticChainOptimizer:
         self.classes_abz = classes_abz if classes_abz is not None else DEFAULT_CLASSES_ABZ
         self.scale_factor = scale_factor
         self.lambda_data = lambda_data
+        self.lambda_iou = lambda_iou
         self.lambda_seq = lambda_seq
         self.lambda_smooth = lambda_smooth
         self.lambda_anchor = lambda_anchor
@@ -142,6 +157,22 @@ class ElasticChainOptimizer:
         self.row_baselines = torch.tensor(self.row_baselines, dtype=torch.float32,
                                           device=self.device)
         
+        # ---- Detection boxes for IoU loss ----
+        # Group detected boxes by class_id (ABZ index)
+        self.det_boxes_by_class: Dict[int, torch.Tensor] = {}
+        if detection_boxes is not None and self.lambda_iou > 0:
+            from collections import defaultdict
+            tmp: Dict[int, list] = defaultdict(list)
+            for bb in detection_boxes:
+                abz = bb.sign.abz
+                if abz in self.classes_abz:
+                    cid = self.classes_abz.index(abz)
+                    tmp[cid].append([bb.x1, bb.y1, bb.x2, bb.y2])
+            for cid, box_list in tmp.items():
+                self.det_boxes_by_class[cid] = torch.tensor(
+                    box_list, dtype=torch.float32, device=self.device
+                )  # (N_det_c, 4)
+
         self.loss_history = []
         self.loss_components_history = []
     
@@ -220,6 +251,80 @@ class ElasticChainOptimizer:
         L_sem = self.compute_semantic_loss()
         L_geo = self.compute_geometric_loss()
         return (1.0 - self.alpha_geo) * L_sem + self.alpha_geo * L_geo
+
+    # ---- IoU-based shape regression loss ----
+    def compute_iou_loss(self) -> torch.Tensor:
+        """
+        Per-class global IoU loss to encourage shape diversity.
+
+        For each class c present in both text-aligned signs and detections:
+          1. Collect all optimised boxes of class c → compute their bounding
+             union (min x1, min y1, max x2, max y2) and sum of areas.
+          2. Collect all detected  boxes of class c (fixed targets).
+          3. Compute the IoU of the two *aggregate bounding boxes*.
+          4. L_iou_c = 1 - IoU_c.
+
+        Returns the mean (1 - IoU) across all matched classes.
+        """
+        if not self.det_boxes_by_class:
+            return torch.tensor(0.0, device=self.device)
+
+        # Group optimised sign indices by class
+        opt_by_class: Dict[int, List[int]] = {}
+        for i in range(self.num_signs):
+            cid = self.class_ids[i]
+            if cid < 0:
+                continue
+            if cid not in self.det_boxes_by_class:
+                continue
+            opt_by_class.setdefault(cid, []).append(i)
+
+        if not opt_by_class:
+            return torch.tensor(0.0, device=self.device)
+
+        iou_losses = []
+        for cid, indices in opt_by_class.items():
+            # Optimised boxes for this class: derive (x1, y1, x2, y2)
+            cx  = torch.stack([self.params[i, 0] for i in indices])
+            cy  = torch.stack([self.params[i, 1] for i in indices])
+            w   = torch.stack([self.params[i, 2] for i in indices])
+            h   = torch.stack([self.params[i, 3] for i in indices])
+            ox1 = cx - w / 2
+            oy1 = cy - h / 2
+            ox2 = cx + w / 2
+            oy2 = cy + h / 2
+
+            # Aggregate bounding union of optimised boxes
+            opt_min_x1 = ox1.min()
+            opt_min_y1 = oy1.min()
+            opt_max_x2 = ox2.max()
+            opt_max_y2 = oy2.max()
+
+            # Detected boxes for this class (fixed target)
+            det_boxes = self.det_boxes_by_class[cid]  # (N, 4)
+            det_min_x1 = det_boxes[:, 0].min()
+            det_min_y1 = det_boxes[:, 1].min()
+            det_max_x2 = det_boxes[:, 2].max()
+            det_max_y2 = det_boxes[:, 3].max()
+
+            # IoU between the two aggregate boxes
+            inter_x1 = torch.max(opt_min_x1, det_min_x1)
+            inter_y1 = torch.max(opt_min_y1, det_min_y1)
+            inter_x2 = torch.min(opt_max_x2, det_max_x2)
+            inter_y2 = torch.min(opt_max_y2, det_max_y2)
+
+            inter_w = torch.clamp(inter_x2 - inter_x1, min=0)
+            inter_h = torch.clamp(inter_y2 - inter_y1, min=0)
+            inter_area = inter_w * inter_h
+
+            opt_area = (opt_max_x2 - opt_min_x1) * (opt_max_y2 - opt_min_y1)
+            det_area = (det_max_x2 - det_min_x1) * (det_max_y2 - det_min_y1)
+            union_area = opt_area + det_area - inter_area
+
+            iou = inter_area / (union_area + 1e-6)
+            iou_losses.append(1.0 - iou)
+
+        return torch.stack(iou_losses).mean()
     
     def compute_seq_loss(self) -> torch.Tensor:
         """L_seq: adjacent signs in a row should be tightly distributed."""
@@ -288,16 +393,18 @@ class ElasticChainOptimizer:
         L_sem = self.compute_semantic_loss()
         L_geo = self.compute_geometric_loss()
         L_data = (1.0 - self.alpha_geo) * L_sem + self.alpha_geo * L_geo
+        L_iou = self.compute_iou_loss()
         L_seq = self.compute_seq_loss()
         L_smooth = self.compute_smooth_loss()
         L_anchor = self.compute_anchor_loss()
         
         L_total = (self.lambda_data * L_data +
+                   self.lambda_iou * L_iou +
                    self.lambda_seq * L_seq +
                    self.lambda_smooth * L_smooth +
                    self.lambda_anchor * L_anchor)
         
-        return L_total, L_data, L_seq, L_smooth, L_anchor, L_sem, L_geo
+        return L_total, L_data, L_iou, L_seq, L_smooth, L_anchor, L_sem, L_geo
     
     def optimize(self, num_iterations: int = 100, lr: float = 1.0,
                  verbose: bool = True, log_every: int = 10) -> SubTablet:
@@ -317,13 +424,13 @@ class ElasticChainOptimizer:
         
         if verbose:
             print(f"Starting optimization with {self.num_signs} signs, {self.num_rows} rows")
-            print(f"Lambdas: data={self.lambda_data}, seq={self.lambda_seq}, "
+            print(f"Lambdas: data={self.lambda_data}, iou={self.lambda_iou}, seq={self.lambda_seq}, "
                   f"smooth={self.lambda_smooth}, anchor={self.lambda_anchor}")
             print(f"alpha_geo={self.alpha_geo} (data = {1-self.alpha_geo:.2f}*semantic + {self.alpha_geo:.2f}*geometric)")
         
         for iteration in range(num_iterations):
             optimizer.zero_grad()
-            L_total, L_data, L_seq, L_smooth, L_anchor, L_sem, L_geo = self.compute_total_loss()
+            L_total, L_data, L_iou, L_seq, L_smooth, L_anchor, L_sem, L_geo = self.compute_total_loss()
             L_total.backward()
             optimizer.step()
             
@@ -336,6 +443,7 @@ class ElasticChainOptimizer:
             self.loss_components_history.append({
                 'total': L_total.item(),
                 'data': L_data.item(),
+                'iou': L_iou.item(),
                 'semantic': L_sem.item(),
                 'geometric': L_geo.item(),
                 'seq': L_seq.item(),
@@ -346,6 +454,7 @@ class ElasticChainOptimizer:
             if verbose and (iteration % log_every == 0 or iteration == num_iterations - 1):
                 print(f"Iter {iteration:4d}: L_total={L_total.item():.4f}, "
                       f"L_data={L_data.item():.4f} (sem={L_sem.item():.4f}, geo={L_geo.item():.4f}), "
+                      f"L_iou={L_iou.item():.4f}, "
                       f"L_seq={L_seq.item():.4f}, L_smooth={L_smooth.item():.4f}, "
                       f"L_anchor={L_anchor.item():.4f}")
         
@@ -388,13 +497,13 @@ class ElasticChainOptimizer:
         initial = self.initial_params.cpu().numpy()
         return current - initial
     
-    def plot_loss_history(self, figsize: tuple = (16, 4)):
+    def plot_loss_history(self, figsize: tuple = (20, 4)):
         """Plot loss history."""
         if not self.loss_components_history:
             print("No optimization history available")
             return
         
-        fig, axes = plt.subplots(1, 3, figsize=figsize)
+        fig, axes = plt.subplots(1, 4, figsize=figsize)
         
         # 1. Total loss
         axes[0].plot(self.loss_history)
@@ -404,8 +513,8 @@ class ElasticChainOptimizer:
         axes[0].grid(True)
         
         # 2. Main components
-        for comp in ['data', 'seq', 'smooth', 'anchor']:
-            values = [h[comp] for h in self.loss_components_history]
+        for comp in ['data', 'iou', 'seq', 'smooth', 'anchor']:
+            values = [h.get(comp, 0) for h in self.loss_components_history]
             axes[1].plot(values, label=f'L_{comp}')
         axes[1].set_xlabel('Iteration')
         axes[1].set_ylabel('Loss')
@@ -423,6 +532,15 @@ class ElasticChainOptimizer:
         axes[2].set_title(f'Data Loss Decomposition (α_geo={self.alpha_geo:.2f})')
         axes[2].legend()
         axes[2].grid(True)
+        
+        # 4. IoU loss
+        iou_vals = [h.get('iou', 0) for h in self.loss_components_history]
+        axes[3].plot(iou_vals, label='L_iou', color='tab:red')
+        axes[3].set_xlabel('Iteration')
+        axes[3].set_ylabel('1 - IoU')
+        axes[3].set_title(f'IoU Shape Regression Loss (λ_iou={self.lambda_iou})')
+        axes[3].legend()
+        axes[3].grid(True)
         
         plt.tight_layout()
         plt.show()
