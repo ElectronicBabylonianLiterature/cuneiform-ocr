@@ -4,14 +4,13 @@ Evaluation script for Cuneiform Signs Alignment.
 Computes object-detection-style metrics (mAP, IoU, Precision, Recall)
 by comparing optimized alignment bounding boxes against ground-truth annotations.
 
-Also includes a simple grid-search hyperparameter tuning for the
+Also includes a fast coordinate-wise hyperparameter sweep for the
 ElasticChainOptimizer.
 """
 
 import json
 import os
 import time
-import itertools
 import numpy as np
 import cv2
 import torch
@@ -39,16 +38,23 @@ SCORE_THRESHOLD = 0.5
 SCALE_FACTOR = 10
 EVAL_OUTPUT_DIR = "evaluation_results"
 
-# Number of fragments to evaluate
-EVAL_SAMPLE_LIMIT = 100
+# --- Iteration counts (easy to tweak) ---
+NUM_ITERATIONS_EVAL = 50          # iterations for full evaluation
+NUM_ITERATIONS_SEARCH = 30        # iterations during hyperparameter sweep (fast)
+
+# Number of fragments to evaluate / search
+EVAL_SAMPLE_LIMIT = 10
+SEARCH_SAMPLE_LIMIT = 5           # small subset for fast sweep
 
 # Default optimizer hyperparameters
 DEFAULT_OPTIMIZER_PARAMS = dict(
     lambda_data=10000.0,
+    lambda_iou=20000.0,
     lambda_seq=0.05,
     lambda_smooth=0.15,
     lambda_anchor=0.05,
-    num_iterations=100,
+    alpha_geo=0.0,                # disabled
+    num_iterations=NUM_ITERATIONS_EVAL,
     lr=5.0,
 )
 
@@ -355,11 +361,14 @@ def run_alignment_pipeline(
         opt = ElasticChainOptimizer(
             sub_tablet_text=sub_aligned,
             detection_heatmap=sub_det.heatmap,
+            detection_boxes=crop_dets,
             scale_factor=scale_factor,
             lambda_data=optimizer_params.get('lambda_data', 10000.0),
+            lambda_iou=optimizer_params.get('lambda_iou', 500.0),
             lambda_seq=optimizer_params.get('lambda_seq', 0.05),
             lambda_smooth=optimizer_params.get('lambda_smooth', 0.15),
             lambda_anchor=optimizer_params.get('lambda_anchor', 0.05),
+            alpha_geo=optimizer_params.get('alpha_geo', 0.0),
             prior_aspect_ratio=prior_ar,
             device=DEVICE,
         )
@@ -542,6 +551,28 @@ def print_eval_summary(eval_result: Dict):
 
 # ============ Hyperparameter Tuning ============
 
+def _eval_score(
+    tablet_detector: TabletImageDetector,
+    local_source: LocalDataSource,
+    api_source: EBLAPISource,
+    fragment_ids: List[str],
+    params: dict,
+) -> float:
+    """Run evaluation and return class-agnostic mAP (higher is better)."""
+    result = run_evaluation(
+        tablet_detector=tablet_detector,
+        local_source=local_source,
+        api_source=api_source,
+        fragment_ids=fragment_ids,
+        optimizer_params=params,
+        verbose=False,
+        label="sweep",
+    )
+    if 'error' in result:
+        return -1.0
+    return result['class_agnostic']['mAP']
+
+
 def hyperparameter_search(
     tablet_detector: TabletImageDetector,
     local_source: LocalDataSource,
@@ -550,91 +581,101 @@ def hyperparameter_search(
     output_dir: str = EVAL_OUTPUT_DIR,
 ) -> Dict:
     """
-    Simple grid search over optimizer hyperparameters.
-    Uses a subset of fragments for speed, evaluates with class-agnostic mAP.
+    Fast coordinate-wise (one-parameter-at-a-time) hyperparameter sweep.
+
+    For each parameter, sweep candidate values while keeping all other
+    parameters at their current best.  This reduces the search from
+    O(product of grid sizes) to O(sum of grid sizes), making it orders
+    of magnitude faster than a full grid search.
+
+    The procedure runs two rounds to allow parameters to adapt to each
+    other's updated values.
     """
-    # Define search grid (keep it small for initial exploration)
-    search_grid = {
-        'lambda_data':   [1000.0, 10000.0, 50000.0],
+    # Candidate values for each tunable parameter
+    search_axes = {
+        'lambda_data':   [1000.0, 5000.0, 10000.0, 50000.0],
+        'lambda_iou':    [0.0, 500.0, 5000.0, 20000.0],
         'lambda_seq':    [0.01, 0.05, 0.2],
         'lambda_smooth': [0.05, 0.15, 0.5],
         'lambda_anchor': [0.01, 0.05, 0.2],
     }
 
-    # Fixed parameters during search
-    fixed = {
-        'num_iterations': 80,    # fewer iterations for speed
-        'lr': 5.0,
-    }
+    # Start from defaults (use fast iteration count for searching)
+    best_params = dict(DEFAULT_OPTIMIZER_PARAMS)
+    best_params['num_iterations'] = NUM_ITERATIONS_SEARCH
 
-    # Generate all combinations
-    keys = list(search_grid.keys())
-    values = list(search_grid.values())
-    combinations = list(itertools.product(*values))
-    print(f"Hyperparameter search: {len(combinations)} combinations")
+    total_evals = 2 * sum(len(v) for v in search_axes.values())
+    print(f"Coordinate-wise sweep: {total_evals} evaluations "
+          f"(2 rounds × {sum(len(v) for v in search_axes.values())} candidates)")
 
-    best_score = -1
-    best_params = None
+    best_score = _eval_score(tablet_detector, local_source, api_source,
+                             fragment_ids, best_params)
+    print(f"  Baseline mAP = {best_score:.4f}")
+
     all_search_results = []
+    eval_count = 0
 
-    for ci, combo in enumerate(combinations):
-        params = dict(zip(keys, combo))
-        params.update(fixed)
+    for round_idx in range(2):
+        print(f"\n--- Round {round_idx + 1} ---")
+        for key, candidates in search_axes.items():
+            old_val = best_params[key]
+            round_best_val = old_val
+            round_best_score = best_score
 
-        print(f"\n--- Combo {ci+1}/{len(combinations)}: {params} ---")
-        t0 = time.time()
+            for val in candidates:
+                if val == old_val:
+                    continue  # already evaluated
+                trial = dict(best_params)
+                trial[key] = val
+                eval_count += 1
 
-        eval_result = run_evaluation(
-            tablet_detector=tablet_detector,
-            local_source=local_source,
-            api_source=api_source,
-            fragment_ids=fragment_ids,
-            optimizer_params=params,
-            verbose=False,
-            label=f"combo_{ci+1}",
-        )
+                t0 = time.time()
+                score = _eval_score(tablet_detector, local_source, api_source,
+                                    fragment_ids, trial)
+                elapsed = time.time() - t0
 
-        elapsed = time.time() - t0
+                entry = {
+                    'round': round_idx + 1,
+                    'param': key,
+                    'value': val,
+                    'mAP': score,
+                    'elapsed_s': elapsed,
+                    'full_params': {k: v for k, v in trial.items()},
+                }
+                all_search_results.append(entry)
 
-        if 'error' in eval_result:
-            print(f"  Skipped (error)")
-            continue
+                tag = ""
+                if score > round_best_score:
+                    round_best_score = score
+                    round_best_val = val
+                    tag = " *"
 
-        score = eval_result['class_agnostic']['mAP']
-        ap50 = eval_result['class_agnostic']['AP@0.5']
-        mean_iou = eval_result['iou_stats']['mean_iou']
+                print(f"  [{eval_count:3d}] {key}={val:<10}  mAP={score:.4f} "
+                      f"({elapsed:.1f}s){tag}")
 
-        entry = {
-            'combo_idx': ci + 1,
-            'params': params,
-            'mAP': score,
-            'AP@0.5': ap50,
-            'mean_iou': mean_iou,
-            'elapsed_s': elapsed,
-        }
-        all_search_results.append(entry)
+            # Update best for this axis
+            if round_best_score > best_score:
+                best_params[key] = round_best_val
+                best_score = round_best_score
+                print(f"  >> {key} updated to {round_best_val} (mAP={best_score:.4f})")
+            else:
+                print(f"  >> {key} stays at {old_val}")
 
-        print(f"  mAP={score:.4f}, AP@0.5={ap50:.4f}, IoU={mean_iou:.4f}, time={elapsed:.1f}s")
+    # Restore full iteration count
+    best_params['num_iterations'] = NUM_ITERATIONS_EVAL
 
-        if score > best_score:
-            best_score = score
-            best_params = params.copy()
-            print(f"  ** New best! **")
-
-    # Sort by mAP
+    # Sort results
     all_search_results.sort(key=lambda x: -x['mAP'])
 
     print(f"\n{'='*60}")
-    print(f"HYPERPARAMETER SEARCH RESULTS (sorted by mAP)")
+    print(f"SWEEP RESULTS (top 10)")
     print(f"{'='*60}")
     for entry in all_search_results[:10]:
-        print(f"  Combo {entry['combo_idx']:3d}: mAP={entry['mAP']:.4f}, "
-              f"AP@0.5={entry['AP@0.5']:.4f}, IoU={entry['mean_iou']:.4f} | {entry['params']}")
+        print(f"  {entry['param']:15s}={entry['value']:<10}  mAP={entry['mAP']:.4f}")
 
     print(f"\nBest params: {best_params}")
     print(f"Best mAP:    {best_score:.4f}")
 
-    # Save search results
     os.makedirs(output_dir, exist_ok=True)
     search_save = {
         'best_params': best_params,
@@ -651,7 +692,7 @@ def hyperparameter_search(
 # ============ Main ============
 
 if __name__ == "__main__":
-    print("Cuneiform Signs Alignment - Evaluation & Hyperparameter Search")
+    print("Cuneiform Signs Alignment - Evaluation & Hyperparameter Sweep")
     print("=" * 60)
 
     # Data sources
@@ -681,6 +722,7 @@ if __name__ == "__main__":
     # --- STEP 1: Full evaluation with default params ---
     print(f"\n{'='*60}")
     print(f"STEP 1: Evaluation with default parameters ({len(eval_fragments)} fragments)")
+    print(f"  num_iterations = {NUM_ITERATIONS_EVAL}")
     print(f"{'='*60}")
 
     eval_result = run_evaluation(
@@ -694,20 +736,18 @@ if __name__ == "__main__":
     )
     print_eval_summary(eval_result)
 
-    # Save full evaluation
-    # Convert per_class to JSON-serializable format
     eval_save = {k: v for k, v in eval_result.items() if k != 'per_class'}
     eval_save['per_class'] = {k: v for k, v in eval_result.get('per_class', {}).items()}
     with open(os.path.join(EVAL_OUTPUT_DIR, "evaluation_default.json"), 'w') as f:
         json.dump(eval_save, f, indent=2)
     print(f"Saved to {EVAL_OUTPUT_DIR}/evaluation_default.json")
 
-    # --- STEP 2: Hyperparameter search (use a smaller subset for speed) ---
-    SEARCH_SAMPLE_LIMIT = min(30, len(eval_fragments))
+    # --- STEP 2: Fast coordinate-wise hyperparameter sweep ---
     search_fragments = eval_fragments[:SEARCH_SAMPLE_LIMIT]
 
     print(f"\n{'='*60}")
-    print(f"STEP 2: Hyperparameter search ({len(search_fragments)} fragments)")
+    print(f"STEP 2: Coordinate-wise sweep ({len(search_fragments)} fragments, "
+          f"num_iterations = {NUM_ITERATIONS_SEARCH})")
     print(f"{'='*60}")
 
     search_result = hyperparameter_search(
@@ -721,12 +761,12 @@ if __name__ == "__main__":
     # --- STEP 3: Re-evaluate with best params on full set ---
     if search_result.get('best_params'):
         best_params = search_result['best_params']
-        # Use full iteration count for final eval
-        best_params['num_iterations'] = 100
+        best_params['num_iterations'] = NUM_ITERATIONS_EVAL
 
         print(f"\n{'='*60}")
         print(f"STEP 3: Re-evaluation with best params ({len(eval_fragments)} fragments)")
-        print(f"Params: {best_params}")
+        print(f"  num_iterations = {NUM_ITERATIONS_EVAL}")
+        print(f"  Params: {best_params}")
         print(f"{'='*60}")
 
         eval_best = run_evaluation(

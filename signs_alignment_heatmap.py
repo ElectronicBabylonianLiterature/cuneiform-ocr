@@ -47,17 +47,17 @@ CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/
 SCORE_THRESHOLD = 0.5
 SCALE_FACTOR = 10
 OUTPUT_DIR = "alignment_results_heatmap"
-SAMPLE_LIMIT = 3
+SAMPLE_LIMIT = 10
 
 # Optimizer hyperparameters
 OPTIMIZER_PARAMS = dict(
-    lambda_data=10000.0,
-    lambda_seq=0.05,
-    lambda_smooth=0.15,
-    lambda_anchor=0.05,
-    num_iterations=50,
-    alpha_geo=0.2,            # 20% geometric (existence), 30% semantic (per-class)
-    lr=5.0,
+    lambda_data=50000.0,
+    lambda_iou=20000.0,
+    lambda_seq=0.10,
+    lambda_smooth=0.05,
+    lambda_anchor=0.1,
+    num_iterations=100,
+    alpha_geo=0.0,            # disable geometric term for ablation
 )
 
 HEATMAP_METHOD = 'gaussian'
@@ -142,12 +142,14 @@ def process_single_crop(
     optimizer = ElasticChainOptimizer(
         sub_tablet_text=sub_text_aligned,
         detection_heatmap=sub_detection.heatmap,
+        detection_boxes=crop_detections,
         scale_factor=scale_factor,
         lambda_data=optimizer_params.get('lambda_data', 10000.0),
+        lambda_iou=optimizer_params.get('lambda_iou', 500.0),
         lambda_seq=optimizer_params.get('lambda_seq', 0.05),
         lambda_smooth=optimizer_params.get('lambda_smooth', 0.15),
         lambda_anchor=optimizer_params.get('lambda_anchor', 0.05),
-        alpha_geo=optimizer_params.get('alpha_geo', 0.2),
+        alpha_geo=optimizer_params.get('alpha_geo', 0.0),
         prior_aspect_ratio=prior_aspect_ratio,
         device=DEVICE,
     )
