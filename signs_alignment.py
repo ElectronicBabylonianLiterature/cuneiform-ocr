@@ -128,46 +128,7 @@ def transform_gt_to_cropped_region(gt_boxes: List[Dict], crop_info: Dict) -> Lis
     
     return transformed_boxes
 
-def load_image(fragment_id):
-    """Load image for a fragment"""
-    imgs_path = os.path.join(ANNOTATIONS_DIR, "imgs")
-    possible_names = [
-        f"{fragment_id}.jpg",
-        f"{fragment_id}.jpeg",
-        f"{fragment_id}.png",
-    ]
-    for name in possible_names:
-        filepath = os.path.join(imgs_path, name)
-        if os.path.exists(filepath):
-            return cv2.imread(filepath)
-    return None
 
-def get_signs_from_api(fragment_id):
-    """Get signs text from ebl API"""
-    url = f"https://ebl.badw.de/api/fragments/{fragment_id}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        data = response.json()
-        return data.get('signs', None)
-    return None
-
-def parse_api_signs(signs_text):
-    if not signs_text:
-        return []
-    
-    lines = []
-    for line_text in signs_text.strip().split('\n'):
-        line_signs = []
-        for token in line_text.split():
-            # Handle alternatives like ABZ579/ABZ129/ABZ312
-            if '/' in token:
-                token = token.split('/')[0]  # take first alternative
-            # Convert ABZ to sign name
-            converter = SignNameConverter(token, expected_type='ABZ')
-            line_signs.append(converter.get_sign_name())
-        if line_signs:
-            lines.append(line_signs)
-    return lines
 
 
 
@@ -440,8 +401,16 @@ class SubTablet:
         return result
     
     def create_heatmap(self, CLASSES_ABZ: List[str], scale_factor: int = None,
-                       img_shape: tuple = None) -> np.ndarray:
-        """Generate heatmap from sign_boxes"""
+                       img_shape: tuple = None, method: str = 'gaussian') -> np.ndarray:
+        """
+        Generate heatmap from sign_boxes.
+        
+        Args:
+            CLASSES_ABZ: List of class names
+            scale_factor: Scale factor for heatmap
+            img_shape: Image shape override
+            method: 'gaussian' or 'rectangle_blur'
+        """
         if scale_factor is None:
             scale_factor = self.scale_factor
         else:
@@ -476,15 +445,31 @@ class SubTablet:
             center_x = sb.cx / scale_factor
             center_y = sb.cy / scale_factor
             
-            # Use anisotropic Gaussian based on this sign box's dimensions
-            sigma_x = sb.width * 1.5 / scale_factor / 3
-            sigma_y = sb.height * 1.5 / scale_factor / 3
+            if method == 'gaussian':
+                # Use anisotropic Gaussian based on this sign box's dimensions
+                sigma_x = sb.width * 4 / scale_factor / 3
+                sigma_y = sb.height * 4 / scale_factor / 3
+                
+                # Generate 2D Gaussian
+                response = create_2d_gaussian(center_x, center_y, 
+                                              heatmap_width, heatmap_height, 
+                                              sigma_x, sigma_y,
+                                              avg_width=self.avg_width / scale_factor,
+                                              avg_height=self.avg_height / scale_factor)
+            elif method == 'rectangle_blur':
+                # Use rectangle + Gaussian blur
+                bbox_width_scaled = sb.width / scale_factor
+                bbox_height_scaled = sb.height / scale_factor
+                sigma_blur = (bbox_width_scaled + bbox_height_scaled) / 4
+                
+                response = create_2d_rectangle_blur(center_x, center_y,
+                                                    heatmap_width, heatmap_height,
+                                                    bbox_width_scaled, bbox_height_scaled,
+                                                    sigma_blur=sigma_blur)
+            else:
+                raise ValueError(f"Unknown method: {method}")
             
-            # Generate 2D Gaussian
-            gaussian = create_2d_gaussian(center_x, center_y, 
-                                          heatmap_width, heatmap_height, 
-                                          sigma_x, sigma_y)
-            heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], gaussian)
+            heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], response)
         
         self.heatmap = heatmap
         return heatmap
@@ -956,17 +941,107 @@ def compute_avg_dimensions(detections):
     return np.mean(widths), np.mean(heights)
 
 # ============ Heatmap-based Alignment ============
-def create_2d_gaussian(center_x, center_y, width, height, sigma_x, sigma_y):
-    """Create a 2D Gaussian centered at (center_x, center_y)"""
+def create_2d_gaussian(center_x, center_y, width, height, sigma_x, sigma_y, 
+                       avg_width=None, avg_height=None, scale_coefficient=None):
+    """
+    Create a normalized 2D Gaussian centered at (center_x, center_y).
+    The peak value decreases with larger sigma to prevent large signs from dominating the heatmap.
+    
+    Args:
+        center_x, center_y: Center position
+        width, height: Heatmap dimensions
+        sigma_x, sigma_y: Gaussian standard deviations
+        avg_width, avg_height: Average sign dimensions (optional, for auto scaling)
+        scale_coefficient: Manual scaling coefficient (optional, overrides auto scaling)
+    """
     x = np.arange(0, width)
     y = np.arange(0, height)
     xx, yy = np.meshgrid(x, y)
     
-    gaussian = np.exp(-((xx - center_x)**2 / (2 * sigma_x**2) + 
-                        (yy - center_y)**2 / (2 * sigma_y**2)))
+    # Normalized 2D Gaussian: base normalization is 1/(2*pi*sigma_x*sigma_y)
+    base_normalization = 1.0 / (2 * np.pi * sigma_x * sigma_y)
+    
+    # Calculate scaling coefficient to maintain reasonable gradient magnitudes
+    if scale_coefficient is None:
+        if avg_width is not None and avg_height is not None:
+            # Scale by pi * avg_width * avg_height * 4 (4 is the sigma coefficient)
+            # Then divide by a constant to keep peak values around 1
+            scale_up = np.pi * avg_width * avg_height * 4
+            scale_down = 4.0  # Adjustable constant to control peak magnitude
+            scale_coefficient = scale_up / scale_down
+        else:
+            scale_coefficient = 1.0
+    
+    # Apply normalization and scaling
+    normalization_factor = base_normalization * scale_coefficient
+    
+    gaussian = normalization_factor * np.exp(-((xx - center_x)**2 / (2 * sigma_x**2) + 
+                                                (yy - center_y)**2 / (2 * sigma_y**2)))
+    
+    # No upper limit - let values distribute naturally based on sign size
+    # Smaller signs (smaller sigma) will have higher peaks, which is desirable
+    
     return gaussian
 
-def create_detection_heatmap(detections, img_shape, CLASSES_ABZ, scale_factor=10, avg_width=None, avg_height=None):
+def create_2d_rectangle_blur(center_x, center_y, width, height, bbox_width, bbox_height, 
+                             sigma_blur=2.0):
+    """
+    Create a rectangular region for a sign, then apply Gaussian blur.
+    This is a simpler alternative to Gaussian heatmap generation.
+    
+    Args:
+        center_x, center_y: Center position in heatmap coordinates
+        width, height: Heatmap dimensions
+        bbox_width, bbox_height: Bounding box dimensions in heatmap coordinates
+        sigma_blur: Sigma for Gaussian blur (controls spread)
+    
+    Returns:
+        Blurred rectangular heatmap channel
+    """
+    # Create empty heatmap
+    heatmap_channel = np.zeros((int(height), int(width)), dtype=np.float32)
+    
+    # Calculate rectangle bounds
+    x1 = int(center_x - bbox_width / 2)
+    y1 = int(center_y - bbox_height / 2)
+    x2 = int(center_x + bbox_width / 2)
+    y2 = int(center_y + bbox_height / 2)
+    
+    # Clamp to heatmap bounds
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(int(width), x2)
+    y2 = min(int(height), y2)
+    
+    # Fill rectangle with 1.0
+    if x1 < x2 and y1 < y2:
+        heatmap_channel[y1:y2, x1:x2] = 1.0
+    
+    # Apply Gaussian blur to spread the response
+    # kernel_size should be odd and proportional to sigma
+    kernel_size = int(sigma_blur * 6) + 1
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    
+    heatmap_channel = cv2.GaussianBlur(heatmap_channel, (kernel_size, kernel_size), sigma_blur)
+    
+    return heatmap_channel
+
+def create_detection_heatmap(detections, img_shape, CLASSES_ABZ, scale_factor=10, avg_width=None, avg_height=None, method='gaussian'):
+    """
+    Create heatmap from detections using specified method.
+    
+    Args:
+        detections: List of detection dictionaries
+        img_shape: Original image shape
+        CLASSES_ABZ: List of class names
+        scale_factor: Scale factor for heatmap
+        avg_width, avg_height: Average sign dimensions
+        method: 'gaussian' or 'rectangle_blur'
+    
+    Returns:
+        heatmap, influence_radius, sigma (or blur_sigma for rectangle_blur)
+    """
     img_height, img_width = img_shape[:2]
     num_CLASSES_ABZ = len(CLASSES_ABZ)
     
@@ -982,6 +1057,7 @@ def create_detection_heatmap(detections, img_shape, CLASSES_ABZ, scale_factor=10
         avg_width, avg_height = compute_avg_dimensions(detections)
     
     influence_radius = (avg_width + avg_height) / 2 * 1.5 / scale_factor  # for reference
+    sigma_or_blur = 0
     
     # Generate heatmap for each detection
     for det in detections:
@@ -996,18 +1072,51 @@ def create_detection_heatmap(detections, img_shape, CLASSES_ABZ, scale_factor=10
         # Compute center and scale to heatmap coordinates
         center_x = (x1 + x2) / 2 / scale_factor
         center_y = (y1 + y2) / 2 / scale_factor
+        bbox_width_scaled = bbox_width / scale_factor
+        bbox_height_scaled = bbox_height / scale_factor
         
-        # Use anisotropic Gaussian based on this bbox's dimensions
-        sigma_x = bbox_width * 1.5 / scale_factor / 3  # ~99.7% of Gaussian within 3 sigma
-        sigma_y = bbox_height * 1.5 / scale_factor / 3
+        if method == 'gaussian':
+            # Use anisotropic Gaussian based on this bbox's dimensions
+            sigma_x = bbox_width * 4 / scale_factor / 3  # ~99.7% of Gaussian within 3 sigma
+            sigma_y = bbox_height * 4 / scale_factor / 3
+            sigma_or_blur = sigma_x  # return for reference
+            
+            # Generate 2D Gaussian and add to corresponding class channel
+            response = create_2d_gaussian(center_x, center_y, heatmap_width, heatmap_height, 
+                                         sigma_x, sigma_y,
+                                         avg_width=avg_width / scale_factor,
+                                         avg_height=avg_height / scale_factor)
+        elif method == 'rectangle_blur':
+            # Use rectangle + Gaussian blur
+            # sigma_blur proportional to average bbox size
+            sigma_blur = (bbox_width_scaled + bbox_height_scaled) / 6
+            sigma_or_blur = sigma_blur  # return for reference
+            
+            response = create_2d_rectangle_blur(center_x, center_y, 
+                                                heatmap_width, heatmap_height,
+                                                bbox_width_scaled, bbox_height_scaled,
+                                                sigma_blur=sigma_blur)
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'gaussian' or 'rectangle_blur'")
         
-        # Generate 2D Gaussian and add to corresponding class channel
-        gaussian = create_2d_gaussian(center_x, center_y, heatmap_width, heatmap_height, sigma_x, sigma_y)
-        heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], gaussian)
+        heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], response)
     
-    return heatmap, influence_radius, sigma_x
+    return heatmap, influence_radius, sigma_or_blur
 
-def create_text_heatmap(text_lines, CLASSES_ABZ, avg_width, avg_height, scale_factor=10):
+def create_text_heatmap(text_lines, CLASSES_ABZ, avg_width, avg_height, scale_factor=10, method='gaussian'):
+    """
+    Create heatmap from text lines using specified method.
+    
+    Args:
+        text_lines: List of text lines (each line is a list of sign names)
+        CLASSES_ABZ: List of class names
+        avg_width, avg_height: Average sign dimensions
+        scale_factor: Scale factor for heatmap
+        method: 'gaussian' or 'rectangle_blur'
+    
+    Returns:
+        heatmap_text, margin, influence_radius, sigma (or blur_sigma)
+    """
     num_CLASSES_ABZ = len(CLASSES_ABZ)
     
     # Determine grid dimensions for text_lines
@@ -1028,10 +1137,20 @@ def create_text_heatmap(text_lines, CLASSES_ABZ, avg_width, avg_height, scale_fa
     # Initialize heatmap
     heatmap_text = np.zeros((heatmap_height_text_scaled, heatmap_width_text_scaled, num_CLASSES_ABZ), dtype=np.float32)
     
-    # Gaussian parameters - use anisotropic Gaussian
-    sigma_x_text = avg_width * 1.5 / scale_factor / 3
-    sigma_y_text = avg_height * 1.5 / scale_factor / 3
-    influence_radius_text = (avg_width + avg_height) / 2 * 1.5 / scale_factor  # for reference
+    # Parameters for heatmap generation
+    influence_radius_text = (avg_width + avg_height) / 2 * 4 / scale_factor  # for reference
+    
+    if method == 'gaussian':
+        # Gaussian parameters - use anisotropic Gaussian
+        sigma_x_text = avg_width * 4 / scale_factor / 3
+        sigma_y_text = avg_height * 4 / scale_factor / 3
+        sigma_or_blur = sigma_x_text
+    elif method == 'rectangle_blur':
+        # Rectangle + blur parameters
+        sigma_blur_text = (avg_width + avg_height) / 4 / scale_factor
+        sigma_or_blur = sigma_blur_text
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'gaussian' or 'rectangle_blur'")
     
     # Build sign_name to class_id lookup (do this once instead of in nested loops)
     sign_name_to_class_id = {}
@@ -1056,13 +1175,25 @@ def create_text_heatmap(text_lines, CLASSES_ABZ, avg_width, avg_height, scale_fa
             center_x_scaled = center_x_orig / scale_factor
             center_y_scaled = center_y_orig / scale_factor
             
-            # Generate 2D Gaussian and add to corresponding class channel
-            gaussian_text = create_2d_gaussian(center_x_scaled, center_y_scaled, 
+            if method == 'gaussian':
+                # Generate 2D Gaussian and add to corresponding class channel
+                response = create_2d_gaussian(center_x_scaled, center_y_scaled, 
                                               heatmap_width_text_scaled, heatmap_height_text_scaled, 
-                                              sigma_x_text, sigma_y_text)
-            heatmap_text[:, :, class_id] = np.maximum(heatmap_text[:, :, class_id], gaussian_text)
+                                              sigma_x_text, sigma_y_text,
+                                              avg_width=avg_width / scale_factor,
+                                              avg_height=avg_height / scale_factor)
+            elif method == 'rectangle_blur':
+                # Generate rectangle + blur
+                bbox_width_scaled = avg_width / scale_factor
+                bbox_height_scaled = avg_height / scale_factor
+                response = create_2d_rectangle_blur(center_x_scaled, center_y_scaled,
+                                                    heatmap_width_text_scaled, heatmap_height_text_scaled,
+                                                    bbox_width_scaled, bbox_height_scaled,
+                                                    sigma_blur=sigma_blur_text)
+            
+            heatmap_text[:, :, class_id] = np.maximum(heatmap_text[:, :, class_id], response)
     
-    return heatmap_text, margin, influence_radius_text, sigma_x_text
+    return heatmap_text, margin, influence_radius_text, sigma_or_blur
 
 def match_heatmaps_ncc(detection_heatmap, text_heatmap, scale_factor=10):
     num_CLASSES_ABZ = detection_heatmap.shape[2]
@@ -1180,506 +1311,3 @@ def create_text_based_detections(text_lines, CLASSES_ABZ, match_position_x, matc
     
     return detection_with_texts
 
-# ============ Alignment Algorithm ============
-def align_signs(detected_lines, text_lines, avg_width, avg_height):
-
-    aligned_signs = []
-    
-    # Flatten detected signs with line info
-    detected_flat = []
-    for line_idx, line in enumerate(detected_lines):
-        for det in line:
-            detected_flat.append({**det, 'line_idx': line_idx, 'matched': False})
-    
-    # Process each text line
-    for text_line_idx, text_line in enumerate(text_lines):
-        line_aligned = []
-        
-        # Find closest detected line
-        best_det_line_idx = None
-        min_dist = float('inf')
-        
-        for det_line_idx, det_line in enumerate(detected_lines):
-            if det_line:
-                det_line_y = np.mean([(d['bbox'][1] + d['bbox'][3]) / 2 for d in det_line])
-                # Estimate text line y based on line index
-                estimated_y = text_line_idx * avg_height * 1.2  # rough estimate
-                dist = abs(det_line_y - estimated_y) if text_line_idx < 3 else det_line_idx
-                if det_line_idx == text_line_idx:
-                    dist = 0  # prefer matching line indices
-                if dist < min_dist:
-                    min_dist = dist
-                    best_det_line_idx = det_line_idx
-        
-        # Match signs in this line
-        matched_positions = []  # (text_idx, det, position_x)
-        
-        for text_idx, text_sign in enumerate(text_line):
-            # Find matching unmatched detection in this or nearby lines
-            best_match = None
-            best_score = float('inf')
-            
-            for det in detected_flat:
-                if det['matched']:
-                    continue
-                # Prefer same line index
-                line_penalty = abs(det['line_idx'] - (best_det_line_idx if best_det_line_idx is not None else text_line_idx)) * 1000
-                
-                if det['sign_name'] == text_sign:
-                    x_center = (det['bbox'][0] + det['bbox'][2]) / 2
-                    # Score based on expected position (proportional in line)
-                    expected_x = text_idx * avg_width * 1.1
-                    position_score = abs(x_center - expected_x) + line_penalty
-                    
-                    if position_score < best_score:
-                        best_score = position_score
-                        best_match = det
-            
-            if best_match is not None:
-                best_match['matched'] = True
-                matched_positions.append((text_idx, best_match, (best_match['bbox'][0] + best_match['bbox'][2]) / 2))
-                line_aligned.append({
-                    'text_idx': text_idx,
-                    'sign_name': text_sign,
-                    'bbox': best_match['bbox'],
-                    'located': True
-                })
-            else:
-                line_aligned.append({
-                    'text_idx': text_idx,
-                    'sign_name': text_sign,
-                    'bbox': None,
-                    'located': False
-                })
-        
-        # Interpolate unlocated signs if at least 2 signs are located
-        located_signs = [s for s in line_aligned if s['located']]
-        
-        if len(located_signs) >= 2:
-            # Fit linear regression for x and y coordinates
-            xs = [s['text_idx'] for s in located_signs]
-            x_centers = [(s['bbox'][0] + s['bbox'][2]) / 2 for s in located_signs]
-            y_centers = [(s['bbox'][1] + s['bbox'][3]) / 2 for s in located_signs]
-            
-            # Linear regression: x_center = a * text_idx + b
-            coeffs_x = np.polyfit(xs, x_centers, 1)
-            coeffs_y = np.polyfit(xs, y_centers, 1)
-            
-            for sign in line_aligned:
-                if not sign['located']:
-                    pred_x = np.polyval(coeffs_x, sign['text_idx'])
-                    pred_y = np.polyval(coeffs_y, sign['text_idx'])
-                    sign['bbox'] = [
-                        pred_x - avg_width / 2,
-                        pred_y - avg_height / 2,
-                        pred_x + avg_width / 2,
-                        pred_y + avg_height / 2
-                    ]
-                    sign['interpolated'] = True
-        
-        aligned_signs.extend(line_aligned)
-    
-    return aligned_signs
-
-# ============ Visualization ============
-class BboxVisualizer:
-    def __init__(self, boxes_color=(0, 255, 0)):
-        self.boxes_color = boxes_color
-        self.label_key = 'sign_name'
-        self.color_func = None
-        self.visualized_result = None
-
-    def draw_boxes(self, img, boxes):
-        img_vis = img.copy()
-        
-        # First, draw all rectangles using OpenCV
-        for box in boxes:
-            bbox = box['bbox']
-            if bbox is None:
-                continue
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            
-            # Determine color: use color_func if provided, otherwise use default color
-            box_color = self.color_func(box) if self.color_func else self.boxes_color
-            box_color = tuple(reversed(box_color))  # Convert RGB to BGR for OpenCV
-            
-            # Draw rectangle using OpenCV (BGR color)
-            cv2.rectangle(img_vis, (x1, y1), (x2, y2), box_color, 2)
-        
-        # Convert to PIL for text drawing (supports Unicode)
-        img_pil = Image.fromarray(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB))
-        draw = ImageDraw.Draw(img_pil)
-        
-        # Try to load a Unicode-supporting font, fallback to default
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 40)
-        except:
-            font = ImageFont.load_default()
-        
-        # Draw labels using PIL
-        for box in boxes:
-            bbox = box['bbox']
-            if bbox is None:
-                continue
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            
-            # Draw label using PIL (RGB color, supports Unicode)
-            label = box.get(self.label_key, '')[:10]
-            if label:
-                # Get text size
-                bbox_text = draw.textbbox((0, 0), label, font=font)
-                text_width = bbox_text[2] - bbox_text[0]
-                text_height = bbox_text[3] - bbox_text[1]
-                
-                # Draw black background
-                draw.rectangle([x1, y1-text_height-10, x1+text_width+4, y1-2], fill=(0, 0, 0))
-                # Draw white text
-                draw.text((x1+2, y1-text_height-8), label, font=font, fill=(255, 255, 255))
-        
-        # Convert back to OpenCV format
-        img_vis = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-        self.visualized_result = img_vis
-        return img_vis
-    
-    def display_result(self, vis_opt = "save", path=None):
-        # vis_opt: "save" or "show"
-        if vis_opt == "show" and self.visualized_result is not None:
-            cv2.imshow('Visualization', self.visualized_result)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-        elif vis_opt == "draw":
-            # draw using plt
-            import matplotlib.pyplot as plt
-            if self.visualized_result is not None:
-                plt.imshow(cv2.cvtColor(self.visualized_result, cv2.COLOR_BGR2RGB))
-                plt.axis('off')
-                plt.show()
-        elif vis_opt == "save" and self.visualized_result is not None:
-            if path is None:
-                print("visualization path not provided, saving to 'visualization_result.jpg'")
-                path = 'visualization_result.jpg'
-            cv2.imwrite(path, self.visualized_result)
-        else:
-            print("No visualization result to display or save.")
-
-class TextVisualizer:
-    def __init__(self, text_lines):
-        self.text_lines = text_lines
-    def write_text_file(self, filepath, fragment_id):
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(f"Fragment: {fragment_id}\n")
-            f.write("=" * 50 + "\n")
-            f.write("Text lines (converted from ABZ to sign names):\n")
-            for i, line in enumerate(self.text_lines):
-                f.write(f"Line {i+1}: {' '.join(line)}\n")
-
-class HeatmapVisualizer:
-    def __init__(self, bboxes_color=(255, 0, 0)):
-        self.visualized_result = None
-        self.fig = None
-        self.bboxes_color = bboxes_color
-        
-    
-    def draw_heatmap(self, img, heatmap, channels=(0, 1, 2), detection = None, texts = None):
-        # Close previous figure to prevent memory leakage
-        if self.fig is not None:
-            plt.close(self.fig)
-        
-        fig, axes = plt.subplots(2, 2, figsize=(15, 15))
-
-        if texts is not None:
-            background_img = np.ones((heatmap.shape[0],  heatmap.shape[1], 3), dtype=np.uint8) * 255
-            img = background_img
-            # Display white background first
-            axes[0, 0].imshow(background_img)
-            axes[0, 0].set_title('Text Lines')
-            axes[0, 0].axis('off')
-            # Display text on the first subplot using normalized axes coordinates
-            # Start from top (0.95) and go down
-            text_y_start = 0.95
-            text_y_step = 0.85 / max(len(texts), 1)  # Distribute evenly in the available space
-            for i, line in enumerate(texts):
-                line_text = ' '.join(line)
-                axes[0, 0].text(0.05, text_y_start - i * text_y_step, line_text, 
-                               fontsize=10, color='black', family='monospace',
-                               transform=axes[0, 0].transAxes, verticalalignment='top')
-        elif detection is not None:
-            bbox_viz = BboxVisualizer(boxes_color=self.bboxes_color)
-            bbox_viz.draw_boxes(img, detection)
-            axes[0, 0].imshow(cv2.cvtColor(bbox_viz.visualized_result, cv2.COLOR_BGR2RGB))
-            axes[0, 0].set_title('Detection with Bounding Box')
-            axes[0, 0].axis('off')
-        else:
-            # Show original image
-            axes[0, 0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            axes[0, 0].set_title('Original Image')
-            axes[0, 0].axis('off')
-        
-        # visualize heatmap channels
-        for i in range(min(len(channels), 3)):  # Max 3 channels to fit in 2x2 grid
-            row = (i + 1) // 2
-            col = (i + 1) % 2
-            
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img_rgb = cv2.resize(img_rgb, (heatmap.shape[1], heatmap.shape[0]))
-            heatmap_channel = heatmap[:, :, channels[i]]
-            
-            # Create heatmap overlay
-            axes[row, col].imshow(img_rgb, alpha=0.5)
-            im = axes[row, col].imshow(heatmap_channel, cmap='hot', alpha=0.6, vmin=0, vmax=1)
-            if channels[i] < len(CLASSES_ABZ):
-                converter = SignNameConverter(CLASSES_ABZ[channels[i]])
-                title = f'Class {channels[i]}: {converter.get_abz()} → {converter.get_sign_name()}'
-            else:
-                title = f'Class {channels[i]}: Unknown'
-            axes[row, col].set_title(title)
-            axes[row, col].axis('off')
-            plt.colorbar(im, ax=axes[row, col], fraction=0.046)
-        
-        plt.tight_layout()
-        self.fig = fig
-        self.visualized_result = fig
-        return fig
-    
-    def draw_heatmap_pca(self, img, heatmap, n_components=3, detection=None, texts=None, alpha=0.6):
-        """
-        Visualize heatmap using PCA to extract and display the first 3 principal components as false RGB.
-        
-        Args:
-            img: Original image (can be None for text-only visualization)
-            heatmap: Heatmap array with shape (H, W, num_classes)
-            n_components: Number of PCA components to compute (default: 3 for RGB)
-            detection: Optional detection boxes to overlay
-            texts: Optional text lines to display
-            alpha: Transparency for heatmap overlay (0-1)
-        """
-        # Close previous figure to prevent memory leakage
-        if self.fig is not None:
-            plt.close(self.fig)
-        
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        
-        # Prepare background image
-        if texts is not None:
-            background_img = np.ones((heatmap.shape[0], heatmap.shape[1], 3), dtype=np.uint8) * 255
-            img = background_img
-        
-        # Perform PCA on heatmap
-        H, W, C = heatmap.shape
-        
-        # Reshape heatmap to (H*W, num_classes) for PCA
-        heatmap_flat = heatmap.reshape(-1, C)
-        
-        # Apply PCA to extract first n_components
-        pca = PCA(n_components=min(n_components, C))
-        pca_result = pca.fit_transform(heatmap_flat)
-        
-        # Reshape back to spatial dimensions (H, W, n_components)
-        pca_spatial = pca_result.reshape(H, W, -1)
-        
-        # Create false RGB from first 3 components
-        false_rgb = np.zeros((H, W, 3), dtype=np.float32)
-        for i in range(min(3, pca_spatial.shape[2])):
-            false_rgb[:, :, i] = pca_spatial[:, :, i]
-        
-        # Normalize to [0, 1] for visualization
-        false_rgb_normalized = np.zeros_like(false_rgb)
-        for i in range(3):
-            channel_min = false_rgb[:, :, i].min()
-            channel_max = false_rgb[:, :, i].max()
-            if channel_max > channel_min:
-                false_rgb_normalized[:, :, i] = (false_rgb[:, :, i] - channel_min) / (channel_max - channel_min)
-            else:
-                false_rgb_normalized[:, :, i] = false_rgb[:, :, i]
-        
-        # Store explained variance for display
-        explained_var = pca.explained_variance_ratio_[:3]
-        
-        # Subplot 1: Original image or text
-        if texts is not None:
-            axes[0].imshow(background_img)
-            axes[0].set_title('Text Lines')
-            axes[0].axis('off')
-            text_y_start = 0.95
-            text_y_step = 0.85 / max(len(texts), 1)
-            for i, line in enumerate(texts):
-                line_text = ' '.join(line)
-                axes[0].text(0.05, text_y_start - i * text_y_step, line_text,
-                           fontsize=10, color='black', family='monospace',
-                           transform=axes[0].transAxes, verticalalignment='top')
-        elif detection is not None:
-            bbox_viz = BboxVisualizer(boxes_color=self.bboxes_color)
-            bbox_viz.draw_boxes(img, detection)
-            axes[0].imshow(cv2.cvtColor(bbox_viz.visualized_result, cv2.COLOR_BGR2RGB))
-            axes[0].set_title('Detection with Bounding Box')
-            axes[0].axis('off')
-        elif img is not None:
-            axes[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            axes[0].set_title('Original Image')
-            axes[0].axis('off')
-        else:
-            axes[0].axis('off')
-        
-        # Subplot 2: False RGB heatmap only (PCA components)
-        axes[1].imshow(false_rgb_normalized)
-        title_text = 'PCA False RGB Heatmap\n'
-        title_text += f'R: PC1 ({explained_var[0]:.1%}) '
-        title_text += f'G: PC2 ({explained_var[1]:.1%}) '
-        title_text += f'B: PC3 ({explained_var[2]:.1%})'
-        axes[1].set_title(title_text)
-        axes[1].axis('off')
-        
-        # Subplot 3: Overlay on image
-        if img is not None:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img_rgb_resized = cv2.resize(img_rgb, (heatmap.shape[1], heatmap.shape[0]))
-            # Normalize image to [0, 1]
-            img_normalized = img_rgb_resized.astype(np.float32) / 255.0
-            # Blend
-            blended = img_normalized * (1 - alpha) + false_rgb_normalized * alpha
-            blended = np.clip(blended, 0, 1)
-            axes[2].imshow(blended)
-            axes[2].set_title(f'Overlay (alpha={alpha})')
-            axes[2].axis('off')
-        else:
-            axes[2].imshow(false_rgb_normalized)
-            axes[2].set_title('False RGB Heatmap')
-            axes[2].axis('off')
-        
-        plt.tight_layout()
-        self.fig = fig
-        self.visualized_result = fig
-        return fig
-    
-
-    def display_result(self, vis_opt = "save", path=None):
-        import matplotlib.pyplot as plt
-        
-        if vis_opt == "show" and self.visualized_result is not None:
-            plt.show()
-        elif vis_opt == "draw" and self.visualized_result is not None:
-            plt.show()
-        elif vis_opt == "save" and self.visualized_result is not None:
-            if path is None:
-                print("heatmap visualization path not provided, saving to 'heatmap_visualization_result.jpg'")
-                path = 'heatmap_visualization_result.jpg'
-            self.fig.savefig(path, dpi=150, bbox_inches='tight')
-            print(f"Heatmap visualization saved to {path}")
-            plt.close(self.fig)
-        else:
-            print("No heatmap visualization result to display or save.")
-
-
-def visualize_results(fragment_id, img, gt_boxes, detections, text_lines, aligned_signs, output_dir):
-    """Create and save visualization results"""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    
-    # 1. Ground truth boxes
-    if gt_boxes:
-        bbox_visualizer = BboxVisualizer(boxes_color=(0, 255, 0))
-        vis_gt = bbox_visualizer.draw_boxes(img, gt_boxes)  # green
-        cv2.imwrite(os.path.join(output_dir, f"{fragment_id}_1_ground_truth.jpg"), vis_gt)
-    
-    # 2. Detection results
-    bbox_visualizer = BboxVisualizer(boxes_color=(255, 0, 0))
-    vis_det = bbox_visualizer.draw_boxes(img, detections)  # blue
-    cv2.imwrite(os.path.join(output_dir, f"{fragment_id}_2_detections.jpg"), vis_det)
-    
-    # 3. Print text conversion (ABZ -> sign names)
-    text_visualizer = TextVisualizer(text_lines)
-    text_filepath = os.path.join(output_dir, f"{fragment_id}_3_text_signs.txt")
-    text_visualizer.write_text_file(text_filepath, fragment_id)
-    
-    # 4. Aligned bounding boxes
-    # Color: located=blue, interpolated=red
-    def get_aligned_color(sign):
-        return (0, 0, 255) if sign.get('interpolated') else (255, 0, 0)
-    
-    bbox_visualizer = BboxVisualizer(color_func=get_aligned_color)
-    vis_aligned = bbox_visualizer.draw_boxes(img, aligned_signs, label_key='sign_name')
-    cv2.imwrite(os.path.join(output_dir, f"{fragment_id}_4_aligned.jpg"), vis_aligned)
-    
-    print(f"Saved visualizations to {output_dir}/{fragment_id}_*.jpg/txt")
-
-# ============ Main ============
-def process_fragment(model, fragment_id):
-    """Process a single fragment"""
-    print(f"\n{'='*60}")
-    print(f"Processing fragment: {fragment_id}")
-    
-    # Load image
-    img = load_image(fragment_id)
-    if img is None:
-        print(f"  Image not found for {fragment_id}")
-        return None
-    
-    # Load ground truth
-    gt_boxes = load_ground_truth(fragment_id)
-    print(f"  Ground truth boxes: {len(gt_boxes) if gt_boxes else 0}")
-    
-    # Get signs from API
-    signs_text = get_signs_from_api(fragment_id)
-    if signs_text is None:
-        print(f"  Could not get signs from API for {fragment_id}")
-        return None
-    
-    print(f"  Raw API signs (first 200 chars): {signs_text[:200]}...")
-    
-    # Parse text signs (ABZ -> sign names)
-    text_lines = parse_api_signs(signs_text)
-    total_text_signs = sum(len(line) for line in text_lines)
-    print(f"  Text lines: {len(text_lines)}, total signs: {total_text_signs}")
-    
-    # Detect signs
-    detector = TabletImageDetector(model, CLASSES_ABZ, SCORE_THRESHOLD, visualize_crop=False, logging_crop=False)
-    detections = detector.detect(img)
-    print(f"  Detected signs (score > {SCORE_THRESHOLD}): {len(detections)}")
-    
-    # Compute average dimensions
-    avg_width, avg_height = compute_avg_dimensions(detections)
-    print(f"  Avg sign dimensions: {avg_width:.1f} x {avg_height:.1f}")
-    
-    # Group detections into lines
-    detected_lines = group_detections_into_lines(detections)
-    print(f"  Detected lines: {len(detected_lines)}")
-    
-    # Align signs
-    aligned_signs = align_signs(detected_lines, text_lines, avg_width, avg_height)
-    located_count = sum(1 for s in aligned_signs if s.get('located'))
-    interpolated_count = sum(1 for s in aligned_signs if s.get('interpolated'))
-    print(f"  Aligned: {located_count} located, {interpolated_count} interpolated")
-    
-    # Visualize
-    visualize_results(fragment_id, img, gt_boxes, detections, text_lines, aligned_signs, OUTPUT_DIR)
-    
-    return {
-        'fragment_id': fragment_id,
-        'gt_count': len(gt_boxes) if gt_boxes else 0,
-        'text_signs': total_text_signs,
-        'detected': len(detections),
-        'located': located_count,
-        'interpolated': interpolated_count
-    }
-
-def get_available_fragments():
-    """Get list of available fragments (have both image and annotation)"""
-    imgs_path = os.path.join(ANNOTATIONS_DIR, "imgs")
-    annotations_path = os.path.join(ANNOTATIONS_DIR, "annotations")
-    
-    fragments = []
-    for img_file in os.listdir(imgs_path):
-        if img_file.endswith(('.jpg', '.jpeg', '.png')):
-            fragment_id = os.path.splitext(img_file)[0]
-            # Check if annotation exists
-            gt_file = os.path.join(annotations_path, f"gt_{fragment_id}.txt")
-            if os.path.exists(gt_file):
-                fragments.append(fragment_id)
-    
-    return fragments
-
-if __name__ == "__main__":
-    print("Cuneiform Signs Alignment")
-    print("=" * 60)
-    
-    print("procedure not exists")
