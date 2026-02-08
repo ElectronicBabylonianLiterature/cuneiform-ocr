@@ -46,6 +46,7 @@ class BboxVisualizer:
             cv2.rectangle(img_vis, (x1, y1), (x2, y2), color_bgr, 2)
         
         if not show_labels:
+            self.result = img_vis
             return img_vis
         
         # Convert to PIL for Unicode text
