@@ -53,6 +53,7 @@ DEFAULT_OPTIMIZER_PARAMS = dict(
     lambda_seq=0.05,
     lambda_smooth=0.15,
     lambda_anchor=0.05,
+    lambda_size=0.1,
     alpha_geo=0.0,                # disabled
     num_iterations=NUM_ITERATIONS_EVAL,
     lr=5.0,
@@ -368,6 +369,7 @@ def run_alignment_pipeline(
             lambda_seq=optimizer_params.get('lambda_seq', 0.05),
             lambda_smooth=optimizer_params.get('lambda_smooth', 0.15),
             lambda_anchor=optimizer_params.get('lambda_anchor', 0.05),
+            lambda_size=optimizer_params.get('lambda_size', 0.1),
             alpha_geo=optimizer_params.get('alpha_geo', 0.0),
             prior_aspect_ratio=prior_ar,
             device=DEVICE,
@@ -598,6 +600,7 @@ def hyperparameter_search(
         'lambda_seq':    [0.01, 0.05, 0.2],
         'lambda_smooth': [0.05, 0.15, 0.5],
         'lambda_anchor': [0.01, 0.05, 0.2],
+        'lambda_size':   [0.0, 0.05, 0.1, 0.5, 1.0],
     }
 
     # Start from defaults (use fast iteration count for searching)

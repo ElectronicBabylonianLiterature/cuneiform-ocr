@@ -47,7 +47,7 @@ CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/
 SCORE_THRESHOLD = 0.5
 SCALE_FACTOR = 10
 OUTPUT_DIR = "alignment_results_heatmap"
-SAMPLE_LIMIT = 10
+SAMPLE_LIMIT = 20
 
 # Optimizer hyperparameters
 OPTIMIZER_PARAMS = dict(
@@ -56,6 +56,7 @@ OPTIMIZER_PARAMS = dict(
     lambda_seq=0.10,
     lambda_smooth=0.05,
     lambda_anchor=0.1,
+    lambda_size=0.1,
     num_iterations=100,
     alpha_geo=0.0,            # disable geometric term for ablation
 )
@@ -149,6 +150,7 @@ def process_single_crop(
         lambda_seq=optimizer_params.get('lambda_seq', 0.05),
         lambda_smooth=optimizer_params.get('lambda_smooth', 0.15),
         lambda_anchor=optimizer_params.get('lambda_anchor', 0.05),
+        lambda_size=optimizer_params.get('lambda_size', 0.1),
         alpha_geo=optimizer_params.get('alpha_geo', 0.0),
         prior_aspect_ratio=prior_aspect_ratio,
         device=DEVICE,
