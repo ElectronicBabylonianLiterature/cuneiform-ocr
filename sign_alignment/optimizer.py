@@ -58,6 +58,9 @@ class ElasticChainOptimizer:
         - L_semantic:  per-class heatmap response  (weight: 1-alpha_geo)
         - L_geometric: class-agnostic existence map (weight: alpha_geo)
     - L_iou: Per-class global IoU between optimised and detected boxes
+    - L_size: Size regularisation – penalises bbox (w+h) that deviates from
+              the average detection size.  Lenient inside [2/3, 4/3] of the
+              reference, severe outside [1/3, 5/3].
     - L_seq: Sequential constraint (signs in a row should be tightly distributed)
     - L_smooth: Height consistency (adjacent signs should have similar heights)
     - L_anchor: Line baseline constraint (signs shouldn't deviate too far from row baseline)
@@ -74,6 +77,7 @@ class ElasticChainOptimizer:
                  lambda_seq: float = 0.1,
                  lambda_smooth: float = 0.05,
                  lambda_anchor: float = 0.02,
+                 lambda_size: float = 0.1,
                  alpha_geo: float = 0.7,
                  prior_aspect_ratio: float = 1.15,
                  device: str = None):
@@ -89,6 +93,7 @@ class ElasticChainOptimizer:
             lambda_seq: Weight for sequential constraint
             lambda_smooth: Weight for height smoothness
             lambda_anchor: Weight for baseline anchor
+            lambda_size: Weight for size regularisation loss
             alpha_geo: Geometric (class-agnostic) weight inside L_data.
                        L_data = (1-alpha_geo)*L_semantic + alpha_geo*L_geometric.
                        Default 0.7 gives heavy weight to existence evidence.
@@ -103,6 +108,7 @@ class ElasticChainOptimizer:
         self.lambda_seq = lambda_seq
         self.lambda_smooth = lambda_smooth
         self.lambda_anchor = lambda_anchor
+        self.lambda_size = lambda_size
         self.alpha_geo = alpha_geo
         self.prior_aspect_ratio = prior_aspect_ratio
         
@@ -157,6 +163,12 @@ class ElasticChainOptimizer:
         self.row_baselines = torch.tensor(self.row_baselines, dtype=torch.float32,
                                           device=self.device)
         
+        # ---- Reference size for L_size (average detection w+h) ----
+        self.ref_size = float(sub_tablet_text.avg_width + sub_tablet_text.avg_height)
+        if detection_boxes is not None and len(detection_boxes) > 0:
+            det_sizes = [(bb.width + bb.height) for bb in detection_boxes]
+            self.ref_size = float(np.mean(det_sizes))
+
         # ---- Detection boxes for IoU loss ----
         # Group detected boxes by class_id (ABZ index)
         self.det_boxes_by_class: Dict[int, torch.Tensor] = {}
@@ -387,24 +399,65 @@ class ElasticChainOptimizer:
             idx += row_len
         
         return loss / max(1, self.num_signs)
-    
+
+    def compute_size_loss(self) -> torch.Tensor:
+        """
+        Size regularisation loss.
+
+        Uses (w + h) of each bbox compared to the average detection size.
+        Let ratio = (w + h) / ref_size.  The loss is:
+
+          - ratio in [2/3, 4/3]  → near-zero penalty  (comfort zone)
+          - ratio in [1/3, 2/3) or (4/3, 5/3] → moderate quadratic ramp
+          - ratio < 1/3 or ratio > 5/3 → very steep extra penalty
+
+        Implemented as:
+          d = relu(lo_soft - ratio) + relu(ratio - hi_soft)      (distance outside comfort)
+          e = relu(lo_hard - ratio) + relu(ratio - hi_hard)      (distance outside danger)
+          penalty_i = d^2 + k * e^2       (k = 10  →  10x steeper in danger zone)
+        """
+        ref = self.ref_size
+        if ref <= 0:
+            return torch.tensor(0.0, device=self.device)
+
+        sizes = self.params[:, 2] + self.params[:, 3]  # w + h per sign
+        ratio = sizes / ref
+
+        lo_soft, hi_soft = 2.0 / 3.0, 4.0 / 3.0   # comfort zone
+        lo_hard, hi_hard = 1.0 / 3.0, 5.0 / 3.0   # danger zone
+
+        d_lo = F.relu(lo_soft - ratio)
+        d_hi = F.relu(ratio - hi_soft)
+        d = d_lo + d_hi  # distance from comfort zone
+
+        e_lo = F.relu(lo_hard - ratio)
+        e_hi = F.relu(ratio - hi_hard)
+        e = e_lo + e_hi  # distance past danger boundary
+
+        k = 10.0  # extra severity multiplier for extreme deviations
+        penalty = d ** 2 + k * e ** 2
+
+        return penalty.mean()
+
     def compute_total_loss(self) -> tuple:
         """Compute total loss and return all components."""
         L_sem = self.compute_semantic_loss()
         L_geo = self.compute_geometric_loss()
         L_data = (1.0 - self.alpha_geo) * L_sem + self.alpha_geo * L_geo
         L_iou = self.compute_iou_loss()
+        L_size = self.compute_size_loss()
         L_seq = self.compute_seq_loss()
         L_smooth = self.compute_smooth_loss()
         L_anchor = self.compute_anchor_loss()
         
         L_total = (self.lambda_data * L_data +
                    self.lambda_iou * L_iou +
+                   self.lambda_size * L_size +
                    self.lambda_seq * L_seq +
                    self.lambda_smooth * L_smooth +
                    self.lambda_anchor * L_anchor)
         
-        return L_total, L_data, L_iou, L_seq, L_smooth, L_anchor, L_sem, L_geo
+        return L_total, L_data, L_iou, L_size, L_seq, L_smooth, L_anchor, L_sem, L_geo
     
     def optimize(self, num_iterations: int = 100, lr: float = 1.0,
                  verbose: bool = True, log_every: int = 10) -> SubTablet:
@@ -430,7 +483,7 @@ class ElasticChainOptimizer:
         
         for iteration in range(num_iterations):
             optimizer.zero_grad()
-            L_total, L_data, L_iou, L_seq, L_smooth, L_anchor, L_sem, L_geo = self.compute_total_loss()
+            L_total, L_data, L_iou, L_size, L_seq, L_smooth, L_anchor, L_sem, L_geo = self.compute_total_loss()
             L_total.backward()
             optimizer.step()
             
@@ -444,6 +497,7 @@ class ElasticChainOptimizer:
                 'total': L_total.item(),
                 'data': L_data.item(),
                 'iou': L_iou.item(),
+                'size': L_size.item(),
                 'semantic': L_sem.item(),
                 'geometric': L_geo.item(),
                 'seq': L_seq.item(),
@@ -454,7 +508,7 @@ class ElasticChainOptimizer:
             if verbose and (iteration % log_every == 0 or iteration == num_iterations - 1):
                 print(f"Iter {iteration:4d}: L_total={L_total.item():.4f}, "
                       f"L_data={L_data.item():.4f} (sem={L_sem.item():.4f}, geo={L_geo.item():.4f}), "
-                      f"L_iou={L_iou.item():.4f}, "
+                      f"L_iou={L_iou.item():.4f}, L_size={L_size.item():.4f}, "
                       f"L_seq={L_seq.item():.4f}, L_smooth={L_smooth.item():.4f}, "
                       f"L_anchor={L_anchor.item():.4f}")
         
@@ -513,7 +567,7 @@ class ElasticChainOptimizer:
         axes[0].grid(True)
         
         # 2. Main components
-        for comp in ['data', 'iou', 'seq', 'smooth', 'anchor']:
+        for comp in ['data', 'iou', 'size', 'seq', 'smooth', 'anchor']:
             values = [h.get(comp, 0) for h in self.loss_components_history]
             axes[1].plot(values, label=f'L_{comp}')
         axes[1].set_xlabel('Iteration')
@@ -533,12 +587,14 @@ class ElasticChainOptimizer:
         axes[2].legend()
         axes[2].grid(True)
         
-        # 4. IoU loss
+        # 4. IoU + Size loss
         iou_vals = [h.get('iou', 0) for h in self.loss_components_history]
+        size_vals = [h.get('size', 0) for h in self.loss_components_history]
         axes[3].plot(iou_vals, label='L_iou', color='tab:red')
+        axes[3].plot(size_vals, label='L_size', color='tab:orange')
         axes[3].set_xlabel('Iteration')
-        axes[3].set_ylabel('1 - IoU')
-        axes[3].set_title(f'IoU Shape Regression Loss (λ_iou={self.lambda_iou})')
+        axes[3].set_ylabel('Loss')
+        axes[3].set_title(f'IoU & Size Loss (λ_iou={self.lambda_iou}, λ_size={self.lambda_size})')
         axes[3].legend()
         axes[3].grid(True)
         
