@@ -53,24 +53,44 @@ class BboxVisualizer:
         img_pil = Image.fromarray(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(img_pil)
         
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 40)
-        except:
-            font = ImageFont.load_default()
-        
         # Draw labels
         for box in boxes:
-            x1, y1 = int(box.x1), int(box.y1)
+            x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
             label = box.sign.name[:10]
+            
+            # Get box color
+            # color = self.color_func(box) if self.color_func else self.default_color
+            color = (0, 0, 0) # still use black
+            
+            # Calculate label height as 1/6 of box height
+            box_height = y2 - y1
+            label_height = max(int(box_height / 6), 12)  # Minimum 12 pixels
+            
+            # Calculate font size to fit label height (approximate: font_size ≈ label_height * 0.75)
+            font_size = max(int(label_height * 0.75), 10)
+            
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+            except:
+                font = ImageFont.load_default()
             
             # Get text size
             bbox_text = draw.textbbox((0, 0), label, font=font)
             text_w = bbox_text[2] - bbox_text[0]
             text_h = bbox_text[3] - bbox_text[1]
             
-            # Draw background and text
-            draw.rectangle([x1, y1-text_h-10, x1+text_w+4, y1-2], fill=(0, 0, 0))
-            draw.text((x1+2, y1-text_h-8), label, font=font, fill=(255, 255, 255))
+            # Position label inside box at the top
+            label_x1 = x1 + 2
+            label_y1 = y1 + 2
+            label_x2 = min(x1 + text_w + 8, x2 - 2)  # Ensure it stays within box
+            label_y2 = y1 + label_height
+            
+            # Draw label background with box color
+            draw.rectangle([label_x1, label_y1, label_x2, label_y2], fill=color)
+            
+            # Draw white text
+            text_y = label_y1 + (label_height - text_h) // 2  # Center vertically
+            draw.text((label_x1 + 4, text_y), label, font=font, fill=(255, 255, 255))
         
         img_result = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
         self.result = img_result  # Store for display_result
