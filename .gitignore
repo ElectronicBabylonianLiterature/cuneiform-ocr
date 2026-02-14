@@ -23,4 +23,6 @@ valid_fragments.json
 log_*.log
 alignment_results/
 alignment_results_heatmap/
+alignment_results_heatmap-*/
 .env
+.ipynb_checkpoints/
