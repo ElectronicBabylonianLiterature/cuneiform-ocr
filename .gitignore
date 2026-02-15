@@ -26,3 +26,5 @@ alignment_results_heatmap/
 alignment_results_heatmap-*/
 .env
 .ipynb_checkpoints/
+data_processing/division_checking_photos/
+data_processing/visualizations/

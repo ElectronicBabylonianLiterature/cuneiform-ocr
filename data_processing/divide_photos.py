@@ -1,9 +1,10 @@
-from typing import List, Union
+from typing import List, Union, Optional
 from pathlib import Path
 import cv2
 import numpy as np
 from IPython.display import display
 from PIL import Image
+import os
     
 
 def merge_nearby_boxes(boxes: List[dict], distance_threshold: float, img_width: int = None, img_height: int = None) -> List[dict]:
@@ -94,6 +95,14 @@ def merge_nearby_boxes(boxes: List[dict], distance_threshold: float, img_width: 
             used.add(idx)
         
         # Create merged box
+        # Collect original contours from merged boxes
+        original_contours = []
+        for idx in merged_indices:
+            if 'original_contours' in boxes[idx]:
+                original_contours.extend(boxes[idx]['original_contours'])
+            elif 'contour' in boxes[idx]:
+                original_contours.append(boxes[idx]['contour'])
+        
         merged_box = {
             'x': x1_min,
             'y': y1_min,
@@ -102,7 +111,8 @@ def merge_nearby_boxes(boxes: List[dict], distance_threshold: float, img_width: 
             'area': (x1_max - x1_min) * (y1_max - y1_min),
             'center_x': (x1_min + x1_max) // 2,
             'center_y': (y1_min + y1_max) // 2,
-            'merged_count': len(merged_indices)
+            'merged_count': len(merged_indices),
+            'original_contours': original_contours
         }
         
         merged.append(merged_box)
@@ -179,6 +189,14 @@ def merge_overlapping_boxes(boxes: List[dict]) -> List[dict]:
                 used.add(idx)
             
             # Create merged box
+            # Collect original contours from all merged boxes
+            original_contours = []
+            for idx in merged_indices:
+                if 'original_contours' in boxes[idx]:
+                    original_contours.extend(boxes[idx]['original_contours'])
+                elif 'contour' in boxes[idx]:
+                    original_contours.append(boxes[idx]['contour'])
+            
             merged_box = {
                 'x': x1_min,
                 'y': y1_min,
@@ -187,7 +205,8 @@ def merge_overlapping_boxes(boxes: List[dict]) -> List[dict]:
                 'area': (x1_max - x1_min) * (y1_max - y1_min),
                 'center_x': (x1_min + x1_max) // 2,
                 'center_y': (y1_min + y1_max) // 2,
-                'merged_count': box1.get('merged_count', 1) + len(merged_indices) - 1
+                'merged_count': box1.get('merged_count', 1) + len(merged_indices) - 1,
+                'original_contours': original_contours
             }
             
             merged.append(merged_box)
@@ -214,8 +233,14 @@ def visualize_contours(img: np.ndarray, contours: list, output_path: str = 'visu
         x, y, w, h = cv2.boundingRect(contour)
         cv2.rectangle(vis_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
     
+    # Create directory if it doesn't exist
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    
     # Save visualization
     cv2.imwrite(output_path, vis_img)
+    print(f"Contour visualization saved to: {output_path}")
 
 def divide_tablet_photo(
     img_or_path: Union[np.ndarray, str, Path],
@@ -225,7 +250,10 @@ def divide_tablet_photo(
     output_path: str = None,
     force_output_result: bool = False,
     logging: bool = True,
-    return_coordinates: bool = False
+    return_coordinates: bool = False,
+    return_masks: bool = False,
+    mask_dilation_size: int = 5,
+    mask_dilation_iterations: int = 2
 ) -> Union[List[np.ndarray], tuple]:
     """
     Divide a photo containing multiple tablet fragments into separate images, sorted top-to-bottom, left-to-right
@@ -237,12 +265,16 @@ def divide_tablet_photo(
         visualize: Whether to visualize detection results (default: False)
         output_path: Path to save visualization results (default: None)
         return_coordinates: Whether to return coordinates of cropped regions (default: False)
+        return_masks: Whether to return binary masks for each cropped region (default: False)
+        mask_dilation_size: Size of dilation kernel for mask expansion (default: 5)
+        mask_dilation_iterations: Number of dilation iterations (default: 2)
     
     Returns:
-        If return_coordinates is False:
-            List[np.ndarray]: List of cropped images sorted from top-to-bottom, left-to-right
-        If return_coordinates is True:
-            tuple: (List[np.ndarray], List[dict]) where dict contains 'x', 'y', 'w', 'h' of each cropped region
+        Depending on flags:
+        - Default: List[np.ndarray] of cropped images
+        - return_coordinates=True: (List[np.ndarray], List[dict])
+        - return_masks=True: (List[np.ndarray], List[np.ndarray])
+        - Both True: (List[np.ndarray], List[dict], List[np.ndarray])
     """
     # Read image
     if isinstance(img_or_path, (str, Path)):
@@ -260,7 +292,7 @@ def divide_tablet_photo(
     
 
     # convert to grayscale and threshold
-    merge_threshold = 30
+    merge_threshold = 5
 
     im_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     # Detect background color by sampling top-left corner pixels
@@ -344,6 +376,18 @@ def divide_tablet_photo(
     if logging:
         print(f"after keeping top 12 largest: {len(merged_contours)} boxes")
 
+    # remove boxes that are too small after merging
+    min_box_area = img_area / 60  # 1/60 of image area
+    filtered_by_size = []
+    for data in merged_contours:
+        if data['area'] >= min_box_area:
+            filtered_by_size.append(data)
+        elif logging:
+            pass
+    merged_contours = filtered_by_size
+    if logging:
+        print(f"after removing small boxes: {len(merged_contours)} boxes")
+
     # Sort by top-to-bottom, left-to-right order
     # first by y (top to bottom), then by x (left to right)
     # use integer division to group by rows
@@ -354,6 +398,7 @@ def divide_tablet_photo(
     # Crop images
     cropped_images = []
     crop_coordinates = []  # Store coordinates of each crop
+    masks = []  # Store masks for each crop
     padding = 10  # Padding in pixels
 
     for data in merged_contours:
@@ -375,6 +420,36 @@ def divide_tablet_photo(
             'w': x2 - x1,
             'h': y2 - y1
         })
+        
+        # Generate mask if requested
+        if return_masks:
+            # Get original contours for this merged box
+            original_contours = data.get('original_contours', [])
+            
+            # If no contours saved (shouldn't happen), fallback to using the box rectangle
+            if not original_contours and 'contour' in data:
+                original_contours = [data['contour']]
+            
+            # Create empty mask with crop dimensions
+            mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+            
+            # Fill mask with all original contours that contributed to this box
+            if original_contours:
+                for contour in original_contours:
+                    # Transform contour coordinates to local crop space
+                    local_contour = contour - np.array([x1, y1])
+                    # Fill contour on mask (solid fill)
+                    cv2.fillPoly(mask, [local_contour], 255)
+            else:
+                # Fallback: fill entire box if no contours available
+                mask[:, :] = 255
+            
+            # Dilate mask to avoid cutting edges
+            if mask_dilation_size > 0 and mask_dilation_iterations > 0:
+                kernel = np.ones((mask_dilation_size, mask_dilation_size), np.uint8)
+                mask = cv2.dilate(mask, kernel, iterations=mask_dilation_iterations)
+            
+            masks.append(mask)
     
     # Visualize results
     if visualize or force_output_result:
@@ -392,18 +467,102 @@ def divide_tablet_photo(
             cv2.putText(vis_img, label, (x + 10, y + 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
         
+        # Draw area threshold reference square in bottom-right corner with dashed lines
+        square_size = int(np.sqrt(min_box_area))
+        margin = 20  # Margin from bottom-right corner
+        dash_length = 10
+        gap_length = 5
+        
+        # Draw dashed rectangle
+        def draw_dashed_line(img, pt1, pt2, color, thickness, dash_len, gap_len):
+            """Draw a dashed line"""
+            dist = np.sqrt((pt2[0] - pt1[0])**2 + (pt2[1] - pt1[1])**2)
+            dashes = int(dist / (dash_len + gap_len))
+            for i in range(dashes):
+                start = i * (dash_len + gap_len) / dist
+                end = (i * (dash_len + gap_len) + dash_len) / dist
+                start_pt = (int(pt1[0] + (pt2[0] - pt1[0]) * start),
+                           int(pt1[1] + (pt2[1] - pt1[1]) * start))
+                end_pt = (int(pt1[0] + (pt2[0] - pt1[0]) * end),
+                         int(pt1[1] + (pt2[1] - pt1[1]) * end))
+                cv2.line(img, start_pt, end_pt, color, thickness)
+        
+        # Draw four sides of the square in bottom-right corner
+        top_left = (img_width - margin - square_size, img_height - margin - square_size)
+        top_right = (img_width - margin, img_height - margin - square_size)
+        bottom_right = (img_width - margin, img_height - margin)
+        bottom_left = (img_width - margin - square_size, img_height - margin)
+        
+        dash_color = (255, 165, 0)  # Orange color for visibility
+        dash_thickness = 2
+        
+        draw_dashed_line(vis_img, top_left, top_right, dash_color, dash_thickness, dash_length, gap_length)
+        draw_dashed_line(vis_img, top_right, bottom_right, dash_color, dash_thickness, dash_length, gap_length)
+        draw_dashed_line(vis_img, bottom_right, bottom_left, dash_color, dash_thickness, dash_length, gap_length)
+        draw_dashed_line(vis_img, bottom_left, top_left, dash_color, dash_thickness, dash_length, gap_length)
+        
+        # Add text label above the square
+        cv2.putText(vis_img, f"Min area: {min_box_area:.0f}", 
+                   (img_width - margin - square_size, img_height - margin - square_size - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, dash_color, 2)
+        
         if output_path:
             cv2.imwrite(output_path, vis_img)
             print(f"Visualized results saved to: {output_path}")
 
-        # visualize cropped images
+    # visualize cropped images and masks
     if visualize:
+        # Create visualizations directory if it doesn't exist
+        os.makedirs('visualizations', exist_ok=True)
+        
         for i, cropped_img in enumerate(cropped_images):
             pil_img = Image.fromarray(cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB))
             print(f"Cropped Image {i + 1}:")
-            display(pil_img)
+            # display(pil_img)
+            
+            # Save cropped image
+            cv2.imwrite(f'visualizations/cropped_{i+1}.jpg', cropped_img)
+            
+            # Also display and save mask if available
+            if return_masks and i < len(masks):
+                mask_pil = Image.fromarray(masks[i])
+                print(f"Mask {i + 1}:")
+                # display(mask_pil)
+                
+                # Save mask as image
+                cv2.imwrite(f'visualizations/mask_{i+1}.jpg', masks[i])
+                
+                # Save masked result (apply mask to cropped image)
+                masked_img = cropped_img.copy()
+                # Create 3-channel mask
+                mask_3ch = cv2.cvtColor(masks[i], cv2.COLOR_GRAY2BGR)
+                # Apply mask (keep only foreground)
+                masked_img = cv2.bitwise_and(masked_img, mask_3ch)
+                cv2.imwrite(f'visualizations/masked_result_{i+1}.jpg', masked_img)
+                
+                # Save overlay visualization (semi-transparent mask on image)
+                overlay = cropped_img.copy()
+                # Create colored mask (green for foreground)
+                mask_colored = np.zeros_like(cropped_img)
+                mask_colored[:, :] = [0, 255, 0]  # Green
+                mask_colored = cv2.bitwise_and(mask_colored, mask_3ch)
+                # Blend with alpha
+                overlay = cv2.addWeighted(overlay, 0.7, mask_colored, 0.3, 0)
+                cv2.imwrite(f'visualizations/overlay_{i+1}.jpg', overlay)
+        
+        print(f"\nVisualization files saved to 'visualizations/' directory:")
+        if return_masks:
+            print("  - cropped_N.jpg: Original cropped images")
+            print("  - mask_N.jpg: Binary masks")
+            print("  - masked_result_N.jpg: Images with mask applied (background removed)")
+            print("  - overlay_N.jpg: Mask overlay visualization (green = foreground)")
         
 
-    if return_coordinates:
+    # Return based on flags
+    if return_coordinates and return_masks:
+        return cropped_images, crop_coordinates, masks
+    elif return_coordinates:
         return cropped_images, crop_coordinates
+    elif return_masks:
+        return cropped_images, masks
     return cropped_images
