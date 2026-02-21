@@ -62,6 +62,12 @@ from .optimizer import (
     build_agnostic_heatmap,
 )
 
+from .psr_optimizer import (
+    PointSetRegistrationOptimizer,
+    initialize_text_subtablet,
+    filter_boxes_by_mask,
+)
+
 __all__ = [
     # Data sources
     'LocalDataSource',
@@ -111,4 +117,9 @@ __all__ = [
     # Optimization
     'ElasticChainOptimizer',
     'build_agnostic_heatmap',
+    
+    # PSR Optimization
+    'PointSetRegistrationOptimizer',
+    'initialize_text_subtablet',
+    'filter_boxes_by_mask',
 ]
