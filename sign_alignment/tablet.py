@@ -362,6 +362,16 @@ class SubTablet:
             rows_dict[row_idx].sort(key=lambda sb: sb.col_idx)
         
         return [rows_dict[k] for k in sorted(rows_dict.keys())]
+    
+    def get_row_sign_sequences(self) -> List[List[str]]:
+        """
+        Get sign name sequences for each row (sorted by row_idx).
+        
+        Returns:
+            List of rows, each row is a list of sign names
+        """
+        rows = self.get_rows()
+        return [[sb.sign_name for sb in row] for row in rows]
 
     @property
     def info(self) -> str:
