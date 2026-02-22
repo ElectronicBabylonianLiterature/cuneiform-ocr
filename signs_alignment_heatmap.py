@@ -51,9 +51,9 @@ SAMPLE_LIMIT = 20
 
 # Optimizer hyperparameters
 OPTIMIZER_PARAMS = dict(
-    lambda_data=50000.0,
-    lambda_iou=20000.0,
-    lambda_seq=0.10,
+    lambda_data=20000.0,
+    lambda_iou=5000.0,
+    lambda_seq=0.30,
     lambda_smooth=0.05,
     lambda_anchor=0.1,
     lambda_size=0.1,
@@ -108,6 +108,9 @@ def process_single_crop(
         avg_width=avg_width,
         avg_height=avg_height,
         margin=margin,
+        img=None,
+        target_detections=None,
+        align_to_detection_centroid=False,
         name="full_text",
     )
     sub_full_text.create_heatmap(scale_factor=scale_factor, method=method)

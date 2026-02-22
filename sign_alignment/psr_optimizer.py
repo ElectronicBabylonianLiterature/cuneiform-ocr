@@ -32,7 +32,7 @@ import cv2
 from typing import List, Optional, Dict, Tuple
 from collections import defaultdict
 
-from .sign import CLASSES_ABZ as DEFAULT_CLASSES_ABZ, SignResolver
+from .sign import CLASSES_ABZ as DEFAULT_CLASSES_ABZ
 from .tablet import SignBox, SubTablet
 from .bounding_box import BoundingBox, Detection
 
@@ -78,48 +78,15 @@ def initialize_text_subtablet(
     SubTablet
         With ``sign_boxes`` placed at the centroid-adjusted positions.
     """
-    if margin is None:
-        margin = max(avg_width, avg_height)
-
-    # 1. Build uniform grid -------------------------------------------------
-    sign_boxes: List[SignBox] = []
-    for row_idx, line in enumerate(text_lines):
-        for col_idx, sign_name in enumerate(line):
-            cx = margin + col_idx * avg_width + avg_width / 2
-            cy = margin + row_idx * avg_height + avg_height / 2
-            sign = SignResolver.resolve(sign_name, expected_type='SIGN')
-            sb = SignBox.from_center(
-                cx=cx, cy=cy, width=avg_width, height=avg_height,
-                sign=sign, row_idx=row_idx, col_idx=col_idx,
-            )
-            sign_boxes.append(sb)
-
-    if not sign_boxes:
-        return SubTablet(img=img, sign_boxes=[], name="text_initialized",
-                         avg_width=avg_width, avg_height=avg_height,
-                         margin=margin)
-
-    # 2. Compute text centroid
-    text_cx = float(np.mean([sb.cx for sb in sign_boxes]))
-    text_cy = float(np.mean([sb.cy for sb in sign_boxes]))
-
-    # 3. Compute detection centroid
-    if target_detections:
-        det_cx = float(np.mean([(d.x1 + d.x2) / 2 for d in target_detections]))
-        det_cy = float(np.mean([(d.y1 + d.y2) / 2 for d in target_detections]))
-    else:
-        det_cx, det_cy = text_cx, text_cy
-
-    # 4. Translate ----------------------------------------------------------
-    dx = det_cx - text_cx
-    dy = det_cy - text_cy
-    for sb in sign_boxes:
-        sb.cx += dx
-        sb.cy += dy
-
-    return SubTablet(
-        img=img, sign_boxes=sign_boxes, name="text_initialized",
-        avg_width=avg_width, avg_height=avg_height, margin=margin,
+    return SubTablet.from_text_lines(
+        text_lines=text_lines,
+        avg_width=avg_width,
+        avg_height=avg_height,
+        margin=margin,
+        img=img,
+        target_detections=target_detections,
+        align_to_detection_centroid=True,
+        name="text_initialized",
     )
 
 
