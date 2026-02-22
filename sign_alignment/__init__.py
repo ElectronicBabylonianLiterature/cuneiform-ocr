@@ -52,6 +52,10 @@ from .heatmap import (
     create_text_based_detections,
 )
 
+from .line_process import (
+    detect_rows_dbscan,
+)
+
 from .tablet import (
     SignBox,
     SubTablet,
@@ -109,6 +113,9 @@ __all__ = [
     'group_detections_into_lines',
     'transform_gt_to_cropped_region',
     'create_text_based_detections',
+    
+    # Line/row processing
+    'detect_rows_dbscan',
     
     # Tablet data structures
     'SignBox',

@@ -172,8 +172,16 @@ class SubTablet:
     def from_text_lines(cls, text_lines: List[List[str]],
                         avg_width: float, avg_height: float,
                         margin: float = None,
+                        img: Optional[np.ndarray] = None,
+                        target_detections: Optional[Detection] = None,
+                        align_to_detection_centroid: bool = False,
                         name: str = "full_text") -> 'SubTablet':
-        """Create from text lines with uniform grid layout."""
+        """
+        Create from text lines with uniform grid layout.
+
+        Optionally translates the generated grid so its centroid matches
+        the centroid of the provided detections.
+        """
         if margin is None:
             margin = max(avg_width, avg_height)
         
@@ -190,8 +198,20 @@ class SubTablet:
                     sign=sign, row_idx=row_idx, col_idx=col_idx
                 )
                 sign_boxes.append(sb)
-        
-        return cls(img=None, sign_boxes=sign_boxes, name=name,
+
+        if align_to_detection_centroid and sign_boxes and target_detections:
+            text_cx = float(np.mean([sb.cx for sb in sign_boxes]))
+            text_cy = float(np.mean([sb.cy for sb in sign_boxes]))
+            det_cx = float(np.mean([(d.x1 + d.x2) / 2 for d in target_detections]))
+            det_cy = float(np.mean([(d.y1 + d.y2) / 2 for d in target_detections]))
+
+            dx = det_cx - text_cx
+            dy = det_cy - text_cy
+            for sb in sign_boxes:
+                sb.cx += dx
+                sb.cy += dy
+
+        return cls(img=img, sign_boxes=sign_boxes, name=name,
                    avg_width=avg_width, avg_height=avg_height, margin=margin)
     
     def to_detection_list(self) -> Detection:
@@ -292,6 +312,43 @@ class SubTablet:
             margin=self.margin, origin_x=self.origin_x, origin_y=self.origin_y
         )
     
+    def detect_rows(self, eps: float = 0.6, min_samples: int = 1, 
+                    lambda_weight: float = 0.05) -> int:
+        """
+        Detect rows using DBSCAN and update row_idx for all sign_boxes.
+        
+        Distance is normalized by average sign size (avg_width, avg_height).
+        
+        Args:
+            eps: Maximum distance threshold as multiple of average sign size (default 0.6)
+                 e.g., eps=0.6 means boxes within 0.6*avg_size are considered neighbors
+            min_samples: Minimum number of samples in a neighborhood
+            lambda_weight: Weight for x-coordinate in distance (default 0.05, emphasizes y)
+            
+        Returns:
+            Number of detected rows (excluding noise)
+        """
+        from .line_process import detect_rows_dbscan
+        
+        if not self.sign_boxes:
+            return 0
+        
+        # Detect rows with normalized distance using avg_width and avg_height
+        row_labels, num_rows = detect_rows_dbscan(
+            boxes=self.sign_boxes,
+            eps=eps,
+            min_samples=min_samples,
+            lambda_weight=lambda_weight,
+            avg_width=self.avg_width,
+            avg_height=self.avg_height
+        )
+        
+        # Update row_idx for all sign_boxes
+        for sb, row_idx in zip(self.sign_boxes, row_labels):
+            sb.row_idx = row_idx
+        
+        return num_rows
+    
     def get_rows(self) -> List[List[SignBox]]:
         """Group sign boxes by row_idx."""
         if not self.sign_boxes:
@@ -305,3 +362,13 @@ class SubTablet:
             rows_dict[row_idx].sort(key=lambda sb: sb.col_idx)
         
         return [rows_dict[k] for k in sorted(rows_dict.keys())]
+
+    @property
+    def info(self) -> str:
+        """Return a string summary of the SubTablet."""
+        num_signs = len(self.sign_boxes)
+        num_rows = len(self.get_rows())
+        img_shape = self.img.shape if self.img is not None else None
+        heatmap_shape = self.heatmap.shape if self.heatmap is not None else None
+        return (f"SubTablet '{self.name}': {num_signs} signs, {num_rows} rows, "
+                f"image shape: {img_shape}, heatmap shape: {heatmap_shape}")

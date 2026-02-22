@@ -139,6 +139,134 @@ class BboxVisualizer:
     def show_draw(self):
         """Display result using matplotlib."""
         self.display_result(vis_opt="draw")
+    
+    def draw_rows(
+        self, 
+        img: np.ndarray, 
+        boxes: List,
+        show_labels: bool = True,
+        line_thickness: int = 2,
+        marker_size: int = 5
+    ) -> np.ndarray:
+        """
+        Draw bounding boxes with row connections.
+        
+        First uses draw_boxes to draw the bounding boxes,
+        then draws lines connecting center points of signs in the same row.
+        Each row gets a unique color.
+        
+        Args:
+            img: Input image in BGR format
+            boxes: List of box objects with row_idx attribute (SignBox, BoundingBox with row_idx, etc.)
+            show_labels: Whether to show sign name labels
+            line_thickness: Thickness of row connection lines
+            marker_size: Size of center point markers
+            
+        Returns:
+            Image with boxes and row connections drawn
+        """
+        # Define distinct colors for rows (HSV-based for better distinction)
+        def get_row_color(row_idx: int) -> tuple:
+            """Generate distinct color for row using HSV (returns RGB)."""
+            if row_idx == -1:
+                return (128, 128, 128)  # Gray for noise
+            hue = int((row_idx * 137.5) % 180)  # Golden angle for better distribution
+            sat = 255
+            val = 255
+            hsv_color = np.uint8([[[hue, sat, val]]])
+            bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+            rgb_color = tuple(reversed(bgr_color))  # Convert BGR to RGB
+            return tuple(map(int, rgb_color))
+        
+        # Set color function to color boxes by row
+        self.color_func = lambda box: get_row_color(getattr(box, 'row_idx', -1))
+        
+        # Convert boxes to Detection format (BoundingBox list) if needed
+        detection_boxes = []
+        for box in boxes:
+            if hasattr(box, 'to_bounding_box'):
+                # SignBox
+                detection_boxes.append(box.to_bounding_box())
+            else:
+                # Already BoundingBox
+                detection_boxes.append(box)
+            # Copy row_idx to the detection box
+            if hasattr(box, 'row_idx'):
+                detection_boxes[-1].row_idx = box.row_idx
+        
+        # Use draw_boxes to draw bounding boxes with labels
+        img_vis = self.draw_boxes(img, detection_boxes, show_labels=show_labels)
+        
+        # Reset color function
+        self.color_func = None
+        
+        # Group boxes by row
+        rows = {}
+        for box in boxes:
+            row_idx = getattr(box, 'row_idx', -1)
+            if row_idx not in rows:
+                rows[row_idx] = []
+            rows[row_idx].append(box)
+        
+        # Draw row connections on top of the boxes
+        for row_idx in sorted(rows.keys()):
+            if row_idx == -1:
+                continue  # Skip noise
+            
+            row_boxes = rows[row_idx]
+            if len(row_boxes) < 2:
+                continue  # Need at least 2 boxes to draw line
+            
+            # Sort boxes by x-coordinate (left to right)
+            def get_cx(b):
+                if hasattr(b, 'cx'):
+                    return b.cx
+                elif hasattr(b, 'center'):
+                    return b.center[0]
+                else:
+                    return (b.x1 + b.x2) / 2
+            
+            sorted_boxes = sorted(row_boxes, key=get_cx)
+            
+            # Get row color in BGR for OpenCV
+            row_color_rgb = get_row_color(row_idx)
+            row_color_bgr = tuple(reversed(row_color_rgb))
+            
+            # Draw lines connecting centers
+            for i in range(len(sorted_boxes) - 1):
+                box1 = sorted_boxes[i]
+                box2 = sorted_boxes[i + 1]
+                
+                # Get centers
+                def get_center(b):
+                    if hasattr(b, 'cx') and hasattr(b, 'cy'):
+                        return (int(b.cx), int(b.cy))
+                    elif hasattr(b, 'center'):
+                        return (int(b.center[0]), int(b.center[1]))
+                    else:
+                        return (int((b.x1 + b.x2) / 2), int((b.y1 + b.y2) / 2))
+                
+                cx1, cy1 = get_center(box1)
+                cx2, cy2 = get_center(box2)
+                
+                # Draw line
+                cv2.line(img_vis, (cx1, cy1), (cx2, cy2), row_color_bgr, line_thickness)
+            
+            # Draw center point markers for all boxes in row
+            for box in sorted_boxes:
+                if hasattr(box, 'cx') and hasattr(box, 'cy'):
+                    cx, cy = int(box.cx), int(box.cy)
+                elif hasattr(box, 'center'):
+                    cx, cy = int(box.center[0]), int(box.center[1])
+                else:
+                    cx = int((box.x1 + box.x2) / 2)
+                    cy = int((box.y1 + box.y2) / 2)
+                
+                cv2.circle(img_vis, (cx, cy), marker_size, row_color_bgr, -1)
+                cv2.circle(img_vis, (cx, cy), marker_size + 1, (255, 255, 255), 1)  # White border
+        
+        self.result = img_vis
+        return img_vis
 
 
 class TextVisualizer:

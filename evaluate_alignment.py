@@ -337,7 +337,11 @@ def run_alignment_pipeline(
         # Full-text SubTablet
         sub_text = SubTablet.from_text_lines(
             text_lines=text_lines, avg_width=avg_width,
-            avg_height=avg_height, margin=margin, name="text",
+            avg_height=avg_height, margin=margin,
+            img=None,
+            target_detections=None,
+            align_to_detection_centroid=False,
+            name="text",
         )
         sub_text.create_heatmap(scale_factor=scale_factor, method=method)
 
