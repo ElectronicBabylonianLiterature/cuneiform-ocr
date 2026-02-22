@@ -7,6 +7,7 @@ from typing import List, Optional, Callable
 
 from .sign import SignResolver, CLASSES_ABZ
 from .bounding_box import BoundingBox, Detection
+from .tablet import SignBox
 
 
 class BboxVisualizer:
@@ -145,6 +146,8 @@ class BboxVisualizer:
         img: np.ndarray, 
         boxes: List,
         show_labels: bool = True,
+        show_row_numbers: bool = False,
+        row_mapping: dict = None,
         line_thickness: int = 2,
         marker_size: int = 5
     ) -> np.ndarray:
@@ -156,9 +159,11 @@ class BboxVisualizer:
         Each row gets a unique color.
         
         Args:
-            img: Input image in BGR format
+            img: Input image in BGR format (None for text-only visualization)
             boxes: List of box objects with row_idx attribute (SignBox, BoundingBox with row_idx, etc.)
             show_labels: Whether to show sign name labels
+            show_row_numbers: Whether to annotate row numbers on the left margin
+            row_mapping: Optional dict mapping row_idx to display number (for matched rows)
             line_thickness: Thickness of row connection lines
             marker_size: Size of center point markers
             
@@ -178,8 +183,76 @@ class BboxVisualizer:
             rgb_color = tuple(reversed(bgr_color))  # Convert BGR to RGB
             return tuple(map(int, rgb_color))
         
+        def get_effective_row_idx(row_idx: int) -> int:
+            """Get effective row index for coloring (considering row_mapping)."""
+            if row_mapping is None:
+                return row_idx
+            # If row_mapping exists but this row is not in it, mark as unmapped (-2)
+            if row_idx not in row_mapping:
+                return -2  # Special code for unmapped rows
+            # Use the mapped detection row index
+            return row_mapping[row_idx]
+        
+        def get_row_color_with_mapping(row_idx: int) -> tuple:
+            """Get color for row, considering row_mapping if provided."""
+            effective_idx = get_effective_row_idx(row_idx)
+            if effective_idx == -2:
+                return (128, 128, 128)  # Dark gray for unmapped rows
+            return get_row_color(effective_idx)
+        
+        # Handle text-only visualization (no background image)
+        if img is None:
+            if not boxes:
+                return np.ones((100, 100, 3), dtype=np.uint8) * 255
+            
+            # Create white canvas based on box extents
+            # Need to handle negative coordinates from centroid alignment
+            max_x = max(b.cx + b.width / 2 if hasattr(b, 'cx') else b.x2 for b in boxes)
+            max_y = max(b.cy + b.height / 2 if hasattr(b, 'cy') else b.y2 for b in boxes)
+            min_x = min(b.cx - b.width / 2 if hasattr(b, 'cx') else b.x1 for b in boxes)
+            min_y = min(b.cy - b.height / 2 if hasattr(b, 'cy') else b.y1 for b in boxes)
+            
+            margin = 100
+            
+            # Calculate offset needed to shift negative coordinates into visible area
+            offset_x = max(0, -min_x) + margin
+            offset_y = max(0, -min_y) + margin
+            
+            canvas_width = int(max_x - min_x + 2 * margin)
+            canvas_height = int(max_y - min_y + 2 * margin)
+            
+            img = np.ones((canvas_height, canvas_width, 3), dtype=np.uint8) * 255
+            
+            # Create shifted copies of boxes for visualization (don't modify originals)
+            boxes_shifted = []
+            for box in boxes:
+                if isinstance(box, SignBox):
+                    # Create new SignBox with adjusted center coordinates
+                    # x1, y1, x2, y2 will be automatically calculated from cx, cy, width, height
+                    box_shifted = SignBox(
+                        sign=box.sign,
+                        score=box.score,
+                        cx=box.cx + offset_x,
+                        cy=box.cy + offset_y,
+                        width=box.width,
+                        height=box.height,
+                        row_idx=box.row_idx,
+                        col_idx=box.col_idx
+                    )
+                else:
+                    # For other box types, create a copy and adjust if possible
+                    import copy
+                    box_shifted = copy.copy(box)
+                    if hasattr(box_shifted, 'cx'):
+                        box_shifted.cx = box.cx + offset_x
+                        box_shifted.cy = box.cy + offset_y
+                boxes_shifted.append(box_shifted)
+            
+            # Use shifted boxes for visualization
+            boxes = boxes_shifted
+        
         # Set color function to color boxes by row
-        self.color_func = lambda box: get_row_color(getattr(box, 'row_idx', -1))
+        self.color_func = lambda box: get_row_color_with_mapping(getattr(box, 'row_idx', -1))
         
         # Convert boxes to Detection format (BoundingBox list) if needed
         detection_boxes = []
@@ -229,7 +302,7 @@ class BboxVisualizer:
             sorted_boxes = sorted(row_boxes, key=get_cx)
             
             # Get row color in BGR for OpenCV
-            row_color_rgb = get_row_color(row_idx)
+            row_color_rgb = get_row_color_with_mapping(row_idx)
             row_color_bgr = tuple(reversed(row_color_rgb))
             
             # Draw lines connecting centers
@@ -264,6 +337,52 @@ class BboxVisualizer:
                 
                 cv2.circle(img_vis, (cx, cy), marker_size, row_color_bgr, -1)
                 cv2.circle(img_vis, (cx, cy), marker_size + 1, (255, 255, 255), 1)  # White border
+        
+        # Add row number annotations if requested
+        if show_row_numbers:
+            # Convert to PIL for Unicode support (arrow character)
+            img_pil = Image.fromarray(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(img_pil)
+            
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+            except:
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+                except:
+                    font = ImageFont.load_default()
+            
+            for row_idx in sorted(rows.keys()):
+                if row_idx == -1:
+                    continue
+                
+                row_boxes = rows[row_idx]
+                if not row_boxes:
+                    continue
+                
+                # Compute average y position for this row
+                avg_y = np.mean([
+                    b.cy if hasattr(b, 'cy') else (b.y1 + b.y2) / 2 
+                    for b in row_boxes
+                ])
+                
+                # Get row color
+                row_color_rgb = get_row_color_with_mapping(row_idx)
+                
+                # Determine display text
+                if row_mapping is not None and row_idx in row_mapping:
+                    mapped_row = row_mapping[row_idx]
+                    # Show both: "R{text_row}→D{det_row}"
+                    label_text = f"R{row_idx}→D{mapped_row}"
+                else:
+                    label_text = f"R{row_idx}"
+                
+                # Draw text with PIL (supports Unicode arrow)
+                label_pos = (10, int(avg_y) - 12)  # Adjust y to center text vertically
+                draw.text(label_pos, label_text, font=font, fill=row_color_rgb)
+            
+            # Convert back to OpenCV format
+            img_vis = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
         
         self.result = img_vis
         return img_vis

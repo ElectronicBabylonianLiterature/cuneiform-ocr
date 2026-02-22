@@ -54,6 +54,9 @@ from .heatmap import (
 
 from .line_process import (
     detect_rows_dbscan,
+    compute_row_similarity,
+    match_rows_dp,
+    create_row_mapping,
 )
 
 from .tablet import (
@@ -116,6 +119,9 @@ __all__ = [
     
     # Line/row processing
     'detect_rows_dbscan',
+    'compute_row_similarity',
+    'match_rows_dp',
+    'create_row_mapping',
     
     # Tablet data structures
     'SignBox',
