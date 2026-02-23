@@ -57,6 +57,9 @@ from .line_process import (
     compute_row_similarity,
     match_rows_dp,
     create_row_mapping,
+    match_signs_in_row_dp,
+    align_text_row_to_detection,
+    align_text_to_detection_rows,
 )
 
 from .tablet import (
@@ -122,6 +125,9 @@ __all__ = [
     'compute_row_similarity',
     'match_rows_dp',
     'create_row_mapping',
+    'match_signs_in_row_dp',
+    'align_text_row_to_detection',
+    'align_text_to_detection_rows',
     
     # Tablet data structures
     'SignBox',

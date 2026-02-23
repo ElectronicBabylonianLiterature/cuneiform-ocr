@@ -308,3 +308,317 @@ def create_row_mapping(matches: List[Tuple[int, int]],
         det_to_text[det_idx] = text_idx
     
     return text_to_det, det_to_text
+
+
+def match_signs_in_row_dp(
+    detection_signs: List[str],
+    text_signs: List[str],
+    skip_text_penalty: float = 0.5,
+    skip_det_penalty: float = 2.0,
+    mismatch_cost: float = 0.9
+) -> Tuple[List[Tuple[int, int]], np.ndarray]:
+    """
+    Match signs within a row using DP with free start and free end.
+    
+    This is similar to match_rows_dp but operates on individual signs within a row.
+    Uses simple class matching: same class = 0.0 cost, different class = mismatch_cost.
+    
+    Args:
+        detection_signs: List of sign names in detection row
+        text_signs: List of sign names in text row
+        skip_text_penalty: Penalty for skipping a text sign (middle damage)
+        skip_det_penalty: Penalty for skipping a detection sign (noise)
+        mismatch_cost: Cost when signs don't match exactly (default 0.9, near 1.0)
+        
+    Returns:
+        Tuple of (matches, dp_matrix) where:
+            - matches: List of (text_sign_idx, det_sign_idx) pairs
+            - dp_matrix: The full DP matrix for debugging
+    """
+    N = len(text_signs)  # Text (source)
+    M = len(detection_signs)  # Detection (target)
+    
+    # DP matrix: dp[i][j] = cost to match text[0:i] with det[0:j]
+    dp = np.full((N + 1, M + 1), np.inf)
+    backtrack = {}  # (i, j) -> (prev_i, prev_j, action)
+    
+    # Initialize
+    dp[0, 0] = 0.0
+    
+    # Free start: can skip text signs at beginning for free
+    for i in range(1, N + 1):
+        dp[i, 0] = 0.0
+        backtrack[(i, 0)] = (i - 1, 0, 'skip_text')
+    
+    # Must penalize detection signs with no match (likely noise)
+    for j in range(1, M + 1):
+        dp[0, j] = dp[0, j - 1] + skip_det_penalty
+        backtrack[(0, j)] = (0, j - 1, 'skip_det')
+    
+    # Fill DP table
+    for i in range(1, N + 1):
+        for j in range(1, M + 1):
+            # Compute match cost: 0.0 if same sign, mismatch_cost otherwise
+            match_cost = 0.0 if text_signs[i-1] == detection_signs[j-1] else mismatch_cost
+            
+            # Three options
+            options = [
+                (dp[i-1, j-1] + match_cost, (i-1, j-1, 'match')),
+                (dp[i-1, j] + skip_text_penalty, (i-1, j, 'skip_text')),
+                (dp[i, j-1] + skip_det_penalty, (i, j-1, 'skip_det'))
+            ]
+            
+            best_cost, best_prev = min(options, key=lambda x: x[0])
+            dp[i, j] = best_cost
+            backtrack[(i, j)] = best_prev
+    
+    # Free end: find minimum in last column
+    min_cost = np.inf
+    best_i = N
+    for i in range(N + 1):
+        if dp[i, M] < min_cost:
+            min_cost = dp[i, M]
+            best_i = i
+    
+    # Backtrack to get matches
+    matches = []
+    i, j = best_i, M
+    
+    while j > 0:
+        if (i, j) not in backtrack:
+            break
+        prev_i, prev_j, action = backtrack[(i, j)]
+        
+        if action == 'match':
+            # Match text sign (i-1) with detection sign (j-1)
+            matches.append((i - 1, j - 1))
+        
+        i, j = prev_i, prev_j
+    
+    # Reverse to get forward order
+    matches.reverse()
+    
+    return matches, dp
+
+
+def align_text_row_to_detection(
+    text_sign_boxes: List,
+    detection_sign_boxes: List,
+    matches: List[Tuple[int, int]],
+    avg_width: float,
+    avg_height: float,
+    min_width_ratio: float = 2/3,
+    max_width_ratio: float = 4/3
+) -> List:
+    """
+    Align text sign boxes to detection sign boxes based on matches.
+    
+    Enhanced strategy with baseline slope:
+    1. Calculate baseline with slope from ALL detection signs (linear regression)
+    2. For matched signs: align based on anchor point, scale, and rotation
+    3. For unmatched signs: place on baseline with average horizontal offset
+    4. Width scaling: constrained to [2/3, 4/3] * avg_width
+    5. Height: always use avg_height
+    
+    Args:
+        text_sign_boxes: List of text SignBox objects (source)
+        detection_sign_boxes: List of detection SignBox objects (target)
+        matches: List of (text_idx, det_idx) pairs from match_signs_in_row_dp
+        avg_width: Average sign width
+        avg_height: Average sign height
+        min_width_ratio: Minimum width as ratio of avg_width (default 2/3)
+        max_width_ratio: Maximum width as ratio of avg_width (default 4/3)
+        
+    Returns:
+        List of aligned SignBox objects with updated positions
+    """
+    from .tablet import SignBox
+    
+    if not detection_sign_boxes:
+        return text_sign_boxes
+    
+    # === Step 1: Calculate baseline from ALL detection signs (linear regression) ===
+    det_cx = np.array([box.cx for box in detection_sign_boxes])
+    det_cy = np.array([box.cy for box in detection_sign_boxes])
+    
+    # Fit line: y = slope * x + intercept
+    if len(det_cx) >= 2:
+        slope, intercept = np.polyfit(det_cx, det_cy, 1)
+    else:
+        slope = 0.0
+        intercept = det_cy[0] if len(det_cy) > 0 else 0.0
+    
+    def baseline_y(x: float) -> float:
+        """Calculate y coordinate on baseline for given x."""
+        return slope * x + intercept
+    
+    # === Step 2: Calculate scaling and offset from matches ===
+    if matches:
+        # Create mapping for quick lookup
+        text_to_det = {text_idx: det_idx for text_idx, det_idx in matches}
+        
+        # Calculate horizontal scaling from matched pairs
+        matched_text_positions = []
+        matched_det_positions = []
+        
+        for text_idx, det_idx in matches:
+            # Use col_idx as relative position (0-based index in row)
+            matched_text_positions.append(text_idx)
+            matched_det_positions.append(detection_sign_boxes[det_idx].cx)
+        
+        # Calculate scale: ratio of detection span to text span
+        if len(matches) >= 2:
+            text_span = max(matched_text_positions) - min(matched_text_positions)
+            det_span = max(matched_det_positions) - min(matched_det_positions)
+            
+            if text_span > 0:
+                # Calculate average spacing
+                text_avg_spacing = text_span / (len(matches) - 1) if len(matches) > 1 else avg_width
+                det_avg_spacing = det_span / (len(matches) - 1) if len(matches) > 1 else avg_width
+                scale_factor = det_avg_spacing / text_avg_spacing if text_avg_spacing > 0 else 1.0
+                
+                # Constrain scaling
+                scale_factor = np.clip(scale_factor, min_width_ratio, max_width_ratio)
+            else:
+                scale_factor = 1.0
+        else:
+            scale_factor = 1.0
+        
+        # Use first match as anchor point
+        anchor_text_idx, anchor_det_idx = matches[0]
+        anchor_det_box = detection_sign_boxes[anchor_det_idx]
+        anchor_x = anchor_det_box.cx
+        anchor_y = baseline_y(anchor_x)
+        
+    else:
+        # No matches: use default parameters
+        text_to_det = {}
+        scale_factor = 1.0
+        # Use leftmost detection sign as reference
+        anchor_x = min(box.cx for box in detection_sign_boxes)
+        anchor_y = baseline_y(anchor_x)
+        anchor_text_idx = 0
+    
+    # === Step 3: Align text sign boxes ===
+    aligned_boxes = []
+    
+    for text_idx, text_box in enumerate(text_sign_boxes):
+        if text_idx in text_to_det:
+            # Matched sign: use detection position directly
+            det_idx = text_to_det[text_idx]
+            det_box = detection_sign_boxes[det_idx]
+            
+            # Calculate width based on detection spacing
+            new_width = avg_width  # default
+            
+            if text_idx + 1 < len(text_sign_boxes) and (text_idx + 1) in text_to_det:
+                # Both current and next are matched, calculate spacing
+                next_det_idx = text_to_det[text_idx + 1]
+                next_det_box = detection_sign_boxes[next_det_idx]
+                spacing = next_det_box.cx - det_box.cx
+                
+                # Adjust width based on spacing, with constraints
+                proposed_width = spacing * 0.8  # Use 80% of spacing as width
+                min_width = avg_width * min_width_ratio
+                max_width = avg_width * max_width_ratio
+                new_width = np.clip(proposed_width, min_width, max_width)
+            else:
+                # Use detection box width if within constraints
+                det_width = det_box.width
+                min_width = avg_width * min_width_ratio
+                max_width = avg_width * max_width_ratio
+                if min_width <= det_width <= max_width:
+                    new_width = det_width
+            
+            new_cx = det_box.cx
+            new_cy = baseline_y(new_cx)
+            
+        else:
+            # Unmatched sign: place on baseline with scaled offset from anchor
+            # Calculate offset from anchor point
+            offset_from_anchor = (text_idx - anchor_text_idx) * avg_width * scale_factor
+            new_cx = anchor_x + offset_from_anchor
+            new_cy = baseline_y(new_cx)
+            new_width = avg_width * scale_factor
+            
+            # Apply width constraints
+            min_width = avg_width * min_width_ratio
+            max_width = avg_width * max_width_ratio
+            new_width = np.clip(new_width, min_width, max_width)
+        
+        # Create aligned box
+        aligned_box = SignBox(
+            sign=text_box.sign,
+            score=text_box.score,
+            cx=new_cx,
+            cy=new_cy,
+            width=new_width,
+            height=avg_height,
+            row_idx=text_box.row_idx,
+            col_idx=text_idx
+        )
+        aligned_boxes.append(aligned_box)
+    
+    return aligned_boxes
+
+
+def align_text_to_detection_rows(
+    det_rows: dict,
+    text_rows: dict,
+    text_to_det: dict,
+    row_sign_matches: dict,
+    avg_width: float,
+    avg_height: float,
+    min_width_ratio: float = 2/3,
+    max_width_ratio: float = 4/3
+) -> List:
+    """
+    Align all text rows to their matched detection rows using baseline with slope.
+    
+    This is a high-level function that processes all matched row pairs and returns
+    aligned sign boxes. Only text rows that have matching detection rows are processed.
+    
+    Args:
+        det_rows: Dictionary mapping detection row_idx -> List[SignBox]
+        text_rows: Dictionary mapping text row_idx -> List[SignBox]
+        text_to_det: Dictionary mapping text row_idx -> detection row_idx
+        row_sign_matches: Dictionary mapping text row_idx -> List[(text_sign_idx, det_sign_idx)]
+        avg_width: Average sign width
+        avg_height: Average sign height
+        min_width_ratio: Minimum width scaling ratio (default 2/3)
+        max_width_ratio: Maximum width scaling ratio (default 4/3)
+    
+    Returns:
+        List of aligned SignBox objects for all matched rows
+    """
+    aligned_text_boxes = []
+    
+    # Process each matched text row
+    for text_row_idx in sorted(row_sign_matches.keys()):
+        if text_row_idx not in text_to_det:
+            continue
+        
+        det_row_idx = text_to_det[text_row_idx]
+        sign_matches = row_sign_matches[text_row_idx]
+        
+        # Get sign boxes for this row
+        text_row_boxes = text_rows.get(text_row_idx, [])
+        det_row_boxes = det_rows.get(det_row_idx, [])
+        
+        if not text_row_boxes or not det_row_boxes:
+            continue
+        
+        # Align this row using baseline with slope
+        aligned_row_boxes = align_text_row_to_detection(
+            text_sign_boxes=text_row_boxes,
+            detection_sign_boxes=det_row_boxes,
+            matches=sign_matches,
+            avg_width=avg_width,
+            avg_height=avg_height,
+            min_width_ratio=min_width_ratio,
+            max_width_ratio=max_width_ratio
+        )
+        
+        aligned_text_boxes.extend(aligned_row_boxes)
+    
+    return aligned_text_boxes
