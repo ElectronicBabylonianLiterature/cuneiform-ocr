@@ -350,7 +350,7 @@ class SubTablet:
         return num_rows
     
     def get_rows(self) -> List[List[SignBox]]:
-        """Group sign boxes by row_idx."""
+        """Group sign boxes by row_idx, return as list of lists."""
         if not self.sign_boxes:
             return []
         
@@ -362,6 +362,25 @@ class SubTablet:
             rows_dict[row_idx].sort(key=lambda sb: sb.col_idx)
         
         return [rows_dict[k] for k in sorted(rows_dict.keys())]
+    
+    def get_rows_dict(self) -> dict:
+        """
+        Group sign boxes by row_idx, return as dictionary.
+        
+        Returns:
+            Dictionary mapping row_idx to list of SignBox objects
+        """
+        if not self.sign_boxes:
+            return {}
+        
+        rows_dict = {}
+        for sb in self.sign_boxes:
+            rows_dict.setdefault(sb.row_idx, []).append(sb)
+        
+        for row_idx in rows_dict:
+            rows_dict[row_idx].sort(key=lambda sb: sb.col_idx)
+        
+        return rows_dict
     
     def get_row_sign_sequences(self) -> List[List[str]]:
         """
@@ -380,5 +399,7 @@ class SubTablet:
         num_rows = len(self.get_rows())
         img_shape = self.img.shape if self.img is not None else None
         heatmap_shape = self.heatmap.shape if self.heatmap is not None else None
-        return (f"SubTablet '{self.name}': {num_signs} signs, {num_rows} rows, "
-                f"image shape: {img_shape}, heatmap shape: {heatmap_shape}")
+        return (f"SubTablet '{self.name}':\n"
+                f"  {num_signs} signs, {num_rows} rows, \n"
+                f"  image shape: {img_shape}, heatmap shape: {heatmap_shape}"
+                f"\n  avg_width: {self.avg_width:.2f}, avg_height: {self.avg_height:.2f}")
