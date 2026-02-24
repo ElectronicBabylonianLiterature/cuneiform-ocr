@@ -21,10 +21,10 @@ imgs/
 .vscode/
 valid_fragments.json
 log_*.log
-.ipynb_checkpoints
 alignment_results/
 alignment_results_heatmap/
+alignment_results_heatmap-*/
 .env
-evaluation_output*/
-ngram_match_search_output/
-output_inference_*.json
+.ipynb_checkpoints/
+data_processing/division_checking_photos/
+data_processing/visualizations/
