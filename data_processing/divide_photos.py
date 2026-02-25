@@ -517,7 +517,7 @@ def divide_tablet_photo(
         
         for i, cropped_img in enumerate(cropped_images):
             pil_img = Image.fromarray(cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB))
-            print(f"Cropped Image {i + 1}:")
+            print(f"Cropped Image {i + 1}: shape={cropped_img.shape}")
             # display(pil_img)
             
             # Save cropped image

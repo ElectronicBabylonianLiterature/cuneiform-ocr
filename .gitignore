@@ -28,3 +28,5 @@ alignment_results_heatmap-*/
 .ipynb_checkpoints/
 data_processing/division_checking_photos/
 data_processing/visualizations/
+evaluation_output_*/
+ngram_match_search_output/

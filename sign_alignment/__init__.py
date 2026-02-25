@@ -52,7 +52,7 @@ from .heatmap import (
     create_text_based_detections,
 )
 
-from .line_process import (
+from data_processing.line_process import (
     detect_rows_dbscan,
     compute_row_similarity,
     match_rows_dp,
