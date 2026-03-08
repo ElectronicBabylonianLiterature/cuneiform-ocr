@@ -123,6 +123,96 @@ def detect_rows_dbscan(
     return labels.tolist(), num_rows
 
 
+class _BoxWrapper:
+    """Simple wrapper to provide cx/cy/width/height from [x1, y1, x2, y2] tensors or arrays."""
+
+    def __init__(self, bbox):
+        self.x1 = float(bbox[0])
+        self.y1 = float(bbox[1])
+        self.x2 = float(bbox[2])
+        self.y2 = float(bbox[3])
+        self.cx = (self.x1 + self.x2) / 2
+        self.cy = (self.y1 + self.y2) / 2
+        self.width = self.x2 - self.x1
+        self.height = self.y2 - self.y1
+
+
+def line_signs(
+    bboxes,
+    labels,
+    classes: List[str],
+    scores=None,
+    eps: float = 0.4,
+    min_samples: int = 1,
+    lambda_weight: float = 0.007,
+    return_bboxes: bool = False,
+):
+    """Group sign detections into text lines using DBSCAN row detection.
+
+    Bounding boxes are clustered into rows by their y-centres (DBSCAN with a
+    custom distance that strongly de-emphasises the x-axis via *lambda_weight*).
+    Within each row signs are sorted left-to-right by cx.
+
+    Args:
+        bboxes: tensor/array of shape (N, 4) with [x1, y1, x2, y2] per bbox.
+        labels: label index for each detection (length N).
+        classes: list of class name strings indexed by label.
+        scores: optional score tensor for each detection (for debug output).
+        eps: DBSCAN distance threshold as a multiple of the average sign size.
+        min_samples: DBSCAN min_samples parameter.
+        lambda_weight: weight for the x-coordinate in the custom distance
+            (small value → clustering is almost purely based on y position).
+        return_bboxes: if True, also return bounding boxes in the same order as
+            the sign tokens in the result string (as a list of [x1,y1,x2,y2] lists).
+
+    Returns:
+        str: multi-line string of sign names ordered top-to-bottom, left-to-right.
+        If *return_bboxes* is True, returns a tuple (str, list[list]) where the
+        second element is the ordered bounding boxes.
+    """
+    if len(bboxes) == 0:
+        return ("", []) if return_bboxes else ""
+
+    boxes = [_BoxWrapper(b) for b in bboxes]
+    row_labels, _ = detect_rows_dbscan(
+        boxes,
+        eps=eps,
+        min_samples=min_samples,
+        lambda_weight=lambda_weight,
+    )
+
+    # Group indices by row label
+    rows: dict = {}
+    for i, label in enumerate(row_labels):
+        rows.setdefault(label, []).append(i)
+
+    # Sort rows top-to-bottom by mean cy; noise row (-1) goes last
+    sorted_keys = sorted(
+        [k for k in rows if k != -1],
+        key=lambda k: float(np.mean([boxes[i].cy for i in rows[k]])),
+    )
+    if -1 in rows:
+        sorted_keys.append(-1)
+
+    result = ""
+    ordered_bboxes = []
+    for key in sorted_keys:
+        row_indices = sorted(rows[key], key=lambda i: boxes[i].cx)
+        for i in row_indices:
+            if scores is not None:
+                result += f"{classes[labels[i]]} {float(scores[i]):.2f} "
+            else:
+                result += classes[labels[i]] + " "
+            if return_bboxes:
+                b = boxes[i]
+                ordered_bboxes.append([b.x1, b.y1, b.x2, b.y2])
+        result += "\n"
+
+    if return_bboxes:
+        return result, ordered_bboxes
+    return result
+
+
 def compute_row_similarity(row1_signs: List[str], row2_signs: List[str], 
                            method: str = 'lcs') -> float:
     """
