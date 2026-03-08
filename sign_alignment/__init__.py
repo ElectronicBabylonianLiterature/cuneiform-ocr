@@ -9,6 +9,7 @@ from .data_source import (
     LocalDataSource,
     EBLAPISource,
     SignTextParser,
+    SignAPIResolver,
     create_local_source,
     create_api_source,
 )
@@ -83,6 +84,7 @@ __all__ = [
     'LocalDataSource',
     'EBLAPISource',
     'SignTextParser',
+    'SignAPIResolver',
     'create_local_source',
     'create_api_source',
     

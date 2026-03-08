@@ -1,4 +1,5 @@
 
+import json
 import os
 from typing import List, Optional, Tuple
 from pathlib import Path
@@ -7,6 +8,67 @@ import requests
 from .sign import SignResolver
 
 from .bounding_box import BoundingBox, Detection, GroundTruths
+
+
+class SignAPIResolver:
+    """Resolves cuneiform reading values to sign names via the EBL signs API, with file-based caching."""
+    
+    SIGNS_API_URL = "https://www.ebl.lmu.de/api/signs"
+    
+    def __init__(self, cache_file: str = None):
+        if cache_file is None:
+            cache_file = os.path.join(os.path.dirname(__file__), '.sign_api_cache.json')
+        self._cache_file = cache_file
+        self._cache = {}  # {"value|subIndex": sign_name_or_null}
+        self._load_cache()
+    
+    def _load_cache(self):
+        if os.path.exists(self._cache_file):
+            try:
+                with open(self._cache_file, 'r', encoding='utf-8') as f:
+                    self._cache = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                self._cache = {}
+    
+    def _save_cache(self):
+        with open(self._cache_file, 'w', encoding='utf-8') as f:
+            json.dump(self._cache, f, indent=2, ensure_ascii=False)
+    
+    def _cache_key(self, value: str, sub_index: int) -> str:
+        return f"{value}|{sub_index}"
+    
+    def resolve(self, value: str, sub_index: int) -> Optional[str]:
+        """Resolve a reading value + sub_index to a sign name.
+        
+        For Reading tokens: pass name (lowercase) and subIndex.
+        For Logogram tokens: pass name lowercased and subIndex.
+        
+        Returns:
+            Sign name string like "IB", "GA", "TUR" or None if not found.
+        """
+        key = self._cache_key(value.lower(), sub_index)
+        if key in self._cache:
+            return self._cache[key]
+        
+        result = self._query_api(value.lower(), sub_index)
+        self._cache[key] = result
+        self._save_cache()
+        return result
+    
+    def _query_api(self, value: str, sub_index: int) -> Optional[str]:
+        try:
+            resp = requests.get(
+                self.SIGNS_API_URL,
+                params={'value': value, 'subIndex': sub_index},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and isinstance(data, list) and len(data) > 0:
+                    return data[0].get('name', None)
+        except requests.RequestException:
+            pass
+        return None
 
 
 class LocalDataSource:    
@@ -87,14 +149,19 @@ class EBLAPISource:
     
     def __init__(self, timeout: int = 10):
         self.timeout = timeout
+        self._fragment_cache = {}  # in-memory cache: fragment_id -> data
     
     def get_fragment_data(self, fragment_id: str) -> Optional[dict]:
+        if fragment_id in self._fragment_cache:
+            return self._fragment_cache[fragment_id]
 
         url = f"{self.BASE_URL}/fragments/{fragment_id}"
         try:
             response = requests.get(url, timeout=self.timeout)
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                self._fragment_cache[fragment_id] = data
+                return data
         except requests.RequestException as e:
             print(f"API request failed for fragment {fragment_id}: {e}")
         return None
@@ -131,7 +198,8 @@ class EBLAPISource:
             return data.get('text', None)
         return None
     
-    def get_signs_filtered(self, fragment_id: str, filter_broken: bool = True) -> Optional[List[List[str]]]:
+    def get_signs_filtered(self, fragment_id: str, filter_broken: bool = True,
+                           sign_resolver: 'SignAPIResolver' = None) -> Optional[List[List[str]]]:
         """
         Get signs from text.lines field with broken sign filtering.
         This provides more control over filtering compared to the pre-processed 'signs' field.
@@ -145,7 +213,7 @@ class EBLAPISource:
         """
         text_data = self.get_text_data(fragment_id)
         if text_data:
-            return SignTextParser.parse_text_lines(text_data, filter_broken)
+            return SignTextParser.parse_text_lines(text_data, filter_broken, sign_resolver=sign_resolver)
         return None
 
 
@@ -228,68 +296,75 @@ class SignTextParser:
         return False
     
     @staticmethod
-    def _extract_signs_from_token(token: dict, filter_broken: bool = True) -> List[str]:
+    def _extract_signs_from_token(token: dict, filter_broken: bool = True) -> List[Tuple[str, int]]:
         """
-        Extract sign names from a token, recursively handling nested parts.
+        Extract (reading_name, sub_index) tuples from a token, recursively handling nested parts.
+        
+        Container types (Word, Determinative, etc.) are always recursed into regardless
+        of their enclosureType, because they may contain a mix of broken and non-broken parts.
+        Only leaf sign-producing types (Reading, Logogram, etc.) are checked for broken status.
         
         Args:
             token: Token dictionary from API
             filter_broken: If True, skip tokens that are broken away
             
         Returns:
-            List of sign names from this token
+            List of (name, sub_index) tuples. sub_index=0 for CompoundGrapheme/UnclearSign.
         """
         signs = []
+        token_type = token.get('type', '')
         
-        # Skip if completely broken away
+        # Container types - always recurse into parts (don't check broken at container level,
+        # since a Word can span across broken brackets e.g. "DUMU-er-ṣe-tim]-ke₄")
+        if token_type in ['Word', 'AkkadianWord', 'GreekWord', 'LoneDeterminative', 'Determinative']:
+            for part in token.get('parts', []):
+                signs.extend(SignTextParser._extract_signs_from_token(part, filter_broken))
+            return signs
+        
+        # For sign-producing types, check broken status
         if filter_broken and SignTextParser._is_broken_away(token):
             return signs
         
-        token_type = token.get('type', '')
-        
         # Handle named signs (Reading, Logogram, Number)
         if token_type in ['Reading', 'Logogram', 'Number']:
-            # Extract the sign name
-            if 'name' in token and token['name']:
-                sign_name = token['name']
-                # The API returns sign names like 'u', 'qa', 'tum', etc.
-                # We need to resolve these to proper sign names
-                signs.append(sign_name)
-        
-        # Handle Word and AkkadianWord - process parts recursively
-        elif token_type in ['Word', 'AkkadianWord', 'GreekWord', 'LoneDeterminative']:
-            if 'parts' in token:
-                for part in token['parts']:
-                    signs.extend(SignTextParser._extract_signs_from_token(part, filter_broken))
+            name = token.get('name', '')
+            sub_index = token.get('subIndex', 1)
+            if sub_index is None:
+                sub_index = 1
+            if name:
+                signs.append((name, sub_index))
         
         # Handle CompoundGrapheme
         elif token_type == 'CompoundGrapheme':
             if filter_broken and 'BROKEN_AWAY' in token.get('enclosureType', []):
                 return signs
-            # Extract from compound
-            if 'compound_parts' in token:
-                signs.extend(token['compound_parts'])
-            elif 'cleanValue' in token:
-                # Some compound graphemes might store the value directly
-                signs.append(token['cleanValue'])
+            clean = token.get('cleanValue', '')
+            if clean:
+                signs.append((clean, 0))  # sub_index=0 signals direct sign name
         
         # Handle Grapheme
         elif token_type == 'Grapheme':
-            if 'name' in token:
-                signs.append(token['name'])
+            name = token.get('name', '')
+            if name:
+                signs.append((name, 0))
         
-        # Handle Variant - process each variant option
+        # Handle UnclearSign
+        elif token_type == 'UnclearSign':
+            signs.append(('X', 0))
+        
+        # Handle Variant - process first variant
         elif token_type in ['Variant', 'Variant2']:
-            if 'tokens' in token:
-                for variant_token in token['tokens']:
-                    signs.extend(SignTextParser._extract_signs_from_token(variant_token, filter_broken))
+            for variant_token in token.get('tokens', []):
+                signs.extend(SignTextParser._extract_signs_from_token(variant_token, filter_broken))
+                break  # take first variant only
         
         # Handle Divider
         elif token_type == 'Divider':
-            if 'divider' in token:
-                signs.append(token['divider'])
+            divider = token.get('divider', '')
+            if divider:
+                signs.append((divider, 0))
         
-        # Recursively handle tokens with parts
+        # Recursively handle other tokens with parts
         elif 'parts' in token:
             for part in token['parts']:
                 signs.extend(SignTextParser._extract_signs_from_token(part, filter_broken))
@@ -297,14 +372,44 @@ class SignTextParser:
         return signs
     
     @staticmethod
-    def parse_text_lines(text_data: dict, filter_broken: bool = True) -> List[List[str]]:
+    def _resolve_sign_token(name: str, sub_index: int, sign_resolver: 'SignAPIResolver' = None) -> Optional[str]:
+        """Resolve a (name, sub_index) tuple to a sign name."""
+        if name == 'X':
+            return 'UnclearSign'
+        
+        # sub_index=0 means direct sign name (CompoundGrapheme, Grapheme, Divider)
+        if sub_index == 0:
+            return name
+        
+        # Use signs API resolver if available
+        if sign_resolver is not None:
+            # For Logograms (uppercase names like DUMU), also query lowercase
+            resolved = sign_resolver.resolve(name, sub_index)
+            if resolved:
+                return resolved
+        
+        # Fallback: try local SignResolver with uppercase name
+        try:
+            sign = SignResolver.resolve(name.upper(), expected_type='SIGN')
+            if sign.name != 'UnclearSign':
+                return sign.name
+        except Exception:
+            pass
+        
+        return name.upper()
+
+    @staticmethod
+    def parse_text_lines(text_data: dict, filter_broken: bool = True,
+                         sign_resolver: 'SignAPIResolver' = None) -> List[List[str]]:
         """
         Parse text.lines field from fragment API, extracting sign names and filtering broken signs.
-        This method processes the structured token data from the API.
+        Uses SignAPIResolver to properly resolve reading values to sign names.
         
         Args:
             text_data: The 'text' field from fragment API response
             filter_broken: If True, filter out completely broken away signs
+            sign_resolver: SignAPIResolver instance for reading→sign name resolution.
+                           If None, falls back to local SignResolver (less accurate).
             
         Returns:
             List of lines, each containing list of sign names
@@ -315,29 +420,18 @@ class SignTextParser:
         result_lines = []
         
         for line in text_data['lines']:
-            line_type = line.get('type', '')
-            
-            # Only process TextLine types (skip SurfaceAtLine, NoteLine, etc.)
-            if line_type != 'TextLine':
+            if line.get('type', '') != 'TextLine':
                 continue
-            
             if 'content' not in line:
                 continue
             
             line_signs = []
             for token in line['content']:
-                # Extract sign names from token
-                sign_names = SignTextParser._extract_signs_from_token(token, filter_broken)
-                
-                # Resolve sign names to proper format
-                for sign_name in sign_names:
-                    try:
-                        # Try to resolve as SIGN name (uppercase format like 'U', 'QA', etc.)
-                        sign = SignResolver.resolve(sign_name.upper(), expected_type='SIGN')
-                        line_signs.append(sign.name)
-                    except:
-                        # If resolution fails, keep the original name
-                        line_signs.append(sign_name)
+                sign_tuples = SignTextParser._extract_signs_from_token(token, filter_broken)
+                for name, sub_index in sign_tuples:
+                    resolved = SignTextParser._resolve_sign_token(name, sub_index, sign_resolver)
+                    if resolved:
+                        line_signs.append(resolved)
             
             if line_signs:
                 result_lines.append(line_signs)
@@ -345,13 +439,15 @@ class SignTextParser:
         return result_lines
     
     @staticmethod
-    def parse_text_lines_with_abz(text_data: dict, filter_broken: bool = True) -> List[List[Tuple[str, str]]]:
+    def parse_text_lines_with_abz(text_data: dict, filter_broken: bool = True,
+                                  sign_resolver: 'SignAPIResolver' = None) -> List[List[Tuple[str, str]]]:
         """
         Parse text.lines field from fragment API, extracting both ABZ codes and sign names.
         
         Args:
             text_data: The 'text' field from fragment API response
             filter_broken: If True, filter out completely broken away signs
+            sign_resolver: SignAPIResolver instance for reading→sign name resolution.
             
         Returns:
             List of lines, each containing list of (abz, sign_name) tuples
@@ -362,29 +458,23 @@ class SignTextParser:
         result_lines = []
         
         for line in text_data['lines']:
-            line_type = line.get('type', '')
-            
-            # Only process TextLine types
-            if line_type != 'TextLine':
+            if line.get('type', '') != 'TextLine':
                 continue
-            
             if 'content' not in line:
                 continue
             
             line_signs = []
             for token in line['content']:
-                # Extract sign names from token
-                sign_names = SignTextParser._extract_signs_from_token(token, filter_broken)
-                
-                # Resolve sign names to proper format with ABZ codes
-                for sign_name in sign_names:
-                    try:
-                        # Try to resolve as SIGN name
-                        sign = SignResolver.resolve(sign_name.upper(), expected_type='SIGN')
-                        line_signs.append((sign.abz, sign.name))
-                    except:
-                        # If resolution fails, include with empty ABZ
-                        line_signs.append(('', sign_name))
+                sign_tuples = SignTextParser._extract_signs_from_token(token, filter_broken)
+                for name, sub_index in sign_tuples:
+                    resolved = SignTextParser._resolve_sign_token(name, sub_index, sign_resolver)
+                    if resolved:
+                        # Try to get ABZ code from local resolver
+                        try:
+                            sign = SignResolver.resolve(resolved, expected_type='SIGN')
+                            line_signs.append((sign.abz, sign.name))
+                        except Exception:
+                            line_signs.append(('', resolved))
             
             if line_signs:
                 result_lines.append(line_signs)
