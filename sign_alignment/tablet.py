@@ -328,7 +328,7 @@ class SubTablet:
         Returns:
             Number of detected rows (excluding noise)
         """
-        from .line_process import detect_rows_dbscan
+        from data_processing.line_process import detect_rows_dbscan
         
         if not self.sign_boxes:
             return 0

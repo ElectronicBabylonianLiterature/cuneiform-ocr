@@ -29,16 +29,24 @@ from data_processing.sign_resolver import SignToABZResolver
 DETECTION_JSON_PATH = os.path.expanduser(
     "~/erc-work-data/signs_detection_on_dataset/eBL_OCRed_Signs_02-19_4-0.6-35.json"
 )
+DETECTION_JSON_PATH = os.path.expanduser(
+    "./output_inference_03-02_try-3-0.8-0.35-2-0.006.json"
+)
 
 # Output directory
-OUTPUT_DIR = "./evaluation_output_0.6_35_20260223"
+OUTPUT_DIR = "./evaluation_output_new_line_det_0.8_0.35_2_0.006_20260225"
 
 # Training set directory (images to exclude from evaluation)
 TRAIN_SET_DIR = os.path.expanduser(
     "~/erc-work-data/coco-recognitioin-2025-09-25/data-coco/coco/train2017/"
 )
 
-MONGODB_URI = "YOUR_MONGODB_URI"  # Replace with your actual MongoDB URI
+import dotenv
+dotenv.load_dotenv()
+MONGODB_URI = os.getenv("MONGODB_URI")
+if not MONGODB_URI:
+    raise ValueError("MONGODB_URI not found in environment variables. Please set it in your .env file.")
+
 
 
 class FragmentModelWithOverlaps(FragmentModel):

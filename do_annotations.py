@@ -11,17 +11,28 @@ import io
 from tqdm import tqdm
 from datetime import datetime
 from data_processing.divide_photos import divide_tablet_photo
+from data_processing.line_process import line_signs
+from dotenv import load_dotenv
 
 # Allow large image processing
 Image.MAX_IMAGE_PIXELS = None
 
+# Load environment variables from .env file
+load_dotenv()
+
 # get thresholds and tag from environment variables
 tag = os.getenv('TAG', '0')
 THRESHOLD_CERTAIN = float(os.getenv('THRESHOLD', '0.8'))
-Y_THRESHOLD = int(os.getenv('Y_THRESHOLD', '35'))
+# DBSCAN row-detection parameters (replaces the old Y_THRESHOLD approach)
+EPS = float(os.getenv('EPS', '0.4'))
+MIN_SAMPLES = int(os.getenv('MIN_SAMPLES', '1'))
+LAMBDA_WEIGHT = float(os.getenv('LAMBDA_WEIGHT', '0.007'))
 
 if __name__ == "__main__":
-    client = MongoClient("YOUR_MONGODB_URI")
+    MONGODB_URI = os.getenv('MONGODB_URI')
+    if not MONGODB_URI:
+        raise ValueError("MONGODB_URI environment variable is not set. Please set it in the .env file.")
+    client = MongoClient(MONGODB_URI)
     db = client['ebl']
     files_collection = db['photos.files']
     chunks_collection = db['photos.chunks']
@@ -44,7 +55,8 @@ if __name__ == "__main__":
     date_str = datetime.now().strftime("%m-%d")
     output_file_name = f"output_inference_{date_str}_{tag}.json"
 
-    info = "tag {}, threshold {}, y_threshold {}".format(tag, THRESHOLD_CERTAIN, Y_THRESHOLD)
+    info = "tag {}, threshold {}, eps {}, min_samples {}, lambda_weight {}".format(
+        tag, THRESHOLD_CERTAIN, EPS, MIN_SAMPLES, LAMBDA_WEIGHT)
     print("starting inference with " + info)
 
     count = 0
@@ -74,38 +86,6 @@ if __name__ == "__main__":
             img = mmcv.imread(f"{filename_save}")
             cropped_images, crop_coordinates = divide_tablet_photo(img, visualize=False, logging=False, return_coordinates=True)
 
-            def line_signs(sorted_indexed_bounding_boxes, labels, classes):
-                lines = []
-                current_line = []
-                y_threshold = Y_THRESHOLD
-
-                for i, (index, box) in enumerate(sorted_indexed_bounding_boxes):
-                    if not current_line:
-                        current_line.append((index, box))
-                    else:
-                        prev_box = current_line[-1][1]
-                        if box[1] - prev_box[1] < y_threshold:
-                            current_line.append((index, box))
-                        else:
-                            lines.append(current_line)
-                            current_line = [(index, box)]
-                if current_line:
-                    lines.append(current_line)
-
-                sorted_lines = [sorted(line, key=lambda item: item[1][0]) for line in lines]
-
-                bounding_boxes = []
-                result = ''
-                for line in sorted_lines:
-                    for index, box in line:
-                        if classes[labels[index]] == 'NoABZ0':
-                            result += 'X '
-                        else:
-                            result += classes[labels[index]] + ' '
-                        bounding_boxes.append(box.tolist())  # Convert tensor to list for easier handling
-                    result += '\n'
-                return result, bounding_boxes
-
             line_signs_results = ''
             bounding_boxes = []
             for idx, img_piece in enumerate(cropped_images):
@@ -114,30 +94,28 @@ if __name__ == "__main__":
                 OCR_result = result.pred_instances.cpu()
                 labels, bboxes = OCR_result['labels'], OCR_result['bboxes']
                 certain_scores_idx = len(OCR_result['scores'][OCR_result['scores'] > THRESHOLD_CERTAIN])
-                certain_scores_idx
                 certain_bboxes = bboxes[:certain_scores_idx]
-                labels = OCR_result['labels'][:certain_scores_idx]
+                certain_labels = OCR_result['labels'][:certain_scores_idx]
 
-                # Sorting bounding boxes and grouping them into lines
-                indexed_bounding_boxes = list(enumerate(certain_bboxes))
-                sorted_indexed_bounding_boxes = sorted(indexed_bounding_boxes, key=lambda item: (item[1][1], item[1][0]))
-                lined_signs, bounding_boxes_of_one_piece = line_signs(sorted_indexed_bounding_boxes, labels, classes)
+                # Group signs into lines using DBSCAN row detection
+                lined_signs, bounding_boxes_of_one_piece = line_signs(
+                    certain_bboxes,
+                    certain_labels,
+                    classes,
+                    eps=EPS,
+                    min_samples=MIN_SAMPLES,
+                    lambda_weight=LAMBDA_WEIGHT,
+                    return_bboxes=True,
+                )
 
                 # Convert bounding boxes from small piece coordinates to original image coordinates
                 piece_offset_x = crop_coordinates[idx]['x']
                 piece_offset_y = crop_coordinates[idx]['y']
-
-                # Transform each bbox to original image coordinates
-                transformed_bboxes = []
-                for bbox in bounding_boxes_of_one_piece:
-                    # bbox format is [x1, y1, x2, y2]
-                    transformed_bbox = [
-                        bbox[0] + piece_offset_x,  # x1
-                        bbox[1] + piece_offset_y,  # y1
-                        bbox[2] + piece_offset_x,  # x2
-                        bbox[3] + piece_offset_y   # y2
-                    ]
-                    transformed_bboxes.append(transformed_bbox)
+                transformed_bboxes = [
+                    [b[0] + piece_offset_x, b[1] + piece_offset_y,
+                     b[2] + piece_offset_x, b[3] + piece_offset_y]
+                    for b in bounding_boxes_of_one_piece
+                ]
 
                 line_signs_results += lined_signs
                 bounding_boxes.extend(transformed_bboxes)
