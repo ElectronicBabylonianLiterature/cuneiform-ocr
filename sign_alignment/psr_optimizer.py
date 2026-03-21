@@ -159,7 +159,13 @@ class PointSetRegistrationOptimizer:
         lambda_seq: float = 0.1,
         lambda_height: float = 0.1,
         lambda_rows: float = 0.1,
-        rows_threshold_ratio: float = 1.0 / 3.0,
+        lambda_boundary: float = 0.0,
+        boundary_steepness: float = 1000.0,
+        rows_threshold_ratio_far: float = 1.0 / 3.0,
+        rows_threshold_ratio_close: float = 1.0 / 2.0,
+        rows_plateau_far: float = 1.0,
+        rows_plateau_close: float = 1.0,
+        contour_mask: np.ndarray = None,
         device: str = None,
     ):
         """
@@ -180,9 +186,32 @@ class PointSetRegistrationOptimizer:
             Class matching weights.  Default: identity (same-class only).
         lambda_data .. lambda_rows : float
             Loss weights.
-        rows_threshold_ratio : float
+        rows_threshold_ratio_far : float
             Fraction of ideal inter-row spacing that defines the
-            quadratic → plateau transition in ``L_rows``.
+            quadratic → plateau transition in ``L_rows`` when rows
+            are **too far apart** (positive deviation).
+        rows_threshold_ratio_close : float
+            Fraction of ideal inter-row spacing that defines the
+            quadratic → plateau transition in ``L_rows`` when rows
+            are **too close together** (negative deviation).
+        rows_plateau_far : float
+            Maximum (plateau) loss value for the **too far** side of
+            ``L_rows``.
+        rows_plateau_close : float
+            Maximum (plateau) loss value for the **too close** side of
+            ``L_rows``.
+        lambda_boundary : float
+            Weight for the contour boundary loss.  Set to 0 to disable
+            (default).  Typical value: 5.0–20.0.
+        boundary_steepness : float
+            Steepness multiplier *k* for the boundary loss:
+            ``L = k · (1 − IoR)²``.  Default 4.0.
+        contour_mask : np.ndarray (H, W), optional
+            Binary mask from ``divide_tablet_photo(return_masks=True)``.
+            Values 255 = inside tablet, 0 = outside.  When provided
+            together with ``lambda_boundary > 0``, an extra loss
+            penalises the first sign of each row whose bounding box
+            extends outside the contour (top / left / bottom edges).
         device : str
             ``'cuda'`` or ``'cpu'``.
         """
@@ -193,8 +222,21 @@ class PointSetRegistrationOptimizer:
         self.lambda_seq = lambda_seq
         self.lambda_height = lambda_height
         self.lambda_rows = lambda_rows
-        self.rows_threshold_ratio = rows_threshold_ratio
+        self.lambda_boundary = lambda_boundary
+        self.boundary_steepness = boundary_steepness
+        self.rows_threshold_ratio_far = rows_threshold_ratio_far
+        self.rows_threshold_ratio_close = rows_threshold_ratio_close
+        self.rows_plateau_far = rows_plateau_far
+        self.rows_plateau_close = rows_plateau_close
         self.sub_tablet_text = sub_tablet_text
+
+        # ---- Contour mask for boundary loss ------------------------------
+        if contour_mask is not None and lambda_boundary > 0:
+            self.contour_mask = contour_mask.astype(np.float32)
+            if self.contour_mask.max() > 1:
+                self.contour_mask = self.contour_mask / 255.0
+        else:
+            self.contour_mask = None
 
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -476,11 +518,12 @@ class PointSetRegistrationOptimizer:
         actual_spacing = baseline_{i+1}(x_align) − baseline_i(x_align)
         x_align = max(first_x_row_i, first_x_row_{i+1})
 
-        Piecewise loss per pair:
-            t = ideal · threshold_ratio           (default 1/3)
+        Asymmetric piecewise loss per pair:
             d = actual − ideal
-            |d| ≤ t :  L = (d/t)²
-            |d| > t :  L = 1              (constant plateau)
+            If d ≥ 0 (too far):  t = ideal · threshold_ratio_far,  plateau = plateau_far
+            If d < 0 (too close): t = ideal · threshold_ratio_close, plateau = plateau_close
+            |d| ≤ t :  L = plateau · (d/t)²
+            |d| > t :  L = plateau
         """
         if self.num_rows < 2:
             return torch.tensor(0.0, device=self.device)
@@ -512,16 +555,121 @@ class PointSetRegistrationOptimizer:
             actual = y_j - y_i  # should be positive (top→bottom)
 
             deviation = actual - ideal
-            threshold = (ideal * self.rows_threshold_ratio).clamp(min=1e-6)
+            # Asymmetric thresholds: different for too-far vs too-close
+            threshold_far = (ideal * self.rows_threshold_ratio_far).clamp(min=1e-6)
+            threshold_close = (ideal * self.rows_threshold_ratio_close).clamp(min=1e-6)
+            threshold = torch.where(deviation >= 0, threshold_far, threshold_close)
+            plateau = torch.where(
+                deviation >= 0,
+                torch.tensor(self.rows_plateau_far, device=self.device),
+                torch.tensor(self.rows_plateau_close, device=self.device),
+            )
             normalised = deviation / threshold
 
-            # Piecewise: quadratic inside, constant outside
+            # Piecewise: quadratic inside, constant plateau outside
             loss_pair = torch.where(
                 normalised.abs() <= 1.0,
-                normalised ** 2,
-                torch.ones_like(normalised),
+                plateau * normalised ** 2,
+                plateau,
             )
             loss = loss + loss_pair
+            count += 1
+
+        return loss / max(1, count)
+
+    # ------------------------------------------------------------------
+
+    def compute_boundary_loss(self) -> torch.Tensor:
+        """
+        Penalise the first sign of each row when its bbox extends
+        outside the tablet contour mask.
+
+        For each row, take the first sign (leftmost, col_idx == 0).
+        Compute the intersection area between its bbox and the contour
+        mask.  The loss is based on  ``1 − IoR`` (Intersection-over-
+        Region, where Region = bbox area), so a box fully inside the
+        contour yields 0 loss.
+
+        A steep exponential-like penalty is used so that even a small
+        exceedance produces a strong gradient:
+
+            L_boundary = mean_over_rows  [ (1 − IoR)^2 × k ]
+
+        where k = 4 gives a steep curve.
+
+        Returns ``0`` if no contour mask is set.
+        """
+        if self.contour_mask is None or self.num_rows == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        mask_h, mask_w = self.contour_mask.shape[:2]
+        loss = torch.tensor(0.0, device=self.device)
+        count = 0
+        k = self.boundary_steepness
+
+        for ri in range(self.num_rows):
+            off = self.row_offsets[ri]
+            rl = self.row_lengths[ri]
+            if rl == 0:
+                continue
+
+            # First sign in the row (index 0, leftmost)
+            cx = self.params[off, 0]
+            cy = self.params[off, 1]
+            w = self.params[off, 2]
+            h = self.params[off, 3]
+
+            # Bbox corners (float, differentiable)
+            x1 = cx - w / 2
+            y1 = cy - h / 2
+            x2 = cx + w / 2
+            y2 = cy + h / 2
+
+            # Clamp to image extent for the sampling grid
+            x1_c = x1.clamp(0, mask_w - 1)
+            y1_c = y1.clamp(0, mask_h - 1)
+            x2_c = x2.clamp(0, mask_w - 1)
+            y2_c = y2.clamp(0, mask_h - 1)
+
+            # If the bbox is entirely outside the image, IoR = 0
+            if (x1_c >= x2_c) or (y1_c >= y2_c):
+                loss = loss + torch.tensor(k, device=self.device)
+                count += 1
+                continue
+
+            # --- Compute IoR via grid sampling on the mask ----------------
+            # Use a coarse grid of sample points inside the (clamped) bbox
+            n_samples = 8  # per axis
+            xs = torch.linspace(float(x1_c.detach()), float(x2_c.detach()),
+                                n_samples, device=self.device)
+            ys = torch.linspace(float(y1_c.detach()), float(y2_c.detach()),
+                                n_samples, device=self.device)
+            gx, gy = torch.meshgrid(xs, ys, indexing='xy')
+            gx_int = gx.long().clamp(0, mask_w - 1)
+            gy_int = gy.long().clamp(0, mask_h - 1)
+
+            mask_t = torch.tensor(self.contour_mask, dtype=torch.float32,
+                                  device=self.device)
+            sampled = mask_t[gy_int, gx_int]  # (n, n) in [0,1]
+
+            # Fraction of the clamped region that's inside the contour
+            inside_ratio_clamped = sampled.mean()
+
+            # Account for the part of the bbox that's outside the image
+            # (which is definitely outside the contour)
+            clamped_area = (x2_c - x1_c) * (y2_c - y1_c)
+            bbox_area = (w * h).clamp(min=1.0)
+            # What fraction of the full bbox is inside the image?
+            area_ratio = clamped_area / bbox_area
+
+            # Overall IoR: inside_clamped * (clamped_area / bbox_area)
+            # Detach the sampling parts (non-differentiable lookup) and
+            # keep the bbox geometry differentiable through area_ratio.
+            ior = inside_ratio_clamped.detach() * area_ratio
+
+            # Steep penalty:  k * (1 - IoR)^2
+            violation = (1.0 - ior)
+            loss = loss + k * violation ** 2
             count += 1
 
         return loss / max(1, count)
@@ -536,14 +684,16 @@ class PointSetRegistrationOptimizer:
         L_seq = self.compute_seq_loss()
         L_height = self.compute_height_loss()
         L_rows = self.compute_rows_loss()
+        L_boundary = self.compute_boundary_loss()
 
         L_total = (self.lambda_data * L_data
                    + self.lambda_anchor * L_anchor
                    + self.lambda_seq * L_seq
                    + self.lambda_height * L_height
-                   + self.lambda_rows * L_rows)
+                   + self.lambda_rows * L_rows
+                   + self.lambda_boundary * L_boundary)
 
-        return L_total, L_data, L_anchor, L_seq, L_height, L_rows
+        return L_total, L_data, L_anchor, L_seq, L_height, L_rows, L_boundary
 
     # ==================================================================
     #  Optimisation loop
@@ -598,7 +748,9 @@ class PointSetRegistrationOptimizer:
             print(f"  w_noise:        {self.w_noise}")
             print(f"  Lambdas:  data={self.lambda_data}, anchor={self.lambda_anchor}, "
                   f"seq={self.lambda_seq}, height={self.lambda_height}, "
-                  f"rows={self.lambda_rows}")
+                  f"rows={self.lambda_rows}, boundary={self.lambda_boundary}")
+            if self.contour_mask is not None:
+                print(f"  Contour mask: {self.contour_mask.shape[1]}×{self.contour_mask.shape[0]}")
             print("-" * 60)
 
         for it in range(num_iterations):
@@ -608,7 +760,7 @@ class PointSetRegistrationOptimizer:
                 self.sigma = sigma_init * (1.0 - t) + sigma_final * t
 
             opt.zero_grad()
-            L_total, L_data, L_anchor, L_seq, L_height, L_rows = \
+            L_total, L_data, L_anchor, L_seq, L_height, L_rows, L_boundary = \
                 self.compute_total_loss()
             L_total.backward()
 
@@ -633,6 +785,7 @@ class PointSetRegistrationOptimizer:
                 'seq': L_seq.item(),
                 'height': L_height.item(),
                 'rows': L_rows.item(),
+                'boundary': L_boundary.item(),
                 'sigma': self.sigma,
             })
 
@@ -642,7 +795,8 @@ class PointSetRegistrationOptimizer:
                         f"anchor={L_anchor.item():.4f}  "
                         f"seq={L_seq.item():.4f}  "
                         f"height={L_height.item():.4f}  "
-                        f"rows={L_rows.item():.4f}")
+                        f"rows={L_rows.item():.4f}  "
+                        f"boundary={L_boundary.item():.4f}")
                 if sigma_anneal:
                     line += f"  σ={self.sigma:.1f}"
                 print(line)
@@ -687,58 +841,270 @@ class PointSetRegistrationOptimizer:
     #  Visualisation
     # ==================================================================
 
-    def plot_loss_history(self, figsize: tuple = (20, 5)):
-        """Plot loss curves: total, raw components, weighted components."""
+    def plot_loss_history(self, figsize: tuple = (16, 12)):
+        """Plot loss curves in a 2x2 grid: total, raw, weighted, log-scale."""
         if not self.loss_components_history:
             print("No optimisation history available.")
             return
 
-        fig, axes = plt.subplots(1, 3, figsize=figsize)
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
 
-        # -- Total loss --
-        axes[0].plot(self.loss_history)
-        axes[0].set_xlabel('Iteration')
-        axes[0].set_ylabel('Total Loss')
-        axes[0].set_title('Total Loss')
-        axes[0].grid(True, alpha=0.3)
-
-        # -- Raw component losses --
         keys = ['data', 'anchor', 'seq', 'height', 'rows']
+        if self.lambda_boundary > 0:
+            keys.append('boundary')
+
+        # -- (0,0) Total loss --
+        axes[0, 0].plot(self.loss_history)
+        axes[0, 0].set_xlabel('Iteration')
+        axes[0, 0].set_ylabel('Total Loss')
+        axes[0, 0].set_title('Total Loss')
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # -- (0,1) Raw component losses --
         for k in keys:
             vals = [h[k] for h in self.loss_components_history]
-            axes[1].plot(vals, label=f'L_{k}')
-        axes[1].set_xlabel('Iteration')
-        axes[1].set_ylabel('Loss')
-        axes[1].set_title('Raw Loss Components')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
+            axes[0, 1].plot(vals, label=f'L_{k}')
+        axes[0, 1].set_xlabel('Iteration')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].set_title('Raw Loss Components')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
 
-        # -- Weighted components or sigma --
+        # -- (1,0) Weighted components (+ sigma if annealed) --
         sigma_vals = [h.get('sigma', self.sigma)
                       for h in self.loss_components_history]
         if len(set(sigma_vals)) > 1:
-            ax2r = axes[2].twinx()
+            ax_twin = axes[1, 0].twinx()
             for k in keys:
                 lam = getattr(self, f'lambda_{k}')
                 vals = [lam * h[k] for h in self.loss_components_history]
-                axes[2].plot(vals, label=f'λ·L_{k}')
-            ax2r.plot(sigma_vals, 'k--', alpha=0.5, label='σ')
-            ax2r.set_ylabel('σ')
-            ax2r.legend(loc='upper right')
-            axes[2].set_title('Weighted Components + σ')
+                axes[1, 0].plot(vals, label=f'λ·L_{k}')
+            ax_twin.plot(sigma_vals, 'k--', alpha=0.5, label='σ')
+            ax_twin.set_ylabel('σ')
+            ax_twin.legend(loc='upper right')
+            axes[1, 0].set_title('Weighted Components + σ')
         else:
             for k in keys:
                 lam = getattr(self, f'lambda_{k}')
                 vals = [lam * h[k] for h in self.loss_components_history]
-                axes[2].plot(vals, label=f'λ·L_{k}')
-            axes[2].set_title('Weighted Loss Components')
-        axes[2].set_xlabel('Iteration')
-        axes[2].set_ylabel('Weighted Loss')
-        axes[2].legend(loc='upper left')
-        axes[2].grid(True, alpha=0.3)
+                axes[1, 0].plot(vals, label=f'λ·L_{k}')
+            axes[1, 0].set_title('Weighted Loss Components')
+        axes[1, 0].set_xlabel('Iteration')
+        axes[1, 0].set_ylabel('Weighted Loss')
+        axes[1, 0].legend(loc='upper left')
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # -- (1,1) Log-scale raw components --
+        for k in keys:
+            vals = [h[k] for h in self.loss_components_history]
+            axes[1, 1].plot(vals, label=f'L_{k}')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].set_xlabel('Iteration')
+        axes[1, 1].set_ylabel('Loss (log)')
+        axes[1, 1].set_title('Raw Loss Components (log scale)')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
 
         plt.tight_layout()
         plt.show()
+
+    # ------------------------------------------------------------------
+
+    def plot_loss_curves(self, save_dir: str = "alignment_loss_functions",
+                         show: bool = True):
+        """
+        Plot the characteristic shape of each loss function and save to files.
+
+        Generates one image per loss function showing how the loss responds
+        to its input variable, using the optimizer's current parameters.
+        """
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+
+        saved_files = []
+
+        # ---- 1. Rows loss (asymmetric piecewise) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        r_far = self.rows_threshold_ratio_far
+        r_close = self.rows_threshold_ratio_close
+        p_far = self.rows_plateau_far
+        p_close = self.rows_plateau_close
+        # x-axis: deviation / ideal  (dimensionless ratio)
+        d_ratio = np.linspace(-1.5, 1.5, 500)
+        loss_vals = np.zeros_like(d_ratio)
+        for i, dr in enumerate(d_ratio):
+            if dr >= 0:
+                t_r, plat = r_far, p_far
+            else:
+                t_r, plat = r_close, p_close
+            normed = dr / t_r if t_r > 0 else 0
+            loss_vals[i] = plat * min(normed ** 2, 1.0)
+        ax.plot(d_ratio, loss_vals, 'b-', linewidth=2)
+        ax.axvline(0, color='gray', linestyle='--', alpha=0.5, label='ideal spacing')
+        ax.axvline(r_far, color='r', linestyle=':', alpha=0.7,
+                   label=f'threshold far = {r_far:.3f}')
+        ax.axvline(-r_close, color='orange', linestyle=':', alpha=0.7,
+                   label=f'threshold close = {r_close:.3f}')
+        ax.axhline(p_far, color='r', linestyle='-', alpha=0.3,
+                   label=f'plateau far = {p_far}')
+        ax.axhline(p_close, color='orange', linestyle='-', alpha=0.3,
+                   label=f'plateau close = {p_close}')
+        ax.set_xlabel('(actual − ideal) / ideal')
+        ax.set_ylabel('Loss')
+        ax.set_title(f'$L_{{rows}}$: Asymmetric Piecewise Loss\n'
+                     f'(r_far={r_far:.3f}, r_close={r_close:.3f}, '
+                     f'p_far={p_far}, p_close={p_close})')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(-0.05, max(p_far, p_close) * 1.3)
+        path = os.path.join(save_dir, 'loss_rows.png')
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        saved_files.append(path)
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        # ---- 2. Anchor loss (quadratic deviation from baseline) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        dev = np.linspace(-100, 100, 500)
+        loss_a = dev ** 2
+        ax.plot(dev, loss_a, 'b-', linewidth=2)
+        ax.set_xlabel('y − y_baseline  (pixels)')
+        ax.set_ylabel('Loss (per sign)')
+        ax.set_title('$L_{anchor}$: Squared Deviation from Row Baseline')
+        ax.grid(True, alpha=0.3)
+        ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
+        path = os.path.join(save_dir, 'loss_anchor.png')
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        saved_files.append(path)
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        # ---- 3. Seq loss (gap deviation) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        gap_dev = np.linspace(-100, 100, 500)
+        loss_s = gap_dev ** 2
+        ax.plot(gap_dev, loss_s, 'b-', linewidth=2)
+        ax.set_xlabel('actual_gap − expected_gap  (pixels)')
+        ax.set_ylabel('Loss (per pair)')
+        ax.set_title('$L_{seq}$: Squared Gap Deviation\n'
+                     '(expected_gap = $(w_j + w_{j+1})/2$)')
+        ax.grid(True, alpha=0.3)
+        ax.axvline(0, color='gray', linestyle='--', alpha=0.5,
+                   label='ideal gap')
+        ax.legend()
+        path = os.path.join(save_dir, 'loss_seq.png')
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        saved_files.append(path)
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        # ---- 4. Height loss (variance) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        # Show how variance grows as one sign deviates from mean
+        # In a row of n signs, if one deviates by delta from the
+        # uniform height, Var = delta^2 * (n-1)/n^2
+        # For simplicity show Var for n=5
+        n_demo = 5
+        delta = np.linspace(-80, 80, 500)
+        var_vals = delta ** 2 * (n_demo - 1) / (n_demo ** 2)
+        ax.plot(delta, var_vals, 'b-', linewidth=2,
+                label=f'row with {n_demo} signs')
+        for n_ex in [3, 10]:
+            v = delta ** 2 * (n_ex - 1) / (n_ex ** 2)
+            ax.plot(delta, v, '--', linewidth=1, alpha=0.6,
+                    label=f'row with {n_ex} signs')
+        ax.set_xlabel('$h_j - \\bar{h}$  (pixel deviation of one sign)')
+        ax.set_ylabel('Variance contribution')
+        ax.set_title('$L_{height}$: Height Variance within a Row\n'
+                     '(one sign deviating, others uniform)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
+        path = os.path.join(save_dir, 'loss_height.png')
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        saved_files.append(path)
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        # ---- 5. Data loss (GMM likelihood for one source) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        sigma = self.sigma
+        w = self.w_noise
+        # Show -log p(x) as a function of distance from the nearest
+        # source centre, for a single source-target pair
+        dist = np.linspace(0, 4 * sigma, 500)
+        gauss = (1.0 / (2 * np.pi * sigma ** 2)) * np.exp(
+            -dist ** 2 / (2 * sigma ** 2))
+        # p(x) = w/N + (1-w)/M * gauss  (simplified for M=N=1)
+        p_x = w + (1 - w) * gauss
+        neg_log_p = -np.log(p_x)
+        ax.plot(dist, neg_log_p, 'b-', linewidth=2)
+        ax.axhline(-np.log(w), color='r', linestyle=':', alpha=0.7,
+                   label=f'floor: −log(w) = {-np.log(w):.2f}')
+        ax.axvline(sigma, color='orange', linestyle='--', alpha=0.6,
+                   label=f'σ = {sigma:.1f}')
+        ax.axvline(2 * sigma, color='orange', linestyle=':', alpha=0.4,
+                   label=f'2σ = {2*sigma:.1f}')
+        ax.set_xlabel('‖x − s‖  (distance, pixels)')
+        ax.set_ylabel('−log p(x)')
+        ax.set_title(f'$E_{{data}}$: Neg-Log-Likelihood per Target Point\n'
+                     f'(σ={sigma:.1f}, w={w})')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        path = os.path.join(save_dir, 'loss_data.png')
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        saved_files.append(path)
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        # ---- 6. Boundary loss (steep IoR penalty) ----
+        if self.lambda_boundary > 0:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+            ior_vals = np.linspace(0, 1, 500)
+            k = self.boundary_steepness
+            boundary_loss = k * (1.0 - ior_vals) ** 2
+            ax.plot(ior_vals, boundary_loss, 'b-', linewidth=2)
+            ax.axvline(1.0, color='gray', linestyle='--', alpha=0.5,
+                       label='fully inside (IoR=1)')
+            ax.axhline(0, color='gray', linestyle='-', alpha=0.3)
+            # Mark some reference points
+            for ref_ior in [0.5, 0.8, 0.9]:
+                ref_loss = k * (1.0 - ref_ior) ** 2
+                ax.plot(ref_ior, ref_loss, 'ro', markersize=5)
+                ax.annotate(f'IoR={ref_ior}: L={ref_loss:.2f}',
+                           xy=(ref_ior, ref_loss),
+                           xytext=(ref_ior - 0.15, ref_loss + 0.2),
+                           fontsize=8, alpha=0.8)
+            ax.set_xlabel('IoR (Intersection over Region)')
+            ax.set_ylabel('Loss (per row-first sign)')
+            ax.set_title(f'$L_{{boundary}}$: Contour Boundary Penalty\n'
+                         f'$k \\cdot (1 - IoR)^2$, k={k}')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(-0.05, 1.05)
+            ax.set_ylim(-0.1, k + 0.5)
+            path = os.path.join(save_dir, 'loss_boundary.png')
+            fig.savefig(path, dpi=150, bbox_inches='tight')
+            saved_files.append(path)
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
+
+        print(f"Loss curve plots saved to {save_dir}/:")
+        for f in saved_files:
+            print(f"  {f}")
+        return saved_files
 
     # ------------------------------------------------------------------
 

@@ -32,3 +32,4 @@ data_processing/visualizations/
 evaluation_output_*/
 evaluation_results/
 ngram_match_search_output/
+alignment_loss_functions/

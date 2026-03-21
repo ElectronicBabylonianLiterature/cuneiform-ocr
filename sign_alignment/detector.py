@@ -25,6 +25,7 @@ class ModelConfig():
 class SingleImage:
     img: np.ndarray
     detections: Detection = field(default_factory=list)
+    mask: np.ndarray = None  # Binary contour mask (H, W), 0/255
     
     def __len__(self):
         return len(self.detections)
@@ -102,11 +103,12 @@ class TabletImageDetector(BaseDetector):
         if self.keep_crops:
             self.cropped_images = [] # reset cropped for each detection
 
-        cropped_images, crop_coordinates = divide_tablet_photo(
+        cropped_images, crop_coordinates, masks = divide_tablet_photo(
             img, 
             visualize=self.visualize_crop, 
             logging=self.logging_crop, 
-            return_coordinates=True
+            return_coordinates=True,
+            return_masks=True,
         )
         
         # Store crop coordinates
@@ -124,7 +126,11 @@ class TabletImageDetector(BaseDetector):
 
             if self.keep_crops:
                 # Deep copy to avoid modifying stored detections when transforming coordinates
-                self.cropped_images.append(SingleImage(img=img_piece, detections=copy.deepcopy(piece_detections)))
+                self.cropped_images.append(SingleImage(
+                    img=img_piece,
+                    detections=copy.deepcopy(piece_detections),
+                    mask=masks[idx],
+                ))
             
             # Transform to original image coordinates
             piece_offset_x = crop_coordinates[idx]['x']
