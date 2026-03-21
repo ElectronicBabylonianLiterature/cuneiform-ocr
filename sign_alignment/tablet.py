@@ -347,6 +347,15 @@ class SubTablet:
         for sb, row_idx in zip(self.sign_boxes, row_labels):
             sb.row_idx = row_idx
         
+        # Assign col_idx based on x-sorted position within each row
+        rows_dict: dict = {}
+        for sb in self.sign_boxes:
+            rows_dict.setdefault(sb.row_idx, []).append(sb)
+        for row_boxes in rows_dict.values():
+            row_boxes.sort(key=lambda sb: sb.cx)
+            for col_idx, sb in enumerate(row_boxes):
+                sb.col_idx = col_idx
+        
         return num_rows
     
     def get_rows(self) -> List[List[SignBox]]:

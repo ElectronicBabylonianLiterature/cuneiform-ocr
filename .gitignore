@@ -24,9 +24,11 @@ log_*.log
 alignment_results/
 alignment_results_heatmap/
 alignment_results_heatmap-*/
+alignment_results-*/
 .env
 .ipynb_checkpoints/
 data_processing/division_checking_photos/
 data_processing/visualizations/
 evaluation_output_*/
+evaluation_results/
 ngram_match_search_output/

@@ -39,6 +39,8 @@ from .visualizer import (
     BboxVisualizer,
     TextVisualizer,
     HeatmapVisualizer,
+    CompositeVisualizer,
+    build_sign_match_info,
 )
 
 from .heatmap import (

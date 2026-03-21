@@ -148,6 +148,8 @@ class BboxVisualizer:
         show_labels: bool = True,
         show_row_numbers: bool = False,
         row_mapping: dict = None,
+        row_label_prefix: str = "R",
+        mapped_label_prefix: str = "D",
         line_thickness: int = 2,
         marker_size: int = 5
     ) -> np.ndarray:
@@ -163,7 +165,9 @@ class BboxVisualizer:
             boxes: List of box objects with row_idx attribute (SignBox, BoundingBox with row_idx, etc.)
             show_labels: Whether to show sign name labels
             show_row_numbers: Whether to annotate row numbers on the left margin
-            row_mapping: Optional dict mapping row_idx to display number (for matched rows)
+            row_mapping: Optional dict mapping row_idx to mapped row idx (for matched rows)
+            row_label_prefix: Prefix for row labels ("R" for text rows, "D" for detection rows)
+            mapped_label_prefix: Prefix for the mapped row in labels ("D" for detection, "R" for text)
             line_thickness: Thickness of row connection lines
             marker_size: Size of center point markers
             
@@ -369,13 +373,14 @@ class BboxVisualizer:
                 # Get row color
                 row_color_rgb = get_row_color_with_mapping(row_idx)
                 
-                # Determine display text
+                # Determine display text (1-indexed for display)
+                display_idx = row_idx + 1
                 if row_mapping is not None and row_idx in row_mapping:
                     mapped_row = row_mapping[row_idx]
-                    # Show both: "R{text_row}→D{det_row}"
-                    label_text = f"R{row_idx}→D{mapped_row}"
+                    mapped_display = mapped_row + 1
+                    label_text = f"{row_label_prefix}{display_idx}→{mapped_label_prefix}{mapped_display}"
                 else:
-                    label_text = f"R{row_idx}"
+                    label_text = f"{row_label_prefix}{display_idx}"
                 
                 # Draw text with PIL (supports Unicode arrow)
                 label_pos = (10, int(avg_y) - 12)  # Adjust y to center text vertically
@@ -386,6 +391,581 @@ class BboxVisualizer:
         
         self.result = img_vis
         return img_vis
+
+    def draw_text_mapping(
+        self,
+        img: Optional[np.ndarray],
+        sign_boxes: List,
+        row_mapping: dict,
+        sign_match_info: dict,
+        mapped_label_prefix: str = "D",
+        line_thickness: int = 2,
+        marker_size: int = 5
+    ) -> np.ndarray:
+        """
+        Draw text rows with per-sign match-quality coloring and supplementary labels.
+
+        Shows all text rows with coloring reflecting how each sign matched to a
+        detection: primary color for same-label match, desaturated for diff-label,
+        gray for unmatched signs or unmatched rows.
+
+        Args:
+            img: Background image in BGR (None → auto white canvas)
+            sign_boxes: List of SignBox from text subtablet
+            row_mapping: text_to_det dict {text_row_idx: det_row_idx}
+            sign_match_info: dict {(row_idx, col_idx): {"status": "same"|"diff"|"unmatched",
+                             "det_sign_name": str|None}}
+            mapped_label_prefix: Prefix for mapped rows ("D")
+            line_thickness: Row connection line thickness
+            marker_size: Center marker radius
+
+        Returns:
+            Image with text mapping visualization drawn
+        """
+        boxes = list(sign_boxes)
+
+        # Handle text-only canvas (no image)
+        if img is None:
+            if not boxes:
+                self.result = np.ones((100, 100, 3), dtype=np.uint8) * 255
+                return self.result
+            max_x = max(b.cx + b.width / 2 for b in boxes)
+            max_y = max(b.cy + b.height / 2 for b in boxes)
+            min_x = min(b.cx - b.width / 2 for b in boxes)
+            min_y = min(b.cy - b.height / 2 for b in boxes)
+            margin = 100
+            offset_x = max(0, -min_x) + margin
+            offset_y = max(0, -min_y) + margin
+            canvas_w = int(max_x - min_x + 2 * margin)
+            canvas_h = int(max_y - min_y + 2 * margin)
+            img = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 255
+            new_boxes = []
+            for box in boxes:
+                new_boxes.append(SignBox(
+                    sign=box.sign, score=box.score,
+                    cx=box.cx + offset_x, cy=box.cy + offset_y,
+                    width=box.width, height=box.height,
+                    row_idx=box.row_idx, col_idx=box.col_idx
+                ))
+            boxes = new_boxes
+
+        img_vis = img.copy()
+
+        # Group boxes by row
+        rows = {}
+        for box in boxes:
+            rows.setdefault(box.row_idx, []).append(box)
+
+        # --- Draw rectangles colored by match status ---
+        for box in boxes:
+            x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
+            key = (box.row_idx, box.col_idx)
+            info = sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
+            color_rgb = self._get_sign_color(box.row_idx, info["status"], row_mapping)
+            color_bgr = tuple(reversed(color_rgb))
+            cv2.rectangle(img_vis, (x1, y1), (x2, y2), color_bgr, 2)
+
+        # --- Draw center lines and markers per row ---
+        for row_idx in sorted(rows.keys()):
+            if row_idx == -1:
+                continue
+            row_boxes = sorted(rows[row_idx], key=lambda b: b.cx)
+            if row_idx in row_mapping:
+                line_color_rgb = _get_row_color(row_mapping[row_idx])
+            else:
+                line_color_rgb = (128, 128, 128)
+            line_color_bgr = tuple(reversed(line_color_rgb))
+            for i in range(len(row_boxes) - 1):
+                c1 = (int(row_boxes[i].cx), int(row_boxes[i].cy))
+                c2 = (int(row_boxes[i + 1].cx), int(row_boxes[i + 1].cy))
+                cv2.line(img_vis, c1, c2, line_color_bgr, line_thickness)
+            for box in row_boxes:
+                c = (int(box.cx), int(box.cy))
+                cv2.circle(img_vis, c, marker_size, line_color_bgr, -1)
+                cv2.circle(img_vis, c, marker_size + 1, (255, 255, 255), 1)
+
+        # --- Draw labels with PIL (Unicode support) ---
+        img_pil = Image.fromarray(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        font = _get_font(24)
+        label_font = _get_font(10)
+
+        for box in boxes:
+            x1, y1 = int(box.x1), int(box.y1)
+            x2, y2 = int(box.x2), int(box.y2)
+            key = (box.row_idx, box.col_idx)
+            info = sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
+            status = info["status"]
+
+            box_height = y2 - y1
+            lbl_h = max(int(box_height / 6), 12)
+            fsize = max(int(lbl_h * 0.75), 10)
+            lbl_font = _get_font(fsize)
+
+            label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
+
+            # Primary label (text sign name)
+            bbox_text = draw.textbbox((0, 0), label, font=lbl_font)
+            tw = bbox_text[2] - bbox_text[0]
+            th = bbox_text[3] - bbox_text[1]
+            lx1, ly1 = x1 + 2, y1 + 2
+            lx2, ly2 = min(x1 + tw + 8, x2 - 2), y1 + lbl_h
+            draw.rectangle([lx1, ly1, lx2, ly2], fill=(0, 0, 0))
+            text_y = ly1 + (lbl_h - th) // 2
+            draw.text((lx1 + 4, text_y), label, font=lbl_font, fill=(255, 255, 255))
+
+            # Supplementary label for diff-label matches
+            if status == "diff" and info.get("det_sign_name"):
+                det_label = info["det_sign_name"][:10]
+                bbox_det = draw.textbbox((0, 0), det_label, font=lbl_font)
+                dtw = bbox_det[2] - bbox_det[0]
+                dth = bbox_det[3] - bbox_det[1]
+                dlx1, dly1 = x1 + 2, ly2 + 1
+                dlx2, dly2 = min(x1 + dtw + 8, x2 - 2), ly2 + 1 + lbl_h
+                draw.rectangle([dlx1, dly1, dlx2, dly2], fill=(80, 80, 80))
+                det_text_y = dly1 + (lbl_h - dth) // 2
+                draw.text((dlx1 + 4, det_text_y), det_label, font=lbl_font, fill=(255, 255, 255))
+
+        # --- Row annotations on left margin ---
+        for row_idx in sorted(rows.keys()):
+            if row_idx == -1:
+                continue
+            row_boxes = rows[row_idx]
+            avg_y = np.mean([b.cy for b in row_boxes])
+            display_idx = row_idx + 1
+            if row_idx in row_mapping:
+                mapped_display = row_mapping[row_idx] + 1
+                lbl = f"R{display_idx}→{mapped_label_prefix}{mapped_display}"
+                color_rgb = _get_row_color(row_mapping[row_idx])
+            else:
+                lbl = f"R{display_idx}"
+                color_rgb = (128, 128, 128)
+            draw.text((10, int(avg_y) - 12), lbl, font=font, fill=color_rgb)
+
+        img_vis = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        self.result = img_vis
+        return img_vis
+
+    def draw_alignment_diagnostic(
+        self,
+        img: np.ndarray,
+        detection_sign_boxes: List,
+        aligned_text_boxes: List,
+        det_sign_match_info: dict,
+        text_sign_match_info: dict,
+        det_to_text: dict,
+        line_thickness: int = 2,
+        marker_size: int = 5
+    ) -> np.ndarray:
+        """
+        Draw alignment diagnostic on the detection image.
+
+        Shows detection boxes colored by match quality, overlays coarse-aligned
+        text boxes (unmatched ones as dashed rectangles), draws detection center
+        lines (solid) and text center lines (dashed), with row annotations
+        D#→R#.
+
+        Args:
+            img: Background image in BGR format
+            detection_sign_boxes: List of SignBox from detection subtablet
+            aligned_text_boxes: List of SignBox from coarse-aligned subtablet (sub_tablet_optim)
+            det_sign_match_info: {(det_row_idx, det_col_idx): {"status": "same"|"diff"|"unmatched",
+                                  "text_sign_name": str|None}}
+            text_sign_match_info: {(text_row_idx, text_col_idx): {"status": "same"|"diff"|"unmatched",
+                                   "det_sign_name": str|None}}
+            det_to_text: dict {det_row_idx: text_row_idx}
+            line_thickness: Line thickness
+            marker_size: Marker radius
+
+        Returns:
+            Image with alignment diagnostic drawn
+        """
+        img_vis = img.copy()
+
+        # Helper: map det row index through det_to_text for consistent coloring with draw_rows
+        def _color_idx(det_row_idx: int) -> int:
+            return det_to_text.get(det_row_idx, det_row_idx)
+
+        # Group by row
+        det_rows = {}
+        for box in detection_sign_boxes:
+            det_rows.setdefault(box.row_idx, []).append(box)
+        text_rows = {}
+        for box in aligned_text_boxes:
+            text_rows.setdefault(box.row_idx, []).append(box)
+
+        # --- Draw detection boxes colored by match status ---
+        for box in detection_sign_boxes:
+            x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
+            key = (box.row_idx, box.col_idx)
+            info = det_sign_match_info.get(key, {"status": "unmatched", "text_sign_name": None})
+            color_rgb = self._get_det_sign_color(_color_idx(box.row_idx), info["status"])
+            color_bgr = tuple(reversed(color_rgb))
+            cv2.rectangle(img_vis, (x1, y1), (x2, y2), color_bgr, 2)
+
+        # --- Draw aligned unmatched text boxes as dashed rectangles ---
+        for box in aligned_text_boxes:
+            key = (box.row_idx, box.col_idx)
+            info = text_sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
+            if info["status"] == "unmatched":
+                x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
+                _draw_dashed_rect(img_vis, (x1, y1), (x2, y2), (180, 180, 180), 2, 8)
+
+        # --- Detection center lines (solid) ---
+        for row_idx in sorted(det_rows.keys()):
+            if row_idx == -1:
+                continue
+            row_boxes = sorted(det_rows[row_idx], key=lambda b: b.cx)
+            row_color_bgr = tuple(reversed(_get_row_color(_color_idx(row_idx))))
+            for i in range(len(row_boxes) - 1):
+                c1 = (int(row_boxes[i].cx), int(row_boxes[i].cy))
+                c2 = (int(row_boxes[i + 1].cx), int(row_boxes[i + 1].cy))
+                cv2.line(img_vis, c1, c2, row_color_bgr, line_thickness)
+            for box in row_boxes:
+                c = (int(box.cx), int(box.cy))
+                cv2.circle(img_vis, c, marker_size, row_color_bgr, -1)
+                cv2.circle(img_vis, c, marker_size + 1, (255, 255, 255), 1)
+
+        # --- Text center lines (dashed) per aligned row ---
+        # text_rows keys are text_row_idx; color uses text_row_idx directly
+        # (consistent with draw_rows which maps det→text for color)
+        for text_row_idx in sorted(text_rows.keys()):
+            if text_row_idx == -1:
+                continue
+            row_boxes = sorted(text_rows[text_row_idx], key=lambda b: b.cx)
+            line_color_bgr = tuple(reversed(_desaturate_color(_get_row_color(text_row_idx), 0.5)))
+            for i in range(len(row_boxes) - 1):
+                c1 = (int(row_boxes[i].cx), int(row_boxes[i].cy))
+                c2 = (int(row_boxes[i + 1].cx), int(row_boxes[i + 1].cy))
+                _draw_dashed_line(img_vis, c1, c2, line_color_bgr, line_thickness, 10)
+            for box in row_boxes:
+                c = (int(box.cx), int(box.cy))
+                cv2.circle(img_vis, c, marker_size - 1, line_color_bgr, -1)
+
+        # --- Labels with PIL ---
+        img_pil = Image.fromarray(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        font = _get_font(24)
+
+        # Detection box labels
+        for box in detection_sign_boxes:
+            x1, y1 = int(box.x1), int(box.y1)
+            x2, y2 = int(box.x2), int(box.y2)
+            key = (box.row_idx, box.col_idx)
+            info = det_sign_match_info.get(key, {"status": "unmatched", "text_sign_name": None})
+            status = info["status"]
+
+            box_height = y2 - y1
+            lbl_h = max(int(box_height / 6), 12)
+            fsize = max(int(lbl_h * 0.75), 10)
+            lbl_font = _get_font(fsize)
+
+            det_label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
+
+            if status == "same":
+                # Detection label, black bg
+                _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(0, 0, 0))
+            elif status == "diff":
+                text_name = info.get("text_sign_name", "")
+                # Detection label on top (dark gray bg = detection result)
+                _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(80, 80, 80))
+                # Text label below (colored bg)
+                if text_name:
+                    color_rgb = self._get_det_sign_color(_color_idx(box.row_idx), "same")
+                    _draw_label(draw, text_name[:10], x1, y1 + lbl_h + 1, x2, lbl_h, lbl_font, bg=color_rgb)
+            else:
+                # Unmatched detection: gray bg
+                _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(128, 128, 128))
+
+        # Unmatched text box labels
+        for box in aligned_text_boxes:
+            key = (box.row_idx, box.col_idx)
+            info = text_sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
+            if info["status"] == "unmatched":
+                x1, y1 = int(box.x1), int(box.y1)
+                x2, y2 = int(box.x2), int(box.y2)
+                box_height = y2 - y1
+                lbl_h = max(int(box_height / 6), 12)
+                fsize = max(int(lbl_h * 0.75), 10)
+                lbl_font = _get_font(fsize)
+                label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
+                _draw_label(draw, label, x1, y1, x2, lbl_h, lbl_font, bg=(160, 160, 160))
+
+        # --- Row annotations ---
+        for row_idx in sorted(det_rows.keys()):
+            if row_idx == -1:
+                continue
+            row_boxes = det_rows[row_idx]
+            avg_y = np.mean([b.cy for b in row_boxes])
+            display_idx = row_idx + 1
+            if row_idx in det_to_text:
+                mapped_display = det_to_text[row_idx] + 1
+                lbl = f"D{display_idx}→R{mapped_display}"
+                color_rgb = _get_row_color(_color_idx(row_idx))
+            else:
+                lbl = f"D{display_idx}"
+                color_rgb = (128, 128, 128)
+            draw.text((10, int(avg_y) - 12), lbl, font=font, fill=color_rgb)
+
+        img_vis = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        self.result = img_vis
+        return img_vis
+
+    # --- Internal helpers for match-quality coloring ---
+
+    @staticmethod
+    def _get_sign_color(row_idx: int, status: str, row_mapping: dict) -> tuple:
+        """Get RGB color for a text sign box based on match status."""
+        if row_idx not in row_mapping:
+            return (128, 128, 128)
+        det_row_idx = row_mapping[row_idx]
+        primary = _get_row_color(det_row_idx)
+        if status == "same":
+            return primary
+        elif status == "diff":
+            return _desaturate_color(primary, 0.4)
+        else:
+            return (128, 128, 128)
+
+    @staticmethod
+    def _get_det_sign_color(row_idx: int, status: str) -> tuple:
+        """Get RGB color for a detection sign box based on match status."""
+        primary = _get_row_color(row_idx)
+        if status == "same":
+            return primary
+        elif status == "diff":
+            return _desaturate_color(primary, 0.4)
+        else:
+            return (128, 128, 128)
+
+
+# ===== Module-level helper functions =====
+
+def _get_row_color(row_idx: int) -> tuple:
+    """Generate distinct RGB color for a row using HSV golden angle."""
+    if row_idx == -1:
+        return (128, 128, 128)
+    hue = int((row_idx * 137.5) % 180)
+    hsv_color = np.uint8([[[hue, 255, 255]]])
+    bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+    return (int(bgr_color[2]), int(bgr_color[1]), int(bgr_color[0]))
+
+
+def _desaturate_color(rgb: tuple, factor: float = 0.4) -> tuple:
+    """Reduce saturation of an RGB color. factor=0 → grayscale, factor=1 → original."""
+    r, g, b = rgb
+    hsv = cv2.cvtColor(np.uint8([[[b, g, r]]]), cv2.COLOR_BGR2HSV)[0][0]
+    hsv[1] = int(hsv[1] * factor)
+    bgr = cv2.cvtColor(np.uint8([[[hsv[0], hsv[1], hsv[2]]]]), cv2.COLOR_HSV2BGR)[0][0]
+    return (int(bgr[2]), int(bgr[1]), int(bgr[0]))
+
+
+def _get_font(size: int):
+    """Load DejaVuSans font at given size, with fallback."""
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+    except Exception:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
+        except Exception:
+            return ImageFont.load_default()
+
+
+def _draw_label(draw: ImageDraw.Draw, text: str, x1: int, y_top: int, x2: int,
+                label_height: int, font, bg: tuple = (0, 0, 0), fg: tuple = (255, 255, 255)):
+    """Draw a text label with background at specified position."""
+    bbox_text = draw.textbbox((0, 0), text, font=font)
+    tw = bbox_text[2] - bbox_text[0]
+    th = bbox_text[3] - bbox_text[1]
+    lx1, ly1 = x1 + 2, y_top + 2
+    lx2, ly2 = min(x1 + tw + 8, x2 - 2), y_top + label_height
+    draw.rectangle([lx1, ly1, lx2, ly2], fill=bg)
+    text_y = ly1 + (label_height - th) // 2
+    draw.text((lx1 + 4, text_y), text, font=font, fill=fg)
+
+
+def _draw_dashed_rect(img: np.ndarray, pt1: tuple, pt2: tuple,
+                      color: tuple, thickness: int = 2, dash_length: int = 8):
+    """Draw a dashed rectangle on an OpenCV image (BGR color)."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    _draw_dashed_line(img, (x1, y1), (x2, y1), color, thickness, dash_length)
+    _draw_dashed_line(img, (x2, y1), (x2, y2), color, thickness, dash_length)
+    _draw_dashed_line(img, (x2, y2), (x1, y2), color, thickness, dash_length)
+    _draw_dashed_line(img, (x1, y2), (x1, y1), color, thickness, dash_length)
+
+
+def _draw_dashed_line(img: np.ndarray, pt1: tuple, pt2: tuple,
+                      color: tuple, thickness: int = 2, dash_length: int = 10):
+    """Draw a dashed line between two points on an OpenCV image (BGR color)."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    dist = np.hypot(x2 - x1, y2 - y1)
+    if dist < 1:
+        return
+    dx = (x2 - x1) / dist
+    dy = (y2 - y1) / dist
+    pos = 0.0
+    drawing = True
+    while pos < dist:
+        end = min(pos + dash_length, dist)
+        sx = int(x1 + dx * pos)
+        sy = int(y1 + dy * pos)
+        ex = int(x1 + dx * end)
+        ey = int(y1 + dy * end)
+        if drawing:
+            cv2.line(img, (sx, sy), (ex, ey), color, thickness)
+        pos = end + dash_length / 2 if drawing else end + dash_length / 2
+        drawing = not drawing
+
+
+def build_sign_match_info(row_sign_matches: dict, text_to_det: dict,
+                          det_rows_dict: dict, optim_sign_boxes: List):
+    """
+    Build sign_match_info dicts for text and detection perspectives.
+
+    Args:
+        row_sign_matches: {text_row_idx: [(text_sign_idx, det_sign_idx), ...]}
+        text_to_det: {text_row_idx: det_row_idx}
+        det_rows_dict: {det_row_idx: [SignBox, ...]} from sub_tablet_detection.get_rows_dict()
+        optim_sign_boxes: List of SignBox from sub_tablet_optim
+
+    Returns:
+        text_sign_match_info: {(text_row_idx, text_col_idx): {"status", "det_sign_name"}}
+        det_sign_match_info:  {(det_row_idx, det_col_idx): {"status", "text_sign_name"}}
+    """
+    # Build match pairs
+    match_pairs = {}       # (text_row_idx, text_sign_idx) → (det_row_idx, det_sign_idx)
+    matched_det_keys = set()
+
+    for text_row_idx, sign_matches in row_sign_matches.items():
+        det_row_idx = text_to_det[text_row_idx]
+        for t_idx, d_idx in sign_matches:
+            match_pairs[(text_row_idx, t_idx)] = (det_row_idx, d_idx)
+            matched_det_keys.add((det_row_idx, d_idx))
+
+    text_info = {}
+    for sb in optim_sign_boxes:
+        key = (sb.row_idx, sb.col_idx)
+        if key in match_pairs:
+            det_row_idx, det_sign_idx = match_pairs[key]
+            det_box = det_rows_dict[det_row_idx][det_sign_idx]
+            det_name = det_box.sign_name if hasattr(det_box, 'sign_name') else det_box.sign.name
+            text_name = sb.sign_name if hasattr(sb, 'sign_name') else sb.sign.name
+            if text_name == det_name:
+                text_info[key] = {"status": "same", "det_sign_name": det_name}
+            else:
+                text_info[key] = {"status": "diff", "det_sign_name": det_name}
+        else:
+            text_info[key] = {"status": "unmatched", "det_sign_name": None}
+
+    # Build reverse lookup: det_key → text_key for O(1) access
+    det_to_text_key = {det_key: text_key for text_key, det_key in match_pairs.items()}
+    # Build text box lookup: (row_idx, col_idx) → SignBox
+    text_box_lookup = {(sb.row_idx, sb.col_idx): sb for sb in optim_sign_boxes}
+
+    det_info = {}
+    for det_row_idx, det_row_boxes in det_rows_dict.items():
+        for d_idx, det_box in enumerate(det_row_boxes):
+            dk = (det_row_idx, d_idx)
+            det_name = det_box.sign_name if hasattr(det_box, 'sign_name') else det_box.sign.name
+            if dk in det_to_text_key:
+                text_key = det_to_text_key[dk]
+                text_box = text_box_lookup.get(text_key)
+                if text_box:
+                    text_name = text_box.sign_name if hasattr(text_box, 'sign_name') else text_box.sign.name
+                    if det_name == text_name:
+                        det_info[dk] = {"status": "same", "text_sign_name": text_name}
+                    else:
+                        det_info[dk] = {"status": "diff", "text_sign_name": text_name}
+                else:
+                    det_info[dk] = {"status": "unmatched", "text_sign_name": None}
+            else:
+                det_info[dk] = {"status": "unmatched", "text_sign_name": None}
+
+    return text_info, det_info
+
+
+class CompositeVisualizer:
+    """Compose multiple images into a grid layout with optional titles."""
+
+    def __init__(self):
+        self.result = None
+
+    def compose(self, images: List[np.ndarray], layout: tuple,
+                titles: List[str] = None, figsize: tuple = None) -> np.ndarray:
+        """
+        Compose multiple BGR images into a grid.
+
+        Args:
+            images: List of BGR images (from .result attributes)
+            layout: (rows, cols) grid layout
+            titles: Optional list of title strings for each image
+            figsize: Optional matplotlib figsize tuple
+
+        Returns:
+            Composed BGR image
+        """
+        rows, cols = layout
+        if figsize is None:
+            figsize = (cols * 8, rows * 6)
+
+        fig, axes = plt.subplots(rows, cols, figsize=figsize)
+        if rows == 1 and cols == 1:
+            axes = np.array([[axes]])
+        elif rows == 1:
+            axes = axes[np.newaxis, :]
+        elif cols == 1:
+            axes = axes[:, np.newaxis]
+
+        for idx in range(rows * cols):
+            r, c = divmod(idx, cols)
+            ax = axes[r, c]
+            if idx < len(images) and images[idx] is not None:
+                ax.imshow(cv2.cvtColor(images[idx], cv2.COLOR_BGR2RGB))
+                if titles and idx < len(titles) and titles[idx]:
+                    ax.set_title(titles[idx])
+            ax.axis('off')
+
+        plt.tight_layout()
+
+        # Render figure to numpy array
+        fig.canvas.draw()
+        buf = fig.canvas.buffer_rgba()
+        img_rgba = np.asarray(buf)
+        img_rgb = img_rgba[:, :, :3].copy()
+        plt.close(fig)
+
+        self.result = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        return self.result
+
+    def display_result(self, vis_opt: str = "draw", path: str = None):
+        """Display or save the composed image."""
+        if self.result is None:
+            print("No result. Call compose() first.")
+            return
+        if vis_opt == "draw":
+            plt.figure(figsize=(16, 10))
+            plt.imshow(cv2.cvtColor(self.result, cv2.COLOR_BGR2RGB))
+            plt.axis('off')
+            plt.show()
+        elif vis_opt == "save":
+            if path is None:
+                path = 'composite.jpg'
+            import os
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            cv2.imwrite(path, self.result)
+            print(f"✓ Saved to: {os.path.abspath(path)}")
+
+    def save(self, path: str):
+        """Save to file."""
+        self.display_result(vis_opt="save", path=path)
+
+    def show_draw(self):
+        """Display using matplotlib."""
+        self.display_result(vis_opt="draw")
 
 
 class TextVisualizer:
