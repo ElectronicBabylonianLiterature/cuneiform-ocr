@@ -471,7 +471,7 @@ class BboxVisualizer:
                 continue
             row_boxes = sorted(rows[row_idx], key=lambda b: b.cx)
             if row_idx in row_mapping:
-                line_color_rgb = _get_row_color(row_mapping[row_idx])
+                line_color_rgb = _get_row_color(row_idx)
             else:
                 line_color_rgb = (128, 128, 128)
             line_color_bgr = tuple(reversed(line_color_rgb))
@@ -536,7 +536,7 @@ class BboxVisualizer:
             if row_idx in row_mapping:
                 mapped_display = row_mapping[row_idx] + 1
                 lbl = f"R{display_idx}→{mapped_label_prefix}{mapped_display}"
-                color_rgb = _get_row_color(row_mapping[row_idx])
+                color_rgb = _get_row_color(row_idx)
             else:
                 lbl = f"R{display_idx}"
                 color_rgb = (128, 128, 128)
@@ -603,11 +603,16 @@ class BboxVisualizer:
             color_bgr = tuple(reversed(color_rgb))
             cv2.rectangle(img_vis, (x1, y1), (x2, y2), color_bgr, 2)
 
-        # --- Draw aligned unmatched text boxes as dashed rectangles ---
+        # --- Draw aligned text boxes (non-same) as dashed rectangles ---
         for box in aligned_text_boxes:
             key = (box.row_idx, box.col_idx)
             info = text_sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
-            if info["status"] == "unmatched":
+            if info["status"] == "diff":
+                x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
+                color_rgb = _desaturate_color(_get_row_color(box.row_idx), 0.4)
+                color_bgr = tuple(reversed(color_rgb))
+                _draw_dashed_rect(img_vis, (x1, y1), (x2, y2), color_bgr, 2, 8)
+            elif info["status"] == "unmatched":
                 x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
                 _draw_dashed_rect(img_vis, (x1, y1), (x2, y2), (180, 180, 180), 2, 8)
 
@@ -677,11 +682,21 @@ class BboxVisualizer:
                 # Unmatched detection: gray bg
                 _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(128, 128, 128))
 
-        # Unmatched text box labels
+        # Diff-label and unmatched text box labels
         for box in aligned_text_boxes:
             key = (box.row_idx, box.col_idx)
             info = text_sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
-            if info["status"] == "unmatched":
+            if info["status"] == "diff":
+                x1, y1 = int(box.x1), int(box.y1)
+                x2, y2 = int(box.x2), int(box.y2)
+                box_height = y2 - y1
+                lbl_h = max(int(box_height / 6), 12)
+                fsize = max(int(lbl_h * 0.75), 10)
+                lbl_font = _get_font(fsize)
+                label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
+                color_rgb = _desaturate_color(_get_row_color(box.row_idx), 0.4)
+                _draw_label(draw, label, x1, y1, x2, lbl_h, lbl_font, bg=color_rgb)
+            elif info["status"] == "unmatched":
                 x1, y1 = int(box.x1), int(box.y1)
                 x2, y2 = int(box.x2), int(box.y2)
                 box_height = y2 - y1
@@ -718,8 +733,7 @@ class BboxVisualizer:
         """Get RGB color for a text sign box based on match status."""
         if row_idx not in row_mapping:
             return (128, 128, 128)
-        det_row_idx = row_mapping[row_idx]
-        primary = _get_row_color(det_row_idx)
+        primary = _get_row_color(row_idx)
         if status == "same":
             return primary
         elif status == "diff":
