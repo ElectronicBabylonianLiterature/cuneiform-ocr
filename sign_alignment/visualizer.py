@@ -907,50 +907,128 @@ class CompositeVisualizer:
         self.result = None
 
     def compose(self, images: List[np.ndarray], layout: tuple,
-                titles: List[str] = None, figsize: tuple = None) -> np.ndarray:
+                titles: List[str] = None, figsize: tuple = None,
+                title_height: int = 40, padding: int = 4) -> np.ndarray:
         """
-        Compose multiple BGR images into a grid.
+        Compose multiple BGR images into a grid at full original resolution.
+
+        Images are resized so that each row has uniform height and each column
+        has uniform width, preserving the original pixel data as much as
+        possible.  Titles are rendered with PIL for Unicode support.
 
         Args:
             images: List of BGR images (from .result attributes)
             layout: (rows, cols) grid layout
             titles: Optional list of title strings for each image
-            figsize: Optional matplotlib figsize tuple
+            figsize: Ignored (kept for API compatibility)
+            title_height: Pixel height of the title bar above each cell
+            padding: Pixel gap between cells
 
         Returns:
             Composed BGR image
         """
-        rows, cols = layout
-        if figsize is None:
-            figsize = (cols * 8, rows * 6)
+        n_rows, n_cols = layout
+        t_h = title_height if titles else 0
 
-        fig, axes = plt.subplots(rows, cols, figsize=figsize)
-        if rows == 1 and cols == 1:
-            axes = np.array([[axes]])
-        elif rows == 1:
-            axes = axes[np.newaxis, :]
-        elif cols == 1:
-            axes = axes[:, np.newaxis]
-
-        for idx in range(rows * cols):
-            r, c = divmod(idx, cols)
-            ax = axes[r, c]
+        # --- collect cells (pad missing slots with None) ---
+        cells: List[Optional[np.ndarray]] = []
+        for idx in range(n_rows * n_cols):
             if idx < len(images) and images[idx] is not None:
-                ax.imshow(cv2.cvtColor(images[idx], cv2.COLOR_BGR2RGB))
-                if titles and idx < len(titles) and titles[idx]:
-                    ax.set_title(titles[idx])
-            ax.axis('off')
+                cells.append(images[idx])
+            else:
+                cells.append(None)
 
-        plt.tight_layout()
+        # --- determine uniform cell size per row/col ---
+        # max height per row, max width per column (from original images)
+        row_heights = [0] * n_rows
+        col_widths = [0] * n_cols
+        for idx, cell in enumerate(cells):
+            r, c = divmod(idx, n_cols)
+            if cell is not None:
+                h, w = cell.shape[:2]
+                row_heights[r] = max(row_heights[r], h)
+                col_widths[c] = max(col_widths[c], w)
 
-        # Render figure to numpy array
-        fig.canvas.draw()
-        buf = fig.canvas.buffer_rgba()
-        img_rgba = np.asarray(buf)
-        img_rgb = img_rgba[:, :, :3].copy()
-        plt.close(fig)
+        # fallback for completely empty rows/cols
+        default_h = max(row_heights) if any(row_heights) else 100
+        default_w = max(col_widths) if any(col_widths) else 100
+        row_heights = [h if h > 0 else default_h for h in row_heights]
+        col_widths = [w if w > 0 else default_w for w in col_widths]
 
-        self.result = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        # --- build per-cell images (resize + title bar) ---
+        def _make_cell(cell_img: Optional[np.ndarray], cell_h: int, cell_w: int,
+                       title: Optional[str]) -> np.ndarray:
+            bar = np.ones((t_h, cell_w, 3), dtype=np.uint8) * 255 if t_h > 0 else None
+
+            if cell_img is None:
+                canvas = np.ones((cell_h, cell_w, 3), dtype=np.uint8) * 220
+            else:
+                ch, cw = cell_img.shape[:2]
+                if ch == cell_h and cw == cell_w:
+                    canvas = cell_img.copy()
+                else:
+                    # scale keeping aspect ratio, center on white canvas
+                    scale = min(cell_w / cw, cell_h / ch)
+                    new_w, new_h = int(cw * scale), int(ch * scale)
+                    resized = cv2.resize(cell_img, (new_w, new_h),
+                                         interpolation=cv2.INTER_AREA)
+                    canvas = np.ones((cell_h, cell_w, 3), dtype=np.uint8) * 220
+                    y0 = (cell_h - new_h) // 2
+                    x0 = (cell_w - new_w) // 2
+                    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+
+            if bar is not None:
+                if title:
+                    bar_pil = Image.fromarray(cv2.cvtColor(bar, cv2.COLOR_BGR2RGB))
+                    draw = ImageDraw.Draw(bar_pil)
+                    font = _get_font(max(t_h - 12, 14))
+                    bbox = draw.textbbox((0, 0), title, font=font)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                    tx = (cell_w - tw) // 2
+                    ty = (t_h - th) // 2
+                    draw.text((tx, ty), title, font=font, fill=(0, 0, 0))
+                    bar = cv2.cvtColor(np.array(bar_pil), cv2.COLOR_RGB2BGR)
+                return np.vstack([bar, canvas])
+            return canvas
+
+        # --- assemble grid ---
+        grid_rows = []
+        for r in range(n_rows):
+            row_cells = []
+            for c in range(n_cols):
+                idx = r * n_cols + c
+                title = titles[idx] if titles and idx < len(titles) else None
+                cell_img = _make_cell(cells[idx], row_heights[r], col_widths[c], title)
+                row_cells.append(cell_img)
+            # add horizontal padding between columns
+            if padding > 0 and len(row_cells) > 1:
+                pad_h = row_cells[0].shape[0]
+                pad_col = np.ones((pad_h, padding, 3), dtype=np.uint8) * 255
+                merged = [row_cells[0]]
+                for rc in row_cells[1:]:
+                    merged.append(pad_col)
+                    merged.append(rc)
+                row_img = np.hstack(merged)
+            else:
+                row_img = np.hstack(row_cells)
+            grid_rows.append(row_img)
+
+        # add vertical padding between rows
+        if padding > 0 and len(grid_rows) > 1:
+            total_w = grid_rows[0].shape[1]
+            pad_row = np.ones((padding, total_w, 3), dtype=np.uint8) * 255
+            merged = [grid_rows[0]]
+            for gr in grid_rows[1:]:
+                # ensure same width (can differ by 1 px due to rounding)
+                if gr.shape[1] != total_w:
+                    gr = cv2.resize(gr, (total_w, gr.shape[0]))
+                merged.append(pad_row)
+                merged.append(gr)
+            self.result = np.vstack(merged)
+        else:
+            self.result = np.vstack(grid_rows)
+
         return self.result
 
     def display_result(self, vis_opt: str = "draw", path: str = None):

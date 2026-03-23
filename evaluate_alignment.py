@@ -1,11 +1,11 @@
 """
-Evaluation script for Cuneiform Signs Alignment.
+Evaluation script for Cuneiform Signs Alignment (PSR method).
 
 Computes object-detection-style metrics (mAP, IoU, Precision, Recall)
-by comparing optimized alignment bounding boxes against ground-truth annotations.
+by comparing PSR-optimized alignment bounding boxes against ground-truth annotations.
 
 Also includes a fast coordinate-wise hyperparameter sweep for the
-ElasticChainOptimizer.
+PointSetRegistrationOptimizer.
 """
 
 import json
@@ -16,15 +16,16 @@ import cv2
 import torch
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
+from PIL import Image as PILImage, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 from sign_alignment import (
-    LocalDataSource, EBLAPISource, SignTextParser,
-    CLASSES_ABZ, SignResolver,
+    LocalDataSource, EBLAPISource, SignTextParser, SignAPIResolver,
     ModelConfig, TabletImageDetector, SingleImage,
-    compute_avg_dimensions,
-    match_heatmaps_ncc, transform_gt_to_cropped_region,
-    SubTablet, ElasticChainOptimizer,
+    compute_avg_dimensions, transform_gt_to_cropped_region,
+    match_rows_dp, create_row_mapping, match_signs_in_row_dp,
+    align_text_to_detection_rows,
+    SubTablet, PointSetRegistrationOptimizer,
     BoundingBox, Detection, GroundTruths,
 )
 
@@ -35,35 +36,57 @@ ANNOTATIONS_DIR = os.path.expanduser("~/erc-work-data/data-of-cuneiform-ocr-data
 CONFIG_FILE = "configs/detr.py"
 CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/epoch_1000.pth")
 SCORE_THRESHOLD = 0.5
-SCALE_FACTOR = 10
 EVAL_OUTPUT_DIR = "evaluation_results"
 
-# --- Iteration counts (easy to tweak) ---
-NUM_ITERATIONS_EVAL = 50          # iterations for full evaluation
-NUM_ITERATIONS_SEARCH = 30        # iterations during hyperparameter sweep (fast)
-
 # Number of fragments to evaluate / search
-EVAL_SAMPLE_LIMIT = 10
-SEARCH_SAMPLE_LIMIT = 5           # small subset for fast sweep
+EVAL_SAMPLE_LIMIT = 30
+SEARCH_SAMPLE_LIMIT = 5
 
-# Default optimizer hyperparameters
-DEFAULT_OPTIMIZER_PARAMS = dict(
-    lambda_data=10000.0,
-    lambda_iou=20000.0,
-    lambda_seq=0.05,
-    lambda_smooth=0.15,
-    lambda_anchor=0.05,
-    lambda_size=0.1,
-    alpha_geo=0.0,                # disabled
-    num_iterations=NUM_ITERATIONS_EVAL,
-    lr=5.0,
-)
-
-HEATMAP_METHOD = 'gaussian'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # IoU thresholds for mAP computation
 IOU_THRESHOLDS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+
+# --- DBSCAN / DP matching defaults (fixed during evaluation) ---
+DBSCAN_EPS = 0.4
+DBSCAN_MIN_SAMPLES = 1
+DBSCAN_LAMBDA_WEIGHT = 0.007
+
+ROW_MATCH_SKIP_TEXT_PENALTY = 0.5
+ROW_MATCH_SKIP_DET_PENALTY = 1.0
+ROW_MATCH_SKIP_SMALL_DET_PENALTY = 0.2
+ROW_MATCH_SMALL_DET_THRESHOLD = 1
+ROW_MATCH_SIMILARITY_METHOD = 'jaccard'
+
+SIGN_MATCH_SKIP_TEXT_PENALTY = 0.5
+SIGN_MATCH_SKIP_DET_PENALTY = 2.0
+SIGN_MATCH_MISMATCH_COST = 0.9
+
+ALIGN_MIN_WIDTH_RATIO = 2 / 3
+ALIGN_MAX_WIDTH_RATIO = 4 / 3
+
+# --- Default PSR optimizer hyperparameters ---
+DEFAULT_PSR_PARAMS = dict(
+    sigma_factor=1.5,
+    w_noise=0.1,
+    lambda_data=2.0,
+    lambda_anchor=0.01,
+    lambda_seq=0.1,
+    lambda_height=0.01,
+    lambda_rows=5.0,
+    lambda_boundary=1.0,
+    rows_threshold_ratio_far=1 / 3.0,
+    rows_threshold_ratio_close=2 / 3.0,
+    rows_plateau_far=0.5,
+    rows_plateau_close=1.0,
+    num_iterations=80,
+    lr=1.0,
+    sigma_anneal=True,
+)
+
+# Faster settings for hyperparameter sweep
+SEARCH_PSR_PARAMS = dict(DEFAULT_PSR_PARAMS)
+SEARCH_PSR_PARAMS['num_iterations'] = 40
 
 
 # ============ IoU & Metrics ============
@@ -276,24 +299,23 @@ def compute_per_class_metrics(
     return per_class
 
 
-# ============ Alignment Pipeline (reused from signs_alignment_heatmap.py) ============
+# ============ PSR Alignment Pipeline ============
 
 def run_alignment_pipeline(
     tablet_detector: TabletImageDetector,
     local_source: LocalDataSource,
     api_source: EBLAPISource,
+    sign_resolver: SignAPIResolver,
     fragment_id: str,
-    scale_factor: int = SCALE_FACTOR,
-    method: str = HEATMAP_METHOD,
-    optimizer_params: dict = None,
+    psr_params: dict = None,
     verbose: bool = False,
 ) -> Optional[Dict]:
     """
-    Run the full alignment pipeline for one fragment.
+    Run the full PSR alignment pipeline for one fragment.
     Returns dict with 'preds' (optimized boxes in full img coords) and 'gts'.
     """
-    if optimizer_params is None:
-        optimizer_params = DEFAULT_OPTIMIZER_PARAMS
+    if psr_params is None:
+        psr_params = DEFAULT_PSR_PARAMS
 
     img = local_source.load_image(fragment_id)
     if img is None:
@@ -303,11 +325,23 @@ def run_alignment_pipeline(
     if not gt_boxes:
         return None
 
-    signs_text = api_source.get_signs(fragment_id)
-    if signs_text is None:
+    # Filter out abnormally large GT boxes (e.g. sub-tablet region annotations)
+    areas = [b.width * b.height for b in gt_boxes]
+    mean_area = np.mean(areas)
+    gt_boxes_filtered = [b for b, a in zip(gt_boxes, areas) if a <= mean_area * 5]
+    if verbose and len(gt_boxes_filtered) < len(gt_boxes):
+        print(f"  {fragment_id}: Filtered {len(gt_boxes) - len(gt_boxes_filtered)} "
+              f"oversized GT boxes (mean_area={mean_area:.0f})")
+    gt_boxes = gt_boxes_filtered
+
+    fragment_data = api_source.get_fragment_data(fragment_id)
+    if fragment_data is None:
         return None
 
-    text_lines = SignTextParser.parse_api_signs(signs_text)
+    text_data = fragment_data.get('text', {})
+    text_lines = SignTextParser.parse_text_lines(
+        text_data, filter_broken=True, sign_resolver=sign_resolver
+    )
     if not text_lines:
         return None
 
@@ -318,7 +352,6 @@ def run_alignment_pipeline(
     cropped_images = tablet_detector.get_cropped_images()
     crop_coordinates = tablet_detector.crop_coordinates
     avg_width, avg_height = compute_avg_dimensions(detections)
-    margin = max(avg_width, avg_height)
 
     all_optimized_full: List[BoundingBox] = []
 
@@ -327,67 +360,116 @@ def run_alignment_pipeline(
         if not crop_dets:
             continue
 
-        # Detection SubTablet
+        # 1. Build SubTablets
         sub_det = SubTablet.from_detections(
             img=crop_single.img, detections=crop_dets,
             name="det", avg_width=avg_width, avg_height=avg_height,
         )
-        sub_det.create_heatmap(scale_factor=scale_factor, method=method)
-
-        # Full-text SubTablet
         sub_text = SubTablet.from_text_lines(
             text_lines=text_lines, avg_width=avg_width,
-            avg_height=avg_height, margin=margin,
-            img=None,
-            target_detections=None,
-            align_to_detection_centroid=False,
+            avg_height=avg_height,
+            img=crop_single.img,
+            target_detections=crop_dets,
+            align_to_detection_centroid=True,
             name="text",
         )
-        sub_text.create_heatmap(scale_factor=scale_factor, method=method)
 
-        # NCC
-        _, match_score, top_left_original = match_heatmaps_ncc(
-            sub_det.heatmap, sub_text.heatmap, scale_factor=scale_factor,
+        # 2. DBSCAN row detection
+        num_rows = sub_det.detect_rows(
+            eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES,
+            lambda_weight=DBSCAN_LAMBDA_WEIGHT,
         )
-        tx, ty = top_left_original
-        eh, ew = crop_single.img.shape[:2]
+        if num_rows == 0:
+            continue
 
-        # Extract aligned region
-        sub_aligned = sub_text.extract_sub_region(
-            offset_x=tx, offset_y=ty, width=ew, height=eh,
-            img=crop_single.img, name="aligned",
+        # 3. Row-level DP matching
+        det_row_seqs = sub_det.get_row_sign_sequences()
+        text_row_seqs = sub_text.get_row_sign_sequences()
+
+        matches, _ = match_rows_dp(
+            detection_rows=det_row_seqs,
+            text_rows=text_row_seqs,
+            skip_text_penalty=ROW_MATCH_SKIP_TEXT_PENALTY,
+            skip_det_penalty=ROW_MATCH_SKIP_DET_PENALTY,
+            skip_small_det_penalty=ROW_MATCH_SKIP_SMALL_DET_PENALTY,
+            small_det_threshold=ROW_MATCH_SMALL_DET_THRESHOLD,
+            similarity_method=ROW_MATCH_SIMILARITY_METHOD,
         )
-        sub_aligned.create_heatmap(
-            scale_factor=scale_factor, img_shape=crop_single.img.shape, method=method,
+        if not matches:
+            continue
+
+        text_to_det, _ = create_row_mapping(
+            matches, len(text_row_seqs), len(det_row_seqs)
         )
 
-        # Optimize
-        prior_ar = avg_width / avg_height if avg_height > 0 else 1.0
-        opt = ElasticChainOptimizer(
-            sub_tablet_text=sub_aligned,
-            detection_heatmap=sub_det.heatmap,
-            detection_boxes=crop_dets,
-            scale_factor=scale_factor,
-            lambda_data=optimizer_params.get('lambda_data', 10000.0),
-            lambda_iou=optimizer_params.get('lambda_iou', 500.0),
-            lambda_seq=optimizer_params.get('lambda_seq', 0.05),
-            lambda_smooth=optimizer_params.get('lambda_smooth', 0.15),
-            lambda_anchor=optimizer_params.get('lambda_anchor', 0.05),
-            lambda_size=optimizer_params.get('lambda_size', 0.1),
-            alpha_geo=optimizer_params.get('alpha_geo', 0.0),
-            prior_aspect_ratio=prior_ar,
+        # 4. Sign-level DP matching
+        row_sign_matches = {}
+        for text_row_idx, det_row_idx in matches:
+            sign_matches, _ = match_signs_in_row_dp(
+                detection_signs=det_row_seqs[det_row_idx],
+                text_signs=text_row_seqs[text_row_idx],
+                skip_text_penalty=SIGN_MATCH_SKIP_TEXT_PENALTY,
+                skip_det_penalty=SIGN_MATCH_SKIP_DET_PENALTY,
+                mismatch_cost=SIGN_MATCH_MISMATCH_COST,
+            )
+            row_sign_matches[text_row_idx] = sign_matches
+
+        # 5. Coarse alignment
+        det_rows = sub_det.get_rows_dict()
+        text_rows = sub_text.get_rows_dict()
+
+        aligned_boxes = align_text_to_detection_rows(
+            det_rows=det_rows,
+            text_rows=text_rows,
+            text_to_det=text_to_det,
+            row_sign_matches=row_sign_matches,
+            avg_width=avg_width,
+            avg_height=avg_height,
+            min_width_ratio=ALIGN_MIN_WIDTH_RATIO,
+            max_width_ratio=ALIGN_MAX_WIDTH_RATIO,
+        )
+        if not aligned_boxes:
+            continue
+
+        sub_optim = SubTablet(
+            sign_boxes=aligned_boxes,
+            img=crop_single.img,
+            name="optim",
+            avg_width=avg_width,
+            avg_height=avg_height,
+        )
+
+        # 6. PSR optimization
+        sigma = avg_width * psr_params.get('sigma_factor', 1.5)
+        optimizer = PointSetRegistrationOptimizer(
+            sub_tablet_text=sub_optim,
+            target_detections=crop_dets,
+            sigma=sigma,
+            w_noise=psr_params.get('w_noise', 0.1),
+            lambda_data=psr_params.get('lambda_data', 2.0),
+            lambda_anchor=psr_params.get('lambda_anchor', 0.01),
+            lambda_seq=psr_params.get('lambda_seq', 0.1),
+            lambda_height=psr_params.get('lambda_height', 0.01),
+            lambda_rows=psr_params.get('lambda_rows', 5.0),
+            lambda_boundary=psr_params.get('lambda_boundary', 1.0),
+            rows_threshold_ratio_far=psr_params.get('rows_threshold_ratio_far', 1 / 3.0),
+            rows_threshold_ratio_close=psr_params.get('rows_threshold_ratio_close', 2 / 3.0),
+            rows_plateau_far=psr_params.get('rows_plateau_far', 0.5),
+            rows_plateau_close=psr_params.get('rows_plateau_close', 1.0),
+            contour_mask=crop_single.mask if hasattr(crop_single, 'mask') else None,
             device=DEVICE,
         )
-        sub_opt = opt.optimize(
-            num_iterations=optimizer_params.get('num_iterations', 100),
-            lr=optimizer_params.get('lr', 5.0),
+        sub_final = optimizer.optimize(
+            num_iterations=psr_params.get('num_iterations', 80),
+            lr=psr_params.get('lr', 1.0),
+            sigma_anneal=psr_params.get('sigma_anneal', True),
             verbose=False,
         )
 
         # Transform to full image coords
         ox = crop_coordinates[idx]['x']
         oy = crop_coordinates[idx]['y']
-        for sb in sub_opt.sign_boxes:
+        for sb in sub_final.sign_boxes:
             all_optimized_full.append(BoundingBox(
                 x1=sb.x1 + ox, y1=sb.y1 + oy,
                 x2=sb.x2 + ox, y2=sb.y2 + oy,
@@ -402,7 +484,148 @@ def run_alignment_pipeline(
         'preds': all_optimized_full,
         'gts': gt_boxes,
         'detections': detections,
+        'img': img,
     }
+
+
+# ============ Evaluation Visualization ============
+
+def _get_eval_font(size: int):
+    """Load font for evaluation annotations."""
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+    except Exception:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
+        except Exception:
+            return ImageFont.load_default()
+
+
+def visualize_evaluation_fragment(
+    img: np.ndarray,
+    fragment_id: str,
+    preds: Detection,
+    gts: GroundTruths,
+    iou_threshold: float = 0.5,
+    class_agnostic: bool = True,
+    output_dir: str = EVAL_OUTPUT_DIR,
+):
+    """
+    Visualize evaluation results for a single fragment.
+
+    Draws semi-transparent filled boxes:
+      - Green:   matched GT and pred boxes (TP)
+      - Orange:  false positive pred boxes (FP)
+      - Magenta: missed GT boxes (FN)
+
+    Annotates per-image evaluation metrics at the top of the image.
+    """
+    match_result = match_predictions_to_gt(
+        preds, gts, iou_threshold=iou_threshold, class_agnostic=class_agnostic
+    )
+
+    tp = match_result['tp']
+    fp = match_result['fp']
+    fn = match_result['fn']
+    precision, recall = compute_precision_recall(tp, fp, fn)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    mean_iou = float(np.mean(match_result['matched_ious'])) if match_result['matched_ious'] else 0.0
+
+    matched_pred_idxs = {pi for pi, gj in match_result['matched_pairs']}
+    matched_gt_idxs = {gj for pi, gj in match_result['matched_pairs']}
+
+    # Colors in BGR
+    GREEN = (0, 200, 0)
+    ORANGE = (0, 165, 255)
+    MAGENTA = (255, 0, 255)
+    alpha = 0.3
+
+    # --- Step 1: Draw semi-transparent fills on overlay ---
+    overlay = img.copy()
+
+    for gj in matched_gt_idxs:
+        box = gts[gj]
+        cv2.rectangle(overlay, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), GREEN, -1)
+    for pi in matched_pred_idxs:
+        box = preds[pi]
+        cv2.rectangle(overlay, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), GREEN, -1)
+    for pi, box in enumerate(preds):
+        if pi not in matched_pred_idxs:
+            cv2.rectangle(overlay, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), ORANGE, -1)
+    for gj, box in enumerate(gts):
+        if gj not in matched_gt_idxs:
+            cv2.rectangle(overlay, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), MAGENTA, -1)
+
+    # --- Step 2: Blend ---
+    vis_img = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
+
+    # --- Step 3: Draw crisp outlines on top ---
+    for gj in matched_gt_idxs:
+        box = gts[gj]
+        cv2.rectangle(vis_img, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), GREEN, 2)
+    for pi in matched_pred_idxs:
+        box = preds[pi]
+        cv2.rectangle(vis_img, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), GREEN, 2)
+    for pi, box in enumerate(preds):
+        if pi not in matched_pred_idxs:
+            cv2.rectangle(vis_img, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), ORANGE, 2)
+    for gj, box in enumerate(gts):
+        if gj not in matched_gt_idxs:
+            cv2.rectangle(vis_img, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), MAGENTA, 2)
+
+    # --- Step 4: Build text banner ---
+    h, w = vis_img.shape[:2]
+    font_scale = max(w / 1200.0, 0.8)
+    font_title_size = int(22 * font_scale)
+    font_text_size = int(18 * font_scale)
+    font_legend_size = int(16 * font_scale)
+    line_h = int(26 * font_scale)
+    banner_height = line_h * 4 + 10
+
+    banner = np.ones((banner_height, w, 3), dtype=np.uint8) * 255
+    result_img = np.vstack([banner, vis_img])
+
+    # Render text with PIL (Unicode-safe)
+    result_pil = PILImage.fromarray(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(result_pil)
+    font_title = _get_eval_font(font_title_size)
+    font_text = _get_eval_font(font_text_size)
+    font_legend = _get_eval_font(font_legend_size)
+
+    y = 5
+    draw.text((10, y), f"Fragment: {fragment_id}    IoU threshold: {iou_threshold}",
+              font=font_title, fill=(0, 0, 0))
+    y += line_h
+    draw.text((10, y),
+              f"GT: {len(gts)}    Pred: {len(preds)}    TP: {tp}    FP: {fp}    FN: {fn}",
+              font=font_text, fill=(0, 0, 0))
+    y += line_h
+    draw.text((10, y),
+              f"Precision: {precision:.4f}    Recall: {recall:.4f}    "
+              f"F1: {f1:.4f}    Mean IoU: {mean_iou:.4f}",
+              font=font_text, fill=(0, 0, 0))
+    y += line_h
+
+    # Legend
+    sq = int(14 * font_scale)
+    gap = int(10 * font_scale)
+    lx = 10
+    draw.rectangle([lx, y, lx + sq, y + sq], fill=(0, 200, 0))
+    draw.text((lx + sq + 4, y - 2), "Match (TP)", font=font_legend, fill=(0, 0, 0))
+    lx += int(120 * font_scale)
+    draw.rectangle([lx, y, lx + sq, y + sq], fill=(255, 165, 0))
+    draw.text((lx + sq + 4, y - 2), "FP (pred)", font=font_legend, fill=(0, 0, 0))
+    lx += int(120 * font_scale)
+    draw.rectangle([lx, y, lx + sq, y + sq], fill=(255, 0, 255))
+    draw.text((lx + sq + 4, y - 2), "Miss (GT)", font=font_legend, fill=(0, 0, 0))
+
+    result_img = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+
+    # --- Save ---
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, f"{fragment_id}_eval_IoU{int(iou_threshold * 100)}.jpg")
+    cv2.imwrite(save_path, result_img)
+    print(f"  Saved evaluation visualization: {save_path}")
 
 
 # ============ Evaluation Runner ============
@@ -411,10 +634,13 @@ def run_evaluation(
     tablet_detector: TabletImageDetector,
     local_source: LocalDataSource,
     api_source: EBLAPISource,
+    sign_resolver: SignAPIResolver,
     fragment_ids: List[str],
-    optimizer_params: dict = None,
+    psr_params: dict = None,
     verbose: bool = True,
     label: str = "",
+    visualize: bool = False,
+    output_dir: str = EVAL_OUTPUT_DIR,
 ) -> Dict:
     """
     Run evaluation on a list of fragments.
@@ -422,27 +648,45 @@ def run_evaluation(
     Returns:
         Dict with mAP, per-threshold results, per-class results, and per-fragment details.
     """
-    if optimizer_params is None:
-        optimizer_params = DEFAULT_OPTIMIZER_PARAMS
+    if psr_params is None:
+        psr_params = DEFAULT_PSR_PARAMS
 
     all_results = []
     skipped = 0
 
     for i, fid in enumerate(fragment_ids):
-        if verbose and (i % 10 == 0 or i == len(fragment_ids) - 1):
+        if verbose and (i % 5 == 0 or i == len(fragment_ids) - 1):
             print(f"  [{label}] Processing {i+1}/{len(fragment_ids)}: {fid}")
 
         result = run_alignment_pipeline(
             tablet_detector=tablet_detector,
             local_source=local_source,
             api_source=api_source,
+            sign_resolver=sign_resolver,
             fragment_id=fid,
-            optimizer_params=optimizer_params,
+            psr_params=psr_params,
             verbose=verbose,
         )
         if result is None:
             skipped += 1
             continue
+
+        # Visualize before discarding the image
+        if visualize:
+            img = result.pop('img', None)
+            if img is not None:
+                visualize_evaluation_fragment(
+                    img=img,
+                    fragment_id=fid,
+                    preds=result['preds'],
+                    gts=result['gts'],
+                    iou_threshold=0.5,
+                    class_agnostic=False,
+                    output_dir=output_dir,
+                )
+        else:
+            result.pop('img', None)
+
         all_results.append(result)
 
     if not all_results:
@@ -458,11 +702,11 @@ def run_evaluation(
     # --- Per-class at IoU=0.5 ---
     per_class = compute_per_class_metrics(all_results, iou_threshold=0.5)
 
-    # --- Aggregate IoU stats ---
+    # --- Aggregate IoU stats (class-aware) ---
     all_matched_ious = []
     for fr in all_results:
         m = match_predictions_to_gt(fr['preds'], fr['gts'], iou_threshold=0.5,
-                                    class_agnostic=True)
+                                    class_agnostic=False)
         all_matched_ious.extend(m['matched_ious'])
 
     mean_iou = float(np.mean(all_matched_ious)) if all_matched_ious else 0.0
@@ -472,7 +716,7 @@ def run_evaluation(
         'label': label,
         'num_fragments': len(all_results),
         'skipped': skipped,
-        'optimizer_params': optimizer_params,
+        'psr_params': {k: v for k, v in psr_params.items()},
         'class_agnostic': {
             'mAP': map_agnostic['mAP'],
             'AP@0.5': map_agnostic['AP@0.5'],
@@ -561,6 +805,7 @@ def _eval_score(
     tablet_detector: TabletImageDetector,
     local_source: LocalDataSource,
     api_source: EBLAPISource,
+    sign_resolver: SignAPIResolver,
     fragment_ids: List[str],
     params: dict,
 ) -> float:
@@ -569,8 +814,9 @@ def _eval_score(
         tablet_detector=tablet_detector,
         local_source=local_source,
         api_source=api_source,
+        sign_resolver=sign_resolver,
         fragment_ids=fragment_ids,
-        optimizer_params=params,
+        psr_params=params,
         verbose=False,
         label="sweep",
     )
@@ -583,40 +829,39 @@ def hyperparameter_search(
     tablet_detector: TabletImageDetector,
     local_source: LocalDataSource,
     api_source: EBLAPISource,
+    sign_resolver: SignAPIResolver,
     fragment_ids: List[str],
     output_dir: str = EVAL_OUTPUT_DIR,
 ) -> Dict:
     """
-    Fast coordinate-wise (one-parameter-at-a-time) hyperparameter sweep.
+    Fast coordinate-wise (one-parameter-at-a-time) hyperparameter sweep
+    for the PointSetRegistrationOptimizer.
 
-    For each parameter, sweep candidate values while keeping all other
-    parameters at their current best.  This reduces the search from
-    O(product of grid sizes) to O(sum of grid sizes), making it orders
-    of magnitude faster than a full grid search.
+    Sweeps PSR-specific parameters: lambda_data, lambda_anchor, lambda_seq,
+    lambda_height, lambda_rows, lambda_boundary, sigma_factor, w_noise.
 
-    The procedure runs two rounds to allow parameters to adapt to each
-    other's updated values.
+    Runs two rounds to allow parameters to adapt to each other.
     """
-    # Candidate values for each tunable parameter
     search_axes = {
-        'lambda_data':   [1000.0, 5000.0, 10000.0, 50000.0],
-        'lambda_iou':    [0.0, 500.0, 5000.0, 20000.0],
-        'lambda_seq':    [0.01, 0.05, 0.2],
-        'lambda_smooth': [0.05, 0.15, 0.5],
-        'lambda_anchor': [0.01, 0.05, 0.2],
-        'lambda_size':   [0.0, 0.05, 0.1, 0.5, 1.0],
+        'lambda_data':     [0.5, 1.0, 2.0, 5.0, 10.0],
+        'lambda_anchor':   [0.005, 0.01, 0.05, 0.1],
+        'lambda_seq':      [0.01, 0.05, 0.1, 0.5],
+        'lambda_height':   [0.0, 0.005, 0.01, 0.05],
+        'lambda_rows':     [1.0, 2.0, 5.0, 10.0],
+        'lambda_boundary': [0.0, 0.5, 1.0, 5.0],
+        'sigma_factor':    [1.0, 1.5, 2.0, 2.5],
+        'w_noise':         [0.05, 0.1, 0.2],
     }
 
-    # Start from defaults (use fast iteration count for searching)
-    best_params = dict(DEFAULT_OPTIMIZER_PARAMS)
-    best_params['num_iterations'] = NUM_ITERATIONS_SEARCH
+    # Start from defaults with reduced iterations for speed
+    best_params = dict(SEARCH_PSR_PARAMS)
 
     total_evals = 2 * sum(len(v) for v in search_axes.values())
     print(f"Coordinate-wise sweep: {total_evals} evaluations "
           f"(2 rounds × {sum(len(v) for v in search_axes.values())} candidates)")
 
     best_score = _eval_score(tablet_detector, local_source, api_source,
-                             fragment_ids, best_params)
+                             sign_resolver, fragment_ids, best_params)
     print(f"  Baseline mAP = {best_score:.4f}")
 
     all_search_results = []
@@ -638,7 +883,7 @@ def hyperparameter_search(
 
                 t0 = time.time()
                 score = _eval_score(tablet_detector, local_source, api_source,
-                                    fragment_ids, trial)
+                                    sign_resolver, fragment_ids, trial)
                 elapsed = time.time() - t0
 
                 entry = {
@@ -668,8 +913,8 @@ def hyperparameter_search(
             else:
                 print(f"  >> {key} stays at {old_val}")
 
-    # Restore full iteration count
-    best_params['num_iterations'] = NUM_ITERATIONS_EVAL
+    # Restore full iteration count for final params
+    best_params['num_iterations'] = DEFAULT_PSR_PARAMS['num_iterations']
 
     # Sort results
     all_search_results.sort(key=lambda x: -x['mAP'])
@@ -699,12 +944,13 @@ def hyperparameter_search(
 # ============ Main ============
 
 if __name__ == "__main__":
-    print("Cuneiform Signs Alignment - Evaluation & Hyperparameter Sweep")
+    print("Cuneiform Signs Alignment - Evaluation & Hyperparameter Sweep (PSR)")
     print("=" * 60)
 
     # Data sources
     local_source = LocalDataSource(ANNOTATIONS_DIR)
     api_source = EBLAPISource()
+    sign_resolver = SignAPIResolver()
 
     fragments = local_source.get_available_fragments()
     print(f"Found {len(fragments)} fragments with both image and annotation")
@@ -728,18 +974,21 @@ if __name__ == "__main__":
 
     # --- STEP 1: Full evaluation with default params ---
     print(f"\n{'='*60}")
-    print(f"STEP 1: Evaluation with default parameters ({len(eval_fragments)} fragments)")
-    print(f"  num_iterations = {NUM_ITERATIONS_EVAL}")
+    print(f"STEP 1: Evaluation with default PSR parameters ({len(eval_fragments)} fragments)")
+    print(f"  num_iterations = {DEFAULT_PSR_PARAMS['num_iterations']}")
     print(f"{'='*60}")
 
     eval_result = run_evaluation(
         tablet_detector=tablet_detector,
         local_source=local_source,
         api_source=api_source,
+        sign_resolver=sign_resolver,
         fragment_ids=eval_fragments,
-        optimizer_params=DEFAULT_OPTIMIZER_PARAMS,
+        psr_params=DEFAULT_PSR_PARAMS,
         verbose=True,
         label="default",
+        visualize=True,
+        output_dir=EVAL_OUTPUT_DIR,
     )
     print_eval_summary(eval_result)
 
@@ -749,18 +998,25 @@ if __name__ == "__main__":
         json.dump(eval_save, f, indent=2)
     print(f"Saved to {EVAL_OUTPUT_DIR}/evaluation_default.json")
 
+    ### ---
+    # not to run tunning
+    exit(0)  #
+
+    ### ---
+
     # --- STEP 2: Fast coordinate-wise hyperparameter sweep ---
     search_fragments = eval_fragments[:SEARCH_SAMPLE_LIMIT]
 
     print(f"\n{'='*60}")
     print(f"STEP 2: Coordinate-wise sweep ({len(search_fragments)} fragments, "
-          f"num_iterations = {NUM_ITERATIONS_SEARCH})")
+          f"num_iterations = {SEARCH_PSR_PARAMS['num_iterations']})")
     print(f"{'='*60}")
 
     search_result = hyperparameter_search(
         tablet_detector=tablet_detector,
         local_source=local_source,
         api_source=api_source,
+        sign_resolver=sign_resolver,
         fragment_ids=search_fragments,
         output_dir=EVAL_OUTPUT_DIR,
     )
@@ -768,11 +1024,10 @@ if __name__ == "__main__":
     # --- STEP 3: Re-evaluate with best params on full set ---
     if search_result.get('best_params'):
         best_params = search_result['best_params']
-        best_params['num_iterations'] = NUM_ITERATIONS_EVAL
 
         print(f"\n{'='*60}")
         print(f"STEP 3: Re-evaluation with best params ({len(eval_fragments)} fragments)")
-        print(f"  num_iterations = {NUM_ITERATIONS_EVAL}")
+        print(f"  num_iterations = {best_params['num_iterations']}")
         print(f"  Params: {best_params}")
         print(f"{'='*60}")
 
@@ -780,8 +1035,9 @@ if __name__ == "__main__":
             tablet_detector=tablet_detector,
             local_source=local_source,
             api_source=api_source,
+            sign_resolver=sign_resolver,
             fragment_ids=eval_fragments,
-            optimizer_params=best_params,
+            psr_params=best_params,
             verbose=True,
             label="best_params",
         )
