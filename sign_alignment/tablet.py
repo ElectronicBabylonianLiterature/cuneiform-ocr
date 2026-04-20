@@ -1,8 +1,8 @@
 """
 SubTablet data structures for sign alignment.
 
-Provides SignBox and SubTablet classes for organizing sign bounding boxes,
-generating heatmaps, and performing coordinate transformations.
+Provides SignBox and SubTablet classes for organizing sign bounding boxes
+and performing coordinate transformations.
 """
 
 import numpy as np
@@ -11,11 +11,7 @@ from typing import List, Optional
 
 from .sign import Sign, SignResolver, CLASSES_ABZ
 from .bounding_box import BoundingBox, Detection
-from .heatmap import (
-    create_2d_gaussian, 
-    create_2d_rectangle_blur,
-    compute_avg_dimensions,
-)
+from .heatmap import compute_avg_dimensions
 
 
 @dataclass
@@ -126,11 +122,10 @@ class SignBox:
 @dataclass
 class SubTablet:
     """
-    Represents a sub-tablet region with image, sign boxes, and heatmap.
+    Represents a sub-tablet region with image and sign boxes.
     """
     img: Optional[np.ndarray] = None
     sign_boxes: List[SignBox] = field(default_factory=list)
-    heatmap: Optional[np.ndarray] = None
     
     name: str = ""
     scale_factor: int = 10
@@ -230,64 +225,6 @@ class SubTablet:
                 result.append(translated)
         return result
     
-    def create_heatmap(self, classes_abz: List[str] = None, 
-                       scale_factor: int = None,
-                       img_shape: tuple = None, 
-                       method: str = 'gaussian') -> np.ndarray:
-        """Generate heatmap from sign_boxes."""
-        if classes_abz is None:
-            classes_abz = CLASSES_ABZ
-        if scale_factor is None:
-            scale_factor = self.scale_factor
-        else:
-            self.scale_factor = scale_factor
-        
-        if img_shape is not None:
-            img_height, img_width = img_shape[:2]
-        elif self.img is not None:
-            img_height, img_width = self.img.shape[:2]
-        else:
-            height, width = self.shape
-            img_height, img_width = height, width
-        
-        num_classes = len(classes_abz)
-        heatmap_height = img_height // scale_factor
-        heatmap_width = img_width // scale_factor
-        heatmap = np.zeros((heatmap_height, heatmap_width, num_classes), dtype=np.float32)
-        
-        for sb in self.sign_boxes:
-            if sb.abz_name in classes_abz:
-                class_id = classes_abz.index(sb.abz_name)
-            else:
-                continue
-            
-            center_x = sb.cx / scale_factor
-            center_y = sb.cy / scale_factor
-            
-            if method == 'gaussian':
-                sigma_x = sb.width * 4 / scale_factor / 3
-                sigma_y = sb.height * 4 / scale_factor / 3
-                response = create_2d_gaussian(center_x, center_y,
-                                              heatmap_width, heatmap_height,
-                                              sigma_x, sigma_y,
-                                              avg_width=self.avg_width / scale_factor,
-                                              avg_height=self.avg_height / scale_factor)
-            elif method == 'rectangle_blur':
-                bbox_w_scaled = sb.width / scale_factor
-                bbox_h_scaled = sb.height / scale_factor
-                sigma_blur = (bbox_w_scaled + bbox_h_scaled) / 4
-                response = create_2d_rectangle_blur(center_x, center_y,
-                                                    heatmap_width, heatmap_height,
-                                                    bbox_w_scaled, bbox_h_scaled,
-                                                    sigma_blur=sigma_blur)
-            else:
-                raise ValueError(f"Unknown method: {method}")
-            
-            heatmap[:, :, class_id] = np.maximum(heatmap[:, :, class_id], response)
-        
-        self.heatmap = heatmap
-        return heatmap
-    
     def extract_sub_region(self, offset_x: float, offset_y: float,
                            width: float, height: float,
                            img: np.ndarray = None,
@@ -306,7 +243,6 @@ class SubTablet:
         return SubTablet(
             img=self.img.copy() if self.img is not None else None,
             sign_boxes=[sb.copy() for sb in self.sign_boxes],
-            heatmap=self.heatmap.copy() if self.heatmap is not None else None,
             name=self.name, scale_factor=self.scale_factor,
             avg_width=self.avg_width, avg_height=self.avg_height,
             margin=self.margin, origin_x=self.origin_x, origin_y=self.origin_y
@@ -407,8 +343,7 @@ class SubTablet:
         num_signs = len(self.sign_boxes)
         num_rows = len(self.get_rows())
         img_shape = self.img.shape if self.img is not None else None
-        heatmap_shape = self.heatmap.shape if self.heatmap is not None else None
         return (f"SubTablet '{self.name}':\n"
                 f"  {num_signs} signs, {num_rows} rows, \n"
-                f"  image shape: {img_shape}, heatmap shape: {heatmap_shape}"
+                f"  image shape: {img_shape}"
                 f"\n  avg_width: {self.avg_width:.2f}, avg_height: {self.avg_height:.2f}")

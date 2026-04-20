@@ -38,21 +38,13 @@ from .detector import (
 from .visualizer import (
     BboxVisualizer,
     TextVisualizer,
-    HeatmapVisualizer,
     CompositeVisualizer,
     build_sign_match_info,
 )
 
 from .heatmap import (
-    create_2d_gaussian,
-    create_2d_rectangle_blur,
-    create_detection_heatmap,
-    create_text_heatmap,
-    match_heatmaps_ncc,
     compute_avg_dimensions,
-    group_detections_into_lines,
     transform_gt_to_cropped_region,
-    create_text_based_detections,
 )
 
 from data_processing.line_process import (
@@ -68,11 +60,6 @@ from data_processing.line_process import (
 from .tablet import (
     SignBox,
     SubTablet,
-)
-
-from .optimizer import (
-    ElasticChainOptimizer,
-    build_agnostic_heatmap,
 )
 
 from .psr_optimizer import (
@@ -111,18 +98,12 @@ __all__ = [
     # Visualization
     'BboxVisualizer',
     'TextVisualizer',
-    'HeatmapVisualizer',
+    'CompositeVisualizer',
+    'build_sign_match_info',
     
-    # Heatmap utilities
-    'create_2d_gaussian',
-    'create_2d_rectangle_blur',
-    'create_detection_heatmap',
-    'create_text_heatmap',
-    'match_heatmaps_ncc',
+    # Geometry utilities
     'compute_avg_dimensions',
-    'group_detections_into_lines',
     'transform_gt_to_cropped_region',
-    'create_text_based_detections',
     
     # Line/row processing
     'detect_rows_dbscan',
@@ -136,10 +117,6 @@ __all__ = [
     # Tablet data structures
     'SignBox',
     'SubTablet',
-    
-    # Optimization
-    'ElasticChainOptimizer',
-    'build_agnostic_heatmap',
     
     # PSR Optimization
     'PointSetRegistrationOptimizer',
