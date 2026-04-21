@@ -1,3 +1,5 @@
+from attr import dataclass
+from enum import Enum
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,6 +9,10 @@ from typing import List, Optional, Callable
 from .bounding_box import BoundingBox, Detection
 from .tablet import SignBox
 
+class ColorConfig(Enum):
+    GT_COLOR = (0, 255, 0)    # Green for GT
+    DET_COLOR = (255, 0, 0)   # Red for Detected
+    OPTIM_COLOR = (0, 255, 255)  # cyan for Optimized
 
 class BboxVisualizer:
     """Visualize bounding boxes on images."""
