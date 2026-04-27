@@ -65,6 +65,7 @@ class PipelineTools:
 class SampleState:
     """All intermediate results for a single fragment, including SubTablets."""
 
+    fragments: list = None # all available fragments (populated at Runner init)
     fragment_id: str = None
 
     # full-image data
@@ -171,6 +172,7 @@ class Runner:
 
         fragments = context.local_source.get_available_fragments()
         self._fragments = fragments
+        context.state.fragments = fragments
         print(f"Found {len(fragments)} fragments with both image and annotation")
 
         if vis.save:
@@ -190,6 +192,10 @@ class Runner:
         fragment_id = self._fragments[idx]
         print(f"Processing sample: {fragment_id}")
         self.context.fragment_id = fragment_id
+
+    def choose_crop(self, crop_idx: int):
+        print(f"Choosing crop index {crop_idx} for sub-image")
+        self.context.config.img_idx = crop_idx
 
 
 # ---------------------------------------------------------------------------
