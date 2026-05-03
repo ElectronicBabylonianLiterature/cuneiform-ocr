@@ -1,31 +1,25 @@
 """
 ProtoSnap center-freeze refiner.
 
-This module is the *redesigned* ProtoSnap integration. It is no longer a
-"replace bbox geometry" stage; it is a **center-only correction + freeze**
-component, callable either before PSR optimization (once) or as a
-mid-iteration hook during PSR.
+This module integrates TAU-VAILab/ProtoSnap (arXiv:2502.00129) as a
+**center-only correction + freeze** component for the PSR optimizer.
+It directly reuses ProtoSnap's Stage-1 init code (SD-DIFT best-buddies +
+RANSAC affine) by importing from the cloned repo via sys.path.
 
-Pipeline owns *when*; this module owns *how*.
-
-Stage decomposition (cf. TAU-VAILab/ProtoSnap, arXiv:2502.00129):
-    - Stage 1 ("init"):  global affine prototype -> target via DIFT/SIFT
-                         best-buddies + RANSAC. We use ONLY this stage.
+Stage decomposition:
+    - Stage 1 ("init"):  global affine prototype -> target via SD-DIFT
+                         best-buddies + RANSAC. This is the only stage used.
     - Stage 2 ("optim"): per-stroke skeleton optimization. Discarded here
                          because PSR already optimizes (cx, cy, w, h).
 
-What this module produces, per sign, is a `CenterRefinement`:
-    - implied new (cx, cy) computed by mapping the prototype center under
-      the affine and shifting from the crop frame back to sub-image coords;
-    - an `accepted` flag from the multi-criteria gate (see `default_gate`);
+Per sign, produces a `CenterRefinement`:
+    - new (cx, cy) computed by mapping the prototype center under the affine
+      and converting from crop frame back to sub-image coords;
+    - an `accepted` flag from the multi-criteria gate (`default_gate`);
     - diagnostic info (inliers, reproj error, scale, det, etc.).
 
-Two estimators are provided:
-    - `OpenCVAffineEstimator`  (default, no GPU/SD weights required)
-    - `OfficialProtoSnapInitEstimator` (stub; wire to TAU-VAILab/ProtoSnap)
-
-The transform estimator is a `Protocol`, so swapping is a one-line config
-change once the official model is wired up.
+The SD model (SDFeaturizer) is pre-loaded once via `load_dift_model()` and
+cached on `CropContext._snap_dift` across all samples in a session.
 """
 
 from __future__ import annotations
@@ -93,7 +87,7 @@ class SnapStatus(str, Enum):
     NO_PROTOTYPE = "no_prototype"      # ABZ -> Unicode missing or PNG missing
     UNCLEAR_SIGN = "unclear_sign"      # 'X' / 'NoABZ0'
     OUT_OF_BOUNDS = "out_of_bounds"    # crop fell outside sub-image
-    NO_FEATURES = "no_features"        # SIFT found nothing on crop or prototype
+    NO_FEATURES = "no_features"        # DIFT found no usable best-buddy pairs
     LOW_MATCHES = "low_matches"        # too few putative matches for RANSAC
     BAD_TRANSFORM = "bad_transform"    # gate rejected: degenerate affine / huge offset
     LOW_INLIERS = "low_inliers"        # gate rejected: inlier ratio / count too low
@@ -138,11 +132,7 @@ class CenterRefinement:
 
 @dataclass
 class GateConfig:
-    """Multi-criteria gate (G2 + G3 + offset sanity).
-
-    Defaults are tuned for SIFT/RANSAC on cuneiform-sized crops; tighten
-    if you swap in DIFT (which produces denser, cleaner matches).
-    """
+    """Multi-criteria gate (G2 + G3 + offset sanity)."""
     min_inliers: int = 5
     min_inlier_ratio: float = 0.30
     max_reproj_err_ratio: float = 0.25  # × max(crop_w, crop_h)
@@ -168,19 +158,9 @@ class ProtoSnapConfig:
 
     # Crop padding around bbox: pad_pixels = ratio * max(bbox.w, bbox.h)
     crop_padding_ratio: float = 0.1
-    # Resize crop+prototype to this size before feature matching (pixels,
-    # longest side). None disables resizing.
-    feature_img_size: Optional[int] = 256
     # Pixels of white re-padding added after tight-cropping the prototype PNG.
     # Mirrors the official ProtoSnap pipeline (crop white → pad 10 → resize).
-    # Set to 0 to disable tight-crop entirely.
     proto_pad: int = 10
-
-    # Estimator selection: "opencv" or "official_protosnap".
-    estimator: str = "opencv"
-    # When using OpenCV: SIFT (default) or ORB. SIFT is more reliable; if
-    # cv2.SIFT_create raises, we fall back to ORB.
-    opencv_feature: str = "sift"
 
     # Gate settings
     gate: GateConfig = field(default_factory=GateConfig)
@@ -188,6 +168,17 @@ class ProtoSnapConfig:
     # When ProtoSnap is invoked as a mid-PSR hook, freeze at this iteration.
     # `0` reproduces "run once before optimization starts".
     snap_at_iter: int = 10
+
+    # Number of DIFT noise realizations to try when using official_protosnap.
+    # Best hull-score pick is used. Keep at 1 for speed.
+    init_tries: int = 1
+
+    # Fraction of sign boxes to run ProtoSnap on per SubTablet.
+    # Signs are sampled evenly (every N-th). At least min_snap_signs signs
+    # are always processed regardless of ratio.
+    # Use 1.0 to process all signs (slow).
+    sample_ratio: float = 0.05
+    min_snap_signs: int = 5
 
     log_failures: bool = True
 
@@ -318,190 +309,229 @@ class PrototypeBank:
 
 
 # ===========================================================================
-# Transform estimators (Stage-1 init)
+# Transform estimator (Stage-1 init)
 # ===========================================================================
 
 class TransformEstimator(Protocol):
-    """Estimate a global affine: prototype-frame -> crop-frame.
-
-    Implementations must be deterministic given the same RNG seed (we set
-    cv2.setRNGSeed in OpenCVAffineEstimator).
-    """
+    """Estimate a global affine: prototype-frame -> crop-frame."""
     def estimate(
-        self, crop: np.ndarray, prototype: np.ndarray
+        self, crop: np.ndarray, prototype: np.ndarray, sign_name: str = ""
     ) -> Optional[InitTransform]: ...
 
 
-class OpenCVAffineEstimator:
-    """SIFT (or ORB) + RANSAC partial-affine.
+class DiftAffineEstimator:
+    """Stage-1 affine estimator using ProtoSnap's SD-DIFT features.
 
-    Uses `cv2.estimateAffinePartial2D` (4 DoF: rotation+uniform-scale+
-    translation), which is robust on small crops where full 6-DoF affine
-    over-fits noise. Outputs the partial affine as a 2x3 matrix.
+    Directly reuses ProtoSnap code via sys.path insertion — imports
+    ``src.dift.DiftWrapper``, ``src.initialization.get_best_buddies`` and
+    ``src.initialization.estimate_affine`` from repo_root.
+
+    The SDFeaturizer (dift) must be pre-loaded externally and passed here;
+    loading takes ~30 s on first call, so the caller caches it on CropContext
+    across samples via ``load_dift_model()`` / ``context._snap_dift``.
     """
 
-    def __init__(self, feature: str = "sift", img_size: Optional[int] = 256,
-                 ransac_thr: float = 4.0, ransac_iters: int = 2000):
-        self.feature = feature
+    def __init__(
+        self,
+        dift,                          # pre-loaded SDFeaturizer instance
+        repo_root: str,                # absolute path to ProtoSnap clone
+        img_size: int = 512,
+        init_tries: int = 1,
+        ransac_k: int = 5,
+        ransac_threshold: float = 50.0,
+    ):
+        self.dift = dift
+        self.repo_root = repo_root
         self.img_size = img_size
-        self.ransac_thr = ransac_thr
-        self.ransac_iters = ransac_iters
-        self._detector = self._make_detector(feature)
-        self._matcher = self._make_matcher(feature)
-        cv2.setRNGSeed(0)
+        self.init_tries = init_tries
+        self.ransac_k = ransac_k
+        self.ransac_threshold = ransac_threshold
+        self._import_protosnap()
+
+    def _import_protosnap(self):
+        import sys
+        if self.repo_root not in sys.path:
+            sys.path.insert(0, self.repo_root)
+        from src.dift import DiftWrapper
+        from src.initialization import get_best_buddies, estimate_affine
+        from argparse import Namespace
+        self._DiftWrapper = DiftWrapper
+        self._get_best_buddies = get_best_buddies
+        self._estimate_affine = estimate_affine
+        self._Namespace = Namespace
 
     @staticmethod
-    def _make_detector(feature: str):
-        if feature == "sift":
-            try:
-                return cv2.SIFT_create()
-            except AttributeError:
-                feature = "orb"  # fall through
-        if feature == "orb":
-            return cv2.ORB_create(nfeatures=2000)
-        raise ValueError(f"unknown feature {feature}")
+    def _to_pil_rgb(img: np.ndarray):
+        from PIL import Image as _PIL
+        if img.ndim == 2:
+            return _PIL.fromarray(img).convert("RGB")
+        return _PIL.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
-    @staticmethod
-    def _make_matcher(feature: str):
-        if feature == "sift":
-            return cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-        return cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    def _run_one(self, proto_pil, crop_pil, sign_name: str):
+        """One DIFT feature extraction + best-buddies + RANSAC attempt.
 
-    @staticmethod
-    def _to_gray(img: np.ndarray) -> np.ndarray:
-        if img.ndim == 3:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        return img
+        Returns (H_512, bbs, inliers) where H_512 is the affine in 512-pixel
+        space (proto -> crop), or (None, [], []) on failure.
+        """
+        args = self._Namespace(prompt=sign_name, img_size=self.img_size)
+        wrapper = self._DiftWrapper(args, self.dift)
+        sim_tensor = wrapper.get_similaritity_tensor(proto_pil, crop_pil)
 
-    def _resize(self, img: np.ndarray) -> Tuple[np.ndarray, float]:
-        if not self.img_size:
-            return img, 1.0
-        h, w = img.shape[:2]
-        long_side = max(h, w)
-        if long_side <= self.img_size:
-            return img, 1.0
-        scale = self.img_size / long_side
-        new = cv2.resize(img, (int(round(w * scale)), int(round(h * scale))),
-                         interpolation=cv2.INTER_AREA)
-        return new, scale
+        bbs = self._get_best_buddies(sim_tensor, self.img_size)
+        if len(bbs) < self.ransac_k:
+            return None, bbs, np.array([], dtype=int)
 
-    def estimate(self, crop: np.ndarray, prototype: np.ndarray
-                 ) -> Optional[InitTransform]:
-        crop_gray = self._to_gray(crop)
-        proto_gray = self._to_gray(prototype)
-        crop_r, s_crop = self._resize(crop_gray)
-        proto_r, s_proto = self._resize(proto_gray)
+        # ProtoSnap bbs layout: ((crop_x, crop_y), (proto_x, proto_y))
+        src_pts = np.array([(xj, yj) for _, (xj, yj) in bbs])  # proto 512-space
+        dst_pts = np.array([(xi, yi) for (xi, yi), _ in bbs])   # crop  512-space
 
-        kp_p, des_p = self._detector.detectAndCompute(proto_r, None)
-        kp_c, des_c = self._detector.detectAndCompute(crop_r, None)
-        if des_p is None or des_c is None or len(kp_p) < 4 or len(kp_c) < 4:
-            return None
-
-        # KNN + Lowe's ratio test
+        args_r = self._Namespace(ransac_k=self.ransac_k,
+                                 ransac_threshold=self.ransac_threshold)
         try:
-            knn = self._matcher.knnMatch(des_p, des_c, k=2)
-        except cv2.error:
-            return None
-        good = []
-        for pair in knn:
-            if len(pair) < 2:
+            H, inliers = self._estimate_affine(src_pts, dst_pts, args_r)
+        except Exception:
+            return None, bbs, np.array([], dtype=int)
+
+        if H is None or inliers is None:
+            return None, bbs, np.array([], dtype=int)
+
+        return H, bbs, inliers  # already a 1D index array from estimate_affine
+
+    def _hull_score(self, proto_pil_512, bbs, inliers) -> float:
+        """Aggregate hull score matching ProtoSnap's get_hull_scores logic."""
+        from PIL import ImageOps
+        if len(inliers) < 3:
+            return 0.0
+        try:
+            pL = np.uint8(ImageOps.invert(proto_pil_512.convert("L"))) / 255.0
+            hull_crop  = np.array(
+                [(int(bbs[i][0][0]), int(bbs[i][0][1])) for i in inliers])
+            hull_proto = np.array(
+                [(int(bbs[i][1][0]), int(bbs[i][1][1])) for i in inliers])
+            mask1 = np.zeros(pL.shape, dtype=np.uint8)
+            cv2.drawContours(mask1, [cv2.convexHull(hull_crop)], -1, 1, -1)
+            score1 = float((mask1 == 1).mean())
+            mask2 = np.zeros(pL.shape, dtype=np.uint8)
+            cv2.drawContours(mask2, [cv2.convexHull(hull_proto)], -1, 1, -1)
+            score2 = float(pL[mask2 == 1].sum() / (pL.sum() + 1e-9))
+            return float((score1 * score2) ** 0.5)
+        except Exception:
+            return 0.0
+
+    def estimate(
+        self, crop: np.ndarray, prototype: np.ndarray, sign_name: str = ""
+    ) -> Optional[InitTransform]:
+        orig_ch, orig_cw = crop.shape[:2]
+        orig_ph, orig_pw = prototype.shape[:2]
+
+        crop_pil  = self._to_pil_rgb(crop)
+        proto_pil = self._to_pil_rgb(prototype)
+        proto_512 = proto_pil.resize((self.img_size, self.img_size))
+
+        best_H, best_bbs, best_inliers, best_score = None, None, np.array([], dtype=int), -1.0
+
+        for _ in range(max(1, self.init_tries)):
+            H, bbs, inliers = self._run_one(proto_pil, crop_pil, sign_name)
+            if H is None or len(inliers) == 0:
                 continue
-            m, n = pair
-            if m.distance < 0.8 * n.distance:
-                good.append(m)
-        if len(good) < 4:
+            if self.init_tries <= 1:
+                best_H, best_bbs, best_inliers = H, bbs, inliers
+                break
+            score = self._hull_score(proto_512, bbs, inliers)
+            if score > best_score:
+                best_score, best_H, best_bbs, best_inliers = score, H, bbs, inliers
+
+        if best_H is None:
             return None
 
-        src = np.float32([kp_p[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst = np.float32([kp_c[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-        # Undo the resize so the affine is in *original* prototype/crop coords
-        src = src / s_proto
-        dst = dst / s_crop
+        n_in  = int(len(best_inliers))
+        n_tot = int(len(best_bbs))
 
-        A, mask = cv2.estimateAffinePartial2D(
-            src, dst,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=self.ransac_thr,
-            maxIters=self.ransac_iters,
-            confidence=0.99,
-            refineIters=10,
-        )
-        if A is None or mask is None:
-            return None
+        # --- Convert H (512-pixel-space, proto->crop) to original pixel coords ---
+        # A_orig = S_c @ H[:2,:2] @ S_pi_inv
+        # t_orig = S_c @ H[:2,2]
+        spx = self.img_size / orig_pw;  spy = self.img_size / orig_ph
+        scx = orig_cw / self.img_size;  scy = orig_ch / self.img_size
 
-        inlier_mask = mask.ravel().astype(bool)
-        n_in = int(inlier_mask.sum())
-        n_tot = int(len(good))
+        A_512  = best_H[:2, :2]
+        t_512  = best_H[:2,  2]
+        S_pi   = np.diag([spx, spy])
+        S_c    = np.diag([scx, scy])
+        A_orig = S_c @ A_512 @ S_pi
+        t_orig = S_c @ t_512
+        affine_orig = np.hstack([A_orig, t_orig.reshape(2, 1)]).astype(np.float32)
 
-        # Median reprojection error on inliers
+        # --- Reprojection error in original crop pixels ---
         if n_in > 0:
-            src_in = src[inlier_mask].reshape(-1, 2)
-            dst_in = dst[inlier_mask].reshape(-1, 2)
-            proj = (A[:, :2] @ src_in.T).T + A[:, 2]
-            err = np.linalg.norm(proj - dst_in, axis=1)
+            src_orig = np.array(
+                [(best_bbs[i][1][0] / spx, best_bbs[i][1][1] / spy)
+                 for i in best_inliers])  # proto orig px
+            dst_orig = np.array(
+                [(best_bbs[i][0][0] * scx, best_bbs[i][0][1] * scy)
+                 for i in best_inliers])  # crop  orig px
+            pred_orig = (A_orig @ src_orig.T).T + t_orig
+            err = np.linalg.norm(pred_orig - dst_orig, axis=1)
             med_err = float(np.median(err))
         else:
             med_err = float("inf")
 
         return InitTransform(
-            affine=A.astype(np.float32),
+            affine=affine_orig,
             inliers=n_in,
             total_matches=n_tot,
             inlier_ratio=n_in / max(n_tot, 1),
             median_reproj_err=med_err,
-            proto_shape=proto_gray.shape[:2],
-            crop_shape=crop_gray.shape[:2],
+            proto_shape=(orig_ph, orig_pw),
+            crop_shape=(orig_ch, orig_cw),
         )
 
 
-class OfficialProtoSnapInitEstimator:
-    """Stub for the SD-DIFT based stage-1 init.
+def load_dift_model(config: Optional["ProtoSnapConfig"]):
+    """Pre-load SDFeaturizer from the ProtoSnap repo.
 
-    To enable: clone https://github.com/TAU-VAILab/ProtoSnap, install its
-    requirements, gdown the SD weights, and fill in `estimate`. The wire-up
-    point is the `_match_dift` placeholder. Until then, ``estimate`` always
-    returns None and the caller falls back to OpenCV.
+    Returns the model (SDFeaturizer), or None if conditions aren't met.
+    Call once per session; store on CropContext._snap_dift so it is reused
+    across all subsequent runner.choose_sample() calls.
     """
+    if config is None:
+        return None
+    if not config.repo_root:
+        logger.warning("load_dift_model: repo_root is None")
+        return None
 
-    def __init__(self, repo_root: str, weights_dir: str, img_size: int = 256):
-        self.repo_root = repo_root
-        self.weights_dir = weights_dir
-        self.img_size = img_size
-        self._model = None
+    repo_root   = str(config.repo_root)
+    weights_dir = str(Path(config.repo_root) / "weights" / "SD_with_prompt")
 
-    def _ensure_model_loaded(self):
-        # TODO(protosnap): import SDFeaturizer from cloned repo and load weights.
-        raise NotImplementedError(
-            "OfficialProtoSnapInitEstimator: wire up TAU-VAILab/ProtoSnap "
-            "SDFeaturizer here. See main.py initialize() in their repo."
-        )
+    import sys
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
-    def estimate(self, crop, prototype):
-        # Until wired up: signal "not available", caller may fall back.
+    try:
+        from src.dift import SDFeaturizer
+        logger.info("Loading SD-DIFT model from %s ...", weights_dir)
+        dift = SDFeaturizer(sd_id=weights_dir)
+        logger.info("SD-DIFT model loaded.")
+        return dift
+    except Exception as e:
+        logger.warning("Failed to load SDFeaturizer: %s", e)
         return None
 
 
-def make_estimator(config: ProtoSnapConfig) -> TransformEstimator:
-    if config.estimator == "official_protosnap":
-        if not config.repo_root:
-            logger.warning("official_protosnap requested but repo_root is None; using opencv")
-            return OpenCVAffineEstimator(
-                feature=config.opencv_feature, img_size=config.feature_img_size)
-        # Try to construct; if it raises NotImplementedError, fall back.
-        try:
-            est = OfficialProtoSnapInitEstimator(
-                repo_root=config.repo_root,
-                weights_dir=str(Path(config.repo_root) / "weights" / "SD_with_prompt"),
-                img_size=config.feature_img_size or 256,
-            )
-            est._ensure_model_loaded()
-            return est
-        except NotImplementedError:
-            logger.warning("OfficialProtoSnapInitEstimator not wired up; falling back to opencv")
-            return OpenCVAffineEstimator(
-                feature=config.opencv_feature, img_size=config.feature_img_size)
-    return OpenCVAffineEstimator(
-        feature=config.opencv_feature, img_size=config.feature_img_size)
+def make_estimator(config: ProtoSnapConfig, dift=None) -> Optional[TransformEstimator]:
+    if config.repo_root and dift is not None:
+        return DiftAffineEstimator(
+            dift=dift,
+            repo_root=str(config.repo_root),
+            img_size=512,
+            init_tries=config.init_tries,
+            ransac_k=5,
+            ransac_threshold=50.0,
+        )
+    logger.warning(
+        "DiftAffineEstimator not available (%s); ProtoSnap step will be disabled.",
+        "repo_root is None" if not config.repo_root else "dift model not loaded",
+    )
+    return None
 
 
 # ===========================================================================
@@ -628,7 +658,7 @@ class CenterFreezeRefiner:
         crop = _crop
 
         try:
-            t = self.estimator.estimate(crop, out.proto_img)
+            t = self.estimator.estimate(crop, out.proto_img, sb.sign_name)
         except Exception as e:
             if self.config.log_failures:
                 logger.exception("estimator failed on %s", sb.sign_name)
@@ -681,9 +711,27 @@ class CenterFreezeRefiner:
         if sub_tablet.img is None:
             raise ValueError("refine_subtablet requires sub_tablet.img to be set")
         H, W = sub_tablet.img.shape[:2]
+        n = len(sub_tablet.sign_boxes)
+
+        # Determine which indices to actually run DIFT on (evenly spaced).
+        n_run = max(self.config.min_snap_signs, int(round(n * self.config.sample_ratio)))
+        n_run = min(n_run, n)
+        if n_run < n:
+            step = n / n_run
+            run_indices = set(int(i * step) for i in range(n_run))
+        else:
+            run_indices = set(range(n))
+
         results: List[CenterRefinement] = []
         for i, sb in enumerate(sub_tablet.sign_boxes):
-            r = self.refine_one(sub_tablet.img, sb, i, (H, W))
+            if i in run_indices:
+                r = self.refine_one(sub_tablet.img, sb, i, (H, W))
+            else:
+                r = CenterRefinement(
+                    sign_index=i, sign_name=sb.sign_name, abz=sb.abz_name,
+                    status=SnapStatus.DISABLED, accepted=False,
+                    new_cx=sb.cx, new_cy=sb.cy,
+                )
             results.append(r)
         return results
 
@@ -708,7 +756,9 @@ class CenterFreezeRefiner:
 # ===========================================================================
 
 def make_refiner(
-    config: Optional[ProtoSnapConfig], period: Optional[str] = None,
+    config: Optional[ProtoSnapConfig],
+    period: Optional[str] = None,
+    dift=None,
 ) -> Tuple[Optional[CenterFreezeRefiner], Dict[str, Any]]:
     """Build a CenterFreezeRefiner if assets are reachable, else (None, meta).
 
@@ -739,7 +789,10 @@ def make_refiner(
         meta["font_reason"] += " | bank not ready (repo_root / prototypes missing)"
         return None, meta
 
-    estimator = make_estimator(config)
+    estimator = make_estimator(config, dift=dift)
+    if estimator is None:
+        meta["font_reason"] += " | estimator not available"
+        return None, meta
     meta["estimator"] = type(estimator).__name__
     meta["enabled"] = True
     return CenterFreezeRefiner(config, bank, estimator), meta

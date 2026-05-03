@@ -24,6 +24,7 @@ from sign_alignment.protosnap import (
     CenterRefinement,
     ProtoSnapConfig,
     SnapStatus,
+    load_dift_model,
     make_refiner,
     render_refinement_grid,
     summarize_refinements,
@@ -144,6 +145,8 @@ class CropContext:
     config: PipelineConfig
     tools: PipelineTools = field(default_factory=PipelineTools)
     state: SampleState = None
+    # Cached SDFeaturizer for SD-DIFT; loaded once, reused across samples.
+    _snap_dift: Optional[object] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if self.state is None:
@@ -714,7 +717,14 @@ def _protosnap_setup(context: CropContext):
         script = fragment_data.get("script") or {}
         period = script.get("period") or None
 
-    refiner, meta = make_refiner(cfg, period=period)
+    # Pre-load SD-DIFT model once per session (cached on context, not state).
+    if cfg is not None and context._snap_dift is None:
+        print("  [ProtoSnap] Loading SD-DIFT model (first time, ~30 s)...")
+        context._snap_dift = load_dift_model(cfg)
+        if context._snap_dift is None:
+            print("  [ProtoSnap] WARNING: SD-DIFT model failed to load; step will be disabled.")
+
+    refiner, meta = make_refiner(cfg, period=period, dift=context._snap_dift)
     s.snap_meta = meta
     s.snap_refiner = refiner
 
