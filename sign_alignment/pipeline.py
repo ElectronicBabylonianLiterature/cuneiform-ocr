@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import os
 from typing import Optional
 
+import cv2
 import numpy as np
 import torch
 
@@ -18,6 +19,16 @@ from sign_alignment.visualizer import (
 from sign_alignment.heatmap import compute_avg_dimensions, transform_gt_to_cropped_region
 from sign_alignment.tablet import SubTablet
 from sign_alignment.psr_optimizer import PointSetRegistrationOptimizer
+from sign_alignment.protosnap import (
+    CenterFreezeRefiner,
+    CenterRefinement,
+    ProtoSnapConfig,
+    SnapStatus,
+    make_refiner,
+    render_refinement_grid,
+    summarize_refinements,
+    collect_used_prototype_paths,
+)
 from data_processing.line_process import (
     align_text_to_detection_rows,
     create_row_mapping,
@@ -50,6 +61,10 @@ class PipelineConfig:
     color_config: ColorConfig
     output_dir: str
     img_idx: int = 1          # which cropped sub-image to use
+    # ProtoSnap is opt-in. None disables the step (default behavior).
+    # Pass a ProtoSnapConfig to enable; the step still no-ops gracefully if
+    # assets/weights are missing.
+    protosnap: Optional[ProtoSnapConfig] = None
 
 
 class PipelineTools:
@@ -93,6 +108,13 @@ class SampleState:
     sub_tablet_text: Optional[SubTablet] = None        # text signs on virtual grid
     sub_tablet_aligned: Optional[SubTablet] = None     # coarse-aligned (formerly optim)
     sub_tablet_final: Optional[SubTablet] = None       # after PSR optimization
+
+    # ProtoSnap center-freeze refiner + diagnostics.
+    snap_refiner: Optional[CenterFreezeRefiner] = None
+    snap_meta: Optional[dict] = None                   # period, font, repo_root, etc.
+    snap_refinements: Optional[list] = None            # list[CenterRefinement] after hook fires
+    snap_summary: Optional[dict] = None
+    snap_used_prototype_paths: Optional[list] = None
 
     # row matching
     det_row_sequences: Optional[list] = None
@@ -665,6 +687,106 @@ def _visualize_offset_analysis(context: CropContext, vis: VisOptions):
 
 
 # ---------------------------------------------------------------------------
+# Step: ProtoSnap setup (build refiner, resolve period; no compute yet)
+# ---------------------------------------------------------------------------
+
+def _protosnap_setup(context: CropContext):
+    """Build the ProtoSnap CenterFreezeRefiner if enabled.
+
+    Resolves `period` from the EBL fragment API (script.period), maps it
+    to a font, and instantiates the refiner. Does NOT run any feature
+    matching here — that happens inside the PSR mid-iteration hook.
+
+    No-op (graceful) when:
+      - config.protosnap is None
+      - the prototype bank cannot find its repo / fonts directory
+    """
+    s = context.state
+    s.snap_refiner = None
+    s.snap_refinements = None
+    s.snap_summary = None
+    s.snap_used_prototype_paths = None
+
+    cfg = context.config.protosnap
+    period = None
+    fragment_data = context.api_source.get_fragment_data(context.fragment_id)
+    if fragment_data is not None:
+        script = fragment_data.get("script") or {}
+        period = script.get("period") or None
+
+    refiner, meta = make_refiner(cfg, period=period)
+    s.snap_meta = meta
+    s.snap_refiner = refiner
+
+
+def _visualize_protosnap_setup(context: CropContext, vis: VisOptions):
+    s = context.state
+    if not vis.info:
+        return
+    meta = s.snap_meta or {}
+    print("=== ProtoSnap Setup ===")
+    print(f"  API period:    {meta.get('period')!r}")
+    print(f"  Resolved font: {meta.get('font')!r}  ({meta.get('font_reason')})")
+    print(f"  repo_root:     {meta.get('repo_root')}")
+    print(f"  estimator:     {meta.get('estimator')}")
+    print(f"  enabled:       {meta.get('enabled')}")
+    if s.snap_refiner is not None:
+        cov = s.snap_refiner.bank.coverage(s.sub_tablet_aligned.sign_boxes)
+        print(f"  prototype coverage: {cov['with_prototype']}/{cov['total']} "
+              f"(metadata_size={cov['metadata_size']})")
+        if cov["missing_sign_top10"]:
+            print(f"  top missing signs: {', '.join(cov['missing_sign_top10'])}")
+
+
+# ---------------------------------------------------------------------------
+# Step: ProtoSnap per-sign crop grid visualization
+# ---------------------------------------------------------------------------
+
+def _visualize_protosnap_crops(context: CropContext, vis: VisOptions):
+    """Render a grid showing every sign that passed through ProtoSnap.
+
+    Each cell shows the prototype (left) and the sign crop (right) with
+    the original bbox center (cyan circle) and the ProtoSnap-estimated
+    center (green cross = accepted, red cross = rejected) connected by an
+    arrow.  A color-coded border and text header/footer indicate the
+    acceptance status and gate reason.
+    """
+    s = context.state
+    if not s.snap_refinements:
+        if vis.info:
+            print("ProtoSnap crop grid: no refinements to show.")
+        return
+
+    if vis.info:
+        n_ok  = sum(1 for r in s.snap_refinements if r.accepted)
+        n_all = len(s.snap_refinements)
+        print(f"=== ProtoSnap Crop Grid ({n_all} signs, {n_ok} accepted) ===")
+        print("  Legend: cyan circle = original center  "
+              "green cross = accepted  red cross = rejected")
+
+    grid = render_refinement_grid(s.snap_refinements, thumb=128, cols=5)
+
+    if vis.display:
+        import matplotlib.pyplot as plt
+        grid_rgb = cv2.cvtColor(grid, cv2.COLOR_BGR2RGB)
+        h, w = grid_rgb.shape[:2]
+        fig_w = min(20.0, w / 60.0)
+        fig_h = fig_w * h / max(w, 1)
+        plt.figure(figsize=(fig_w, fig_h))
+        plt.imshow(grid_rgb)
+        plt.axis("off")
+        plt.title("ProtoSnap: prototype (left) | annotated crop (right)")
+        plt.tight_layout(pad=0.3)
+        plt.show()
+
+    if vis.save:
+        out_path = _out(context, "protosnap_crop_grid.jpg")
+        cv2.imwrite(out_path, grid, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if vis.info:
+            print(f"  Saved: {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Step: Create PSR Optimizer
 # ---------------------------------------------------------------------------
 
@@ -712,6 +834,37 @@ def _visualize_psr_optimizer(context: CropContext, vis: VisOptions):
 
 def _run_psr_optimization(context: CropContext):
     s = context.state
+    cfg = context.config.protosnap
+    refiner = s.snap_refiner
+    snap_iter = cfg.snap_at_iter if cfg is not None else None
+    fired = {"done": False}
+
+    def _snap_freeze_hook(opt, it):
+        if refiner is None or snap_iter is None:
+            return
+        if it != snap_iter or fired["done"]:
+            return
+        fired["done"] = True
+        # Build a SubTablet view that reflects current params, so the
+        # crops we feed to the refiner are correct after the first 10
+        # iterations of PSR have moved things around.
+        current = opt.get_optimized_subtablet()
+        refinements = refiner.refine_subtablet(current)
+        s.snap_refinements = refinements
+
+        accepted = [r for r in refinements if r.accepted]
+        idx = [r.sign_index for r in accepted]
+        new_centers = [(r.new_cx, r.new_cy) for r in accepted]
+        opt.freeze_centers(idx, new_centers)
+
+        s.snap_summary = summarize_refinements(refinements)
+        s.snap_used_prototype_paths = collect_used_prototype_paths(
+            refinements, refiner.bank, opt.sign_boxes_flat)
+
+        print(f"  [iter {it}] ProtoSnap fired: "
+              f"{s.snap_summary['accepted']}/{s.snap_summary['total']} "
+              f"signs frozen.")
+
     s.sub_tablet_final = s.optimizer.optimize(
         num_iterations=80,
         lr=1.0,
@@ -719,6 +872,7 @@ def _run_psr_optimization(context: CropContext):
         sigma_final=None,
         verbose=True,
         log_every=20,
+        mid_iteration_hook=_snap_freeze_hook,
     )
 
 
@@ -726,6 +880,69 @@ def _visualize_psr_optimization(context: CropContext, vis: VisOptions):
     if vis.info:
         s = context.state
         print(f"=== Optimization Complete: {len(s.sub_tablet_final)} signs ===")
+
+
+# ---------------------------------------------------------------------------
+# Step: Visualize ProtoSnap freeze (blue=frozen, orange=free)
+# ---------------------------------------------------------------------------
+
+def _visualize_protosnap_freeze(context: CropContext, vis: VisOptions):
+    """Show the optimizer-state at the moment ProtoSnap fired.
+
+    Frozen-center bboxes are drawn in **blue**, the rest (still being
+    optimized) in **orange**. We render two snapshots side-by-side:
+      (a) snapshot taken right after freeze (before further optimization);
+      (b) final SubTablet after optimization completed.
+    """
+    s = context.state
+    if s.snap_refinements is None:
+        if vis.info:
+            print("ProtoSnap freeze visualization: nothing to show "
+                  "(refiner disabled or no signs accepted).")
+        return
+
+    if vis.info:
+        summ = s.snap_summary or {}
+        print("=== ProtoSnap Freeze Summary ===")
+        print(f"  Total refined: {summ.get('total')}, Accepted: {summ.get('accepted')}")
+        for status_value, count in sorted(summ.get("by_status", {}).items()):
+            print(f"    {status_value}: {count}")
+        # Top reasons for rejection (helps gate tuning)
+        reasons = Counter(
+            (r.info or {}).get("gate_reason", "?")
+            for r in s.snap_refinements if not r.accepted
+        )
+        if reasons:
+            print("  Top rejection reasons:")
+            for reason, n in reasons.most_common(5):
+                print(f"    [{n}] {reason}")
+        if s.snap_used_prototype_paths:
+            print(f"  Used {len(s.snap_used_prototype_paths)} unique prototype PNGs.")
+
+    # Build a per-sign color function based on which indices are frozen.
+    accepted_idx = {r.sign_index for r in s.snap_refinements if r.accepted}
+    final_boxes = s.sub_tablet_final.to_detection_list()
+
+    BLUE = (0, 102, 255)     # frozen
+    ORANGE = (255, 128, 0)   # free
+
+    def _color_func_factory(idx_to_box):
+        # Identity-based lookup: BboxVisualizer iterates boxes in order,
+        # so we use a counter via id(box) -> index.
+        index_lookup = {id(b): i for i, b in enumerate(idx_to_box)}
+        def _color(box):
+            i = index_lookup.get(id(box), -1)
+            return BLUE if i in accepted_idx else ORANGE
+        return _color
+
+    final_vis = BboxVisualizer()
+    final_vis.color_func = _color_func_factory(final_boxes)
+    final_vis.draw_boxes(s.sub_image.img.copy(), final_boxes)
+
+    if vis.display:
+        final_vis.display_result(vis_opt="draw")
+    if vis.save:
+        final_vis.save(_out(context, "protosnap_freeze_final.jpg"))
 
 
 # ---------------------------------------------------------------------------
@@ -888,6 +1105,22 @@ step_offset_analysis = Step(
     visualize=_visualize_offset_analysis,
 )
 
+step_protosnap = Step(
+    name="ProtoSnap Setup (resolve period, build refiner)",
+    run=_protosnap_setup,
+    visualize=_visualize_protosnap_setup,
+)
+
+step_protosnap_freeze_vis = Step(
+    name="ProtoSnap Freeze Visualization (blue=frozen, orange=free)",
+    visualize=_visualize_protosnap_freeze,
+)
+
+step_protosnap_crop_vis = Step(
+    name="ProtoSnap Crop Grid (prototype | annotated crop per sign)",
+    visualize=_visualize_protosnap_crops,
+)
+
 step_create_psr_optimizer = Step(
     name="Create PSR Optimizer",
     run=_create_psr_optimizer,
@@ -931,6 +1164,37 @@ DEBUG_STEPS = [
     step_offset_analysis,
     step_create_psr_optimizer,
     step_run_psr_optimization,
+    step_plot_loss_history,
+    step_results_comparison,
+    step_param_changes,
+]
+
+
+# Opt-in variant that wires ProtoSnap center-freeze into the PSR
+# optimizer as a mid-iteration hook (fires at config.protosnap.snap_at_iter,
+# default 10). step_protosnap only builds the refiner; the actual freeze
+# happens inside step_run_psr_optimization. step_protosnap_freeze_vis
+# renders blue (frozen) / orange (free) bboxes after optimization.
+#
+# Default DEBUG_STEPS is unchanged so existing notebooks keep working.
+DEBUG_STEPS_WITH_PROTOSNAP = [
+    step_load_data,
+    step_detect_signs,
+    step_transform_gt_to_img,
+    step_compute_statistics,
+    step_create_subtablets,
+    step_detect_rows,
+    step_match_rows,
+    step_visualize_detection_rows,
+    step_match_signs_in_rows,
+    step_align_text_rows,
+    step_build_sign_match_info,
+    step_offset_analysis,
+    step_protosnap,
+    step_create_psr_optimizer,
+    step_run_psr_optimization,
+    step_protosnap_freeze_vis,
+    step_protosnap_crop_vis,
     step_plot_loss_history,
     step_results_comparison,
     step_param_changes,
