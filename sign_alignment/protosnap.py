@@ -177,7 +177,7 @@ class ProtoSnapConfig:
     # Signs are sampled evenly (every N-th). At least min_snap_signs signs
     # are always processed regardless of ratio.
     # Use 1.0 to process all signs (slow).
-    sample_ratio: float = 0.05
+    sample_ratio: float = 1.0
     min_snap_signs: int = 5
 
     log_failures: bool = True

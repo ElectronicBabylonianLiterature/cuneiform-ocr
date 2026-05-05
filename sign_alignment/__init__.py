@@ -7,7 +7,9 @@ between images and text transcriptions.
 
 from .data_source import (
     LocalDataSource,
+    LocalTestDataSource,
     EBLAPISource,
+    SubtabletEBLAPISource,
     SignTextParser,
     SignAPIResolver,
     create_local_source,
@@ -71,7 +73,9 @@ from .psr_optimizer import (
 __all__ = [
     # Data sources
     'LocalDataSource',
+    'LocalTestDataSource',
     'EBLAPISource',
+    'SubtabletEBLAPISource',
     'SignTextParser',
     'SignAPIResolver',
     'create_local_source',

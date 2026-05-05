@@ -6,6 +6,9 @@ by comparing PSR-optimized alignment bounding boxes against ground-truth annotat
 
 Also includes a fast coordinate-wise hyperparameter sweep for the
 PointSetRegistrationOptimizer.
+
+Uses the step functions from sign_alignment/pipeline.py for the alignment
+pipeline. No ProtoSnap.
 """
 
 import json
@@ -13,26 +16,39 @@ import os
 import time
 import numpy as np
 import cv2
-import torch
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 from PIL import Image as PILImage, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 from sign_alignment import (
-    LocalDataSource, EBLAPISource, SignTextParser, SignAPIResolver,
-    ModelConfig, TabletImageDetector, SingleImage,
-    compute_avg_dimensions, transform_gt_to_cropped_region,
-    match_rows_dp, create_row_mapping, match_signs_in_row_dp,
-    align_text_to_detection_rows,
-    SubTablet, PointSetRegistrationOptimizer,
+    LocalDataSource,
+    LocalTestDataSource,
+    SubtabletEBLAPISource,
+    ModelConfig, TabletImageDetector,
     BoundingBox, Detection, GroundTruths,
+)
+from sign_alignment.visualizer import ColorConfig
+from sign_alignment.pipeline import (
+    CropContext, PipelineConfig, SampleState, Runner, VisOptions,
+    step_load_data,
+    step_detect_signs,
+    step_compute_statistics,
+    step_transform_gt_to_img,
+    step_create_subtablets,
+    step_detect_rows,
+    step_match_rows,
+    step_match_signs_in_rows,
+    step_align_text_rows,
+    step_create_psr_optimizer,
+    step_run_psr_optimization,
 )
 
 load_dotenv()
 
 # ============ Configuration ============
 ANNOTATIONS_DIR = os.path.expanduser("~/erc-work-data/data-of-cuneiform-ocr-data/filtered_annotations")
+COCO_TEST_DIR = os.path.expanduser("~/erc-work-data/ready-for-training/coco-recognition-2025-09/data/coco")
 CONFIG_FILE = "configs/detr.py"
 CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/epoch_1000.pth")
 SCORE_THRESHOLD = 0.5
@@ -42,30 +58,10 @@ EVAL_OUTPUT_DIR = "evaluation_results"
 EVAL_SAMPLE_LIMIT = 30
 SEARCH_SAMPLE_LIMIT = 5
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
 # IoU thresholds for mAP computation
 IOU_THRESHOLDS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 
-# --- DBSCAN / DP matching defaults (fixed during evaluation) ---
-DBSCAN_EPS = 0.4
-DBSCAN_MIN_SAMPLES = 1
-DBSCAN_LAMBDA_WEIGHT = 0.007
-
-ROW_MATCH_SKIP_TEXT_PENALTY = 0.5
-ROW_MATCH_SKIP_DET_PENALTY = 1.0
-ROW_MATCH_SKIP_SMALL_DET_PENALTY = 0.2
-ROW_MATCH_SMALL_DET_THRESHOLD = 1
-ROW_MATCH_SIMILARITY_METHOD = 'jaccard'
-
-SIGN_MATCH_SKIP_TEXT_PENALTY = 0.5
-SIGN_MATCH_SKIP_DET_PENALTY = 2.0
-SIGN_MATCH_MISMATCH_COST = 0.9
-
-ALIGN_MIN_WIDTH_RATIO = 2 / 3
-ALIGN_MAX_WIDTH_RATIO = 4 / 3
-
-# --- Default PSR optimizer hyperparameters ---
+# --- Default PSR optimizer hyperparameters (used by hyperparameter sweep) ---
 DEFAULT_PSR_PARAMS = dict(
     sigma_factor=1.5,
     w_noise=0.1,
@@ -79,7 +75,7 @@ DEFAULT_PSR_PARAMS = dict(
     rows_threshold_ratio_close=2 / 3.0,
     rows_plateau_far=0.5,
     rows_plateau_close=1.0,
-    num_iterations=80,
+    num_iterations=150,
     lr=1.0,
     sigma_anneal=True,
 )
@@ -299,195 +295,6 @@ def compute_per_class_metrics(
     return per_class
 
 
-# ============ PSR Alignment Pipeline ============
-
-def run_alignment_pipeline(
-    tablet_detector: TabletImageDetector,
-    local_source: LocalDataSource,
-    api_source: EBLAPISource,
-    sign_resolver: SignAPIResolver,
-    fragment_id: str,
-    psr_params: dict = None,
-    verbose: bool = False,
-) -> Optional[Dict]:
-    """
-    Run the full PSR alignment pipeline for one fragment.
-    Returns dict with 'preds' (optimized boxes in full img coords) and 'gts'.
-    """
-    if psr_params is None:
-        psr_params = DEFAULT_PSR_PARAMS
-
-    img = local_source.load_image(fragment_id)
-    if img is None:
-        return None
-
-    gt_boxes = local_source.load_annotation(fragment_id)
-    if not gt_boxes:
-        return None
-
-    # Filter out abnormally large GT boxes (e.g. sub-tablet region annotations)
-    areas = [b.width * b.height for b in gt_boxes]
-    mean_area = np.mean(areas)
-    gt_boxes_filtered = [b for b, a in zip(gt_boxes, areas) if a <= mean_area * 5]
-    if verbose and len(gt_boxes_filtered) < len(gt_boxes):
-        print(f"  {fragment_id}: Filtered {len(gt_boxes) - len(gt_boxes_filtered)} "
-              f"oversized GT boxes (mean_area={mean_area:.0f})")
-    gt_boxes = gt_boxes_filtered
-
-    fragment_data = api_source.get_fragment_data(fragment_id)
-    if fragment_data is None:
-        return None
-
-    text_data = fragment_data.get('text', {})
-    text_lines = SignTextParser.parse_text_lines(
-        text_data, filter_broken=True, sign_resolver=sign_resolver
-    )
-    if not text_lines:
-        return None
-
-    detections = tablet_detector.detect(img)
-    if not detections:
-        return None
-
-    cropped_images = tablet_detector.get_cropped_images()
-    crop_coordinates = tablet_detector.crop_coordinates
-    avg_width, avg_height = compute_avg_dimensions(detections)
-
-    all_optimized_full: List[BoundingBox] = []
-
-    for idx, crop_single in enumerate(cropped_images):
-        crop_dets = crop_single.detections
-        if not crop_dets:
-            continue
-
-        # 1. Build SubTablets
-        sub_det = SubTablet.from_detections(
-            img=crop_single.img, detections=crop_dets,
-            name="det", avg_width=avg_width, avg_height=avg_height,
-        )
-        sub_text = SubTablet.from_text_lines(
-            text_lines=text_lines, avg_width=avg_width,
-            avg_height=avg_height,
-            img=crop_single.img,
-            target_detections=crop_dets,
-            align_to_detection_centroid=True,
-            name="text",
-        )
-
-        # 2. DBSCAN row detection
-        num_rows = sub_det.detect_rows(
-            eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES,
-            lambda_weight=DBSCAN_LAMBDA_WEIGHT,
-        )
-        if num_rows == 0:
-            continue
-
-        # 3. Row-level DP matching
-        det_row_seqs = sub_det.get_row_sign_sequences()
-        text_row_seqs = sub_text.get_row_sign_sequences()
-
-        matches, _ = match_rows_dp(
-            detection_rows=det_row_seqs,
-            text_rows=text_row_seqs,
-            skip_text_penalty=ROW_MATCH_SKIP_TEXT_PENALTY,
-            skip_det_penalty=ROW_MATCH_SKIP_DET_PENALTY,
-            skip_small_det_penalty=ROW_MATCH_SKIP_SMALL_DET_PENALTY,
-            small_det_threshold=ROW_MATCH_SMALL_DET_THRESHOLD,
-            similarity_method=ROW_MATCH_SIMILARITY_METHOD,
-        )
-        if not matches:
-            continue
-
-        text_to_det, _ = create_row_mapping(
-            matches, len(text_row_seqs), len(det_row_seqs)
-        )
-
-        # 4. Sign-level DP matching
-        row_sign_matches = {}
-        for text_row_idx, det_row_idx in matches:
-            sign_matches, _ = match_signs_in_row_dp(
-                detection_signs=det_row_seqs[det_row_idx],
-                text_signs=text_row_seqs[text_row_idx],
-                skip_text_penalty=SIGN_MATCH_SKIP_TEXT_PENALTY,
-                skip_det_penalty=SIGN_MATCH_SKIP_DET_PENALTY,
-                mismatch_cost=SIGN_MATCH_MISMATCH_COST,
-            )
-            row_sign_matches[text_row_idx] = sign_matches
-
-        # 5. Coarse alignment
-        det_rows = sub_det.get_rows_dict()
-        text_rows = sub_text.get_rows_dict()
-
-        aligned_boxes = align_text_to_detection_rows(
-            det_rows=det_rows,
-            text_rows=text_rows,
-            text_to_det=text_to_det,
-            row_sign_matches=row_sign_matches,
-            avg_width=avg_width,
-            avg_height=avg_height,
-            min_width_ratio=ALIGN_MIN_WIDTH_RATIO,
-            max_width_ratio=ALIGN_MAX_WIDTH_RATIO,
-        )
-        if not aligned_boxes:
-            continue
-
-        sub_optim = SubTablet(
-            sign_boxes=aligned_boxes,
-            img=crop_single.img,
-            name="optim",
-            avg_width=avg_width,
-            avg_height=avg_height,
-        )
-
-        # 6. PSR optimization
-        sigma = avg_width * psr_params.get('sigma_factor', 1.5)
-        optimizer = PointSetRegistrationOptimizer(
-            sub_tablet_text=sub_optim,
-            target_detections=crop_dets,
-            sigma=sigma,
-            w_noise=psr_params.get('w_noise', 0.1),
-            lambda_data=psr_params.get('lambda_data', 2.0),
-            lambda_anchor=psr_params.get('lambda_anchor', 0.01),
-            lambda_seq=psr_params.get('lambda_seq', 0.1),
-            lambda_height=psr_params.get('lambda_height', 0.01),
-            lambda_rows=psr_params.get('lambda_rows', 5.0),
-            lambda_boundary=psr_params.get('lambda_boundary', 1.0),
-            rows_threshold_ratio_far=psr_params.get('rows_threshold_ratio_far', 1 / 3.0),
-            rows_threshold_ratio_close=psr_params.get('rows_threshold_ratio_close', 2 / 3.0),
-            rows_plateau_far=psr_params.get('rows_plateau_far', 0.5),
-            rows_plateau_close=psr_params.get('rows_plateau_close', 1.0),
-            contour_mask=crop_single.mask if hasattr(crop_single, 'mask') else None,
-            device=DEVICE,
-        )
-        sub_final = optimizer.optimize(
-            num_iterations=psr_params.get('num_iterations', 80),
-            lr=psr_params.get('lr', 1.0),
-            sigma_anneal=psr_params.get('sigma_anneal', True),
-            verbose=False,
-        )
-
-        # Transform to full image coords
-        ox = crop_coordinates[idx]['x']
-        oy = crop_coordinates[idx]['y']
-        for sb in sub_final.sign_boxes:
-            all_optimized_full.append(BoundingBox(
-                x1=sb.x1 + ox, y1=sb.y1 + oy,
-                x2=sb.x2 + ox, y2=sb.y2 + oy,
-                score=sb.score, sign=sb.sign,
-            ))
-
-    if verbose:
-        print(f"  {fragment_id}: GT={len(gt_boxes)}, Pred={len(all_optimized_full)}")
-
-    return {
-        'fragment_id': fragment_id,
-        'preds': all_optimized_full,
-        'gts': gt_boxes,
-        'detections': detections,
-        'img': img,
-    }
-
-
 # ============ Evaluation Visualization ============
 
 def _get_eval_font(size: int):
@@ -631,12 +438,9 @@ def visualize_evaluation_fragment(
 # ============ Evaluation Runner ============
 
 def run_evaluation(
-    tablet_detector: TabletImageDetector,
-    local_source: LocalDataSource,
-    api_source: EBLAPISource,
-    sign_resolver: SignAPIResolver,
+    context: CropContext,
     fragment_ids: List[str],
-    psr_params: dict = None,
+    psr_params: Optional[dict] = None,
     verbose: bool = True,
     label: str = "",
     visualize: bool = False,
@@ -648,9 +452,9 @@ def run_evaluation(
     Returns:
         Dict with mAP, per-threshold results, per-class results, and per-fragment details.
     """
-    if psr_params is None:
-        psr_params = DEFAULT_PSR_PARAMS
-
+    context.config.psr_params = psr_params  # None = step defaults
+    vis = VisOptions(info=False, display=False, save=False)
+    runner = Runner(context, steps=[], vis=vis)
     all_results = []
     skipped = 0
 
@@ -658,36 +462,83 @@ def run_evaluation(
         if verbose and (i % 5 == 0 or i == len(fragment_ids) - 1):
             print(f"  [{label}] Processing {i+1}/{len(fragment_ids)}: {fid}")
 
-        result = run_alignment_pipeline(
-            tablet_detector=tablet_detector,
-            local_source=local_source,
-            api_source=api_source,
-            sign_resolver=sign_resolver,
-            fragment_id=fid,
-            psr_params=psr_params,
-            verbose=verbose,
-        )
-        if result is None:
+        context.state = SampleState()
+        context.fragment_id = fid
+
+        try:
+            runner.run_single_step(step_load_data)
+        except Exception as e:
             skipped += 1
             continue
 
-        # Visualize before discarding the image
-        if visualize:
-            img = result.pop('img', None)
-            if img is not None:
-                visualize_evaluation_fragment(
-                    img=img,
-                    fragment_id=fid,
-                    preds=result['preds'],
-                    gts=result['gts'],
-                    iou_threshold=0.5,
-                    class_agnostic=False,
-                    output_dir=output_dir,
-                )
-        else:
-            result.pop('img', None)
+        s = context.state
+        if not s.img or not s.text_lines or not s.gt_boxes:
+            skipped += 1
+            continue
 
-        all_results.append(result)
+        # Filter out abnormally large GT boxes (e.g. sub-tablet region annotations)
+        areas = [b.width * b.height for b in s.gt_boxes]
+        mean_area = np.mean(areas)
+        s.gt_boxes = [b for b, a in zip(s.gt_boxes, areas) if a <= mean_area * 5]
+        if not s.gt_boxes:
+            skipped += 1
+            continue
+
+        runner.run_single_step(step_detect_signs)
+        runner.run_single_step(step_compute_statistics)
+        if not s.detections:
+            skipped += 1
+            continue
+
+        all_optimized_full: List[BoundingBox] = []
+        for crop_idx in range(len(context.tablet_detector.get_cropped_images())):
+            runner.choose_crop(crop_idx)
+            if not s.sub_image.detections:
+                continue
+            try:
+                runner.run_single_step(step_transform_gt_to_img)
+                runner.run_single_step(step_create_subtablets)
+                runner.run_single_step(step_detect_rows)
+                if not s.sub_tablet_detection.get_rows():
+                    continue
+                runner.run_single_step(step_match_rows)
+                if not s.matches:
+                    continue
+                runner.run_single_step(step_match_signs_in_rows)
+                runner.run_single_step(step_align_text_rows)
+                if not s.sub_tablet_aligned:
+                    continue
+                runner.run_single_step(step_create_psr_optimizer)
+                runner.run_single_step(step_run_psr_optimization)
+            except Exception:
+                continue
+
+            ox, oy = s.crop_info['x'], s.crop_info['y']
+            for sb in s.sub_tablet_final.sign_boxes:
+                all_optimized_full.append(BoundingBox(
+                    x1=sb.x1 + ox, y1=sb.y1 + oy,
+                    x2=sb.x2 + ox, y2=sb.y2 + oy,
+                    score=sb.score, sign=sb.sign,
+                ))
+
+        if visualize and s.img is not None:
+            visualize_evaluation_fragment(
+                img=s.img,
+                fragment_id=fid,
+                preds=all_optimized_full,
+                gts=s.gt_boxes,
+                iou_threshold=0.5,
+                class_agnostic=False,
+                output_dir=output_dir,
+            )
+
+        if verbose:
+            print(f"    GT={len(s.gt_boxes)}, Pred={len(all_optimized_full)}")
+        all_results.append({
+            'fragment_id': fid,
+            'preds': all_optimized_full,
+            'gts': s.gt_boxes,
+        })
 
     if not all_results:
         print(f"  [{label}] No results produced.")
@@ -716,7 +567,7 @@ def run_evaluation(
         'label': label,
         'num_fragments': len(all_results),
         'skipped': skipped,
-        'psr_params': {k: v for k, v in psr_params.items()},
+        'psr_params': dict(psr_params) if psr_params else {},
         'class_agnostic': {
             'mAP': map_agnostic['mAP'],
             'AP@0.5': map_agnostic['AP@0.5'],
@@ -802,19 +653,13 @@ def print_eval_summary(eval_result: Dict):
 # ============ Hyperparameter Tuning ============
 
 def _eval_score(
-    tablet_detector: TabletImageDetector,
-    local_source: LocalDataSource,
-    api_source: EBLAPISource,
-    sign_resolver: SignAPIResolver,
+    context: CropContext,
     fragment_ids: List[str],
     params: dict,
 ) -> float:
     """Run evaluation and return class-agnostic mAP (higher is better)."""
     result = run_evaluation(
-        tablet_detector=tablet_detector,
-        local_source=local_source,
-        api_source=api_source,
-        sign_resolver=sign_resolver,
+        context=context,
         fragment_ids=fragment_ids,
         psr_params=params,
         verbose=False,
@@ -826,10 +671,7 @@ def _eval_score(
 
 
 def hyperparameter_search(
-    tablet_detector: TabletImageDetector,
-    local_source: LocalDataSource,
-    api_source: EBLAPISource,
-    sign_resolver: SignAPIResolver,
+    context: CropContext,
     fragment_ids: List[str],
     output_dir: str = EVAL_OUTPUT_DIR,
 ) -> Dict:
@@ -860,8 +702,7 @@ def hyperparameter_search(
     print(f"Coordinate-wise sweep: {total_evals} evaluations "
           f"(2 rounds × {sum(len(v) for v in search_axes.values())} candidates)")
 
-    best_score = _eval_score(tablet_detector, local_source, api_source,
-                             sign_resolver, fragment_ids, best_params)
+    best_score = _eval_score(context, fragment_ids, best_params)
     print(f"  Baseline mAP = {best_score:.4f}")
 
     all_search_results = []
@@ -882,8 +723,7 @@ def hyperparameter_search(
                 eval_count += 1
 
                 t0 = time.time()
-                score = _eval_score(tablet_detector, local_source, api_source,
-                                    sign_resolver, fragment_ids, trial)
+                score = _eval_score(context, fragment_ids, trial)
                 elapsed = time.time() - t0
 
                 entry = {
@@ -947,15 +787,10 @@ if __name__ == "__main__":
     print("Cuneiform Signs Alignment - Evaluation & Hyperparameter Sweep (PSR)")
     print("=" * 60)
 
-    # Data sources
-    local_source = LocalDataSource(ANNOTATIONS_DIR)
-    api_source = EBLAPISource()
-    sign_resolver = SignAPIResolver()
+    test_source = LocalTestDataSource(COCO_TEST_DIR)
+    fragments = test_source.get_available_fragments()
+    print(f"Found {len(fragments)} fragments in COCO test set")
 
-    fragments = local_source.get_available_fragments()
-    print(f"Found {len(fragments)} fragments with both image and annotation")
-
-    # Detector
     print("Loading detection model...")
     model_config = ModelConfig(
         config_file=CONFIG_FILE,
@@ -966,8 +801,21 @@ if __name__ == "__main__":
         model_config=model_config,
         score_threshold=SCORE_THRESHOLD,
         keep_crops=True,
+        is_crop_itself=True,
     )
     print("Model loaded.")
+
+    context = CropContext(
+        config=PipelineConfig(
+            model_config=model_config,
+            tablet_detector=tablet_detector,
+            local_source=test_source,
+            api_source=SubtabletEBLAPISource(),
+            color_config=ColorConfig,
+            output_dir=EVAL_OUTPUT_DIR,
+        ),
+        task_type="evaluation"
+    )
 
     eval_fragments = fragments[:EVAL_SAMPLE_LIMIT]
     os.makedirs(EVAL_OUTPUT_DIR, exist_ok=True)
@@ -979,10 +827,7 @@ if __name__ == "__main__":
     print(f"{'='*60}")
 
     eval_result = run_evaluation(
-        tablet_detector=tablet_detector,
-        local_source=local_source,
-        api_source=api_source,
-        sign_resolver=sign_resolver,
+        context=context,
         fragment_ids=eval_fragments,
         psr_params=DEFAULT_PSR_PARAMS,
         verbose=True,
@@ -1013,10 +858,7 @@ if __name__ == "__main__":
     print(f"{'='*60}")
 
     search_result = hyperparameter_search(
-        tablet_detector=tablet_detector,
-        local_source=local_source,
-        api_source=api_source,
-        sign_resolver=sign_resolver,
+        context=context,
         fragment_ids=search_fragments,
         output_dir=EVAL_OUTPUT_DIR,
     )
@@ -1032,10 +874,7 @@ if __name__ == "__main__":
         print(f"{'='*60}")
 
         eval_best = run_evaluation(
-            tablet_detector=tablet_detector,
-            local_source=local_source,
-            api_source=api_source,
-            sign_resolver=sign_resolver,
+            context=context,
             fragment_ids=eval_fragments,
             psr_params=best_params,
             verbose=True,

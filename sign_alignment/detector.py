@@ -57,6 +57,27 @@ class BaseDetector(ABC):
             device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         return device
 
+    def unload_model(self) -> None:
+        """Release the detector model from GPU memory.
+
+        Moves the model to CPU then deletes it, followed by
+        ``torch.cuda.empty_cache()``.  Safe to call multiple times.
+        After unloading, ``detect()`` must not be called again.
+        """
+        import gc
+        if self.model is None:
+            return
+        try:
+            self.model.cpu()
+        except Exception:
+            pass
+        del self.model
+        self.model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("Detector model unloaded from GPU.")
+
     def _filter_detections(self, labels, bboxes, scores) -> Detection:
         mask = scores > self.score_threshold
         labels = labels[mask]
@@ -91,17 +112,35 @@ class SingleImageDetector(BaseDetector):
     
 class TabletImageDetector(BaseDetector):
     def __init__(self, model_config: ModelConfig, score_threshold: float = 0.5, 
-                 visualize_crop: bool = False, logging_crop: bool = False, keep_crops: bool = False):
+                 visualize_crop: bool = False, logging_crop: bool = False, keep_crops: bool = False, is_crop_itself: bool = False):
         super().__init__(model_config, score_threshold)
         self.visualize_crop = visualize_crop
         self.logging_crop = logging_crop
         self.keep_crops = keep_crops
+        self.is_crop_itself = is_crop_itself
         self.cropped_images = []
         self.crop_coordinates = []  # Store crop coordinates for GT transformation
+        
     
     def detect(self, img) -> Detection:
         if self.keep_crops:
-            self.cropped_images = [] # reset cropped for each detection
+            self.cropped_images = []  # reset cropped for each detection
+
+        if self.is_crop_itself:
+            # The image is already a subtablet crop — detect directly without splitting.
+            h, w = img.shape[:2]
+            self.crop_coordinates = [{'x': 0, 'y': 0, 'w': w, 'h': h}]
+            single_detector = SingleImageDetector(model=self.model, score_threshold=self.score_threshold)
+            detections = single_detector.detect(img)
+            if self.keep_crops:
+                h, w = img.shape[:2]
+                mask = np.full((h, w), 255, dtype=np.uint8)
+                self.cropped_images.append(SingleImage(
+                    img=img,
+                    detections=copy.deepcopy(detections),
+                    mask=mask,
+                ))
+            return detections
 
         cropped_images, crop_coordinates, masks = divide_tablet_photo(
             img, 

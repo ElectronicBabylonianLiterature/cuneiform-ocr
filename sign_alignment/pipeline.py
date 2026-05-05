@@ -61,15 +61,21 @@ class PipelineConfig:
     local_source: LocalDataSource
     color_config: ColorConfig
     output_dir: str
+    api_source: EBLAPISource = field(default_factory=EBLAPISource)
     img_idx: int = 1          # which cropped sub-image to use
     # ProtoSnap is opt-in. None disables the step (default behavior).
     # Pass a ProtoSnapConfig to enable; the step still no-ops gracefully if
     # assets/weights are missing.
     protosnap: Optional[ProtoSnapConfig] = None
+    # Optional PSR optimizer parameter overrides (dict or None for defaults).
+    # Keys: sigma_factor, w_noise, lambda_data, lambda_anchor, lambda_seq,
+    #       lambda_height, lambda_rows, lambda_boundary,
+    #       rows_threshold_ratio_far, rows_threshold_ratio_close,
+    #       rows_plateau_far, rows_plateau_close, num_iterations, lr, sigma_anneal
+    psr_params: Optional[dict] = None
 
 
 class PipelineTools:
-    api_source = EBLAPISource()
     sign_resolver = SignAPIResolver()
 
 
@@ -148,6 +154,8 @@ class CropContext:
     # Cached SDFeaturizer for SD-DIFT; loaded once, reused across samples.
     _snap_dift: Optional[object] = field(default=None, repr=False, compare=False)
 
+    task_type: str = "debug"  
+
     def __post_init__(self):
         if self.state is None:
             self.state = SampleState()
@@ -157,7 +165,7 @@ class CropContext:
     @property
     def local_source(self): return self.config.local_source
     @property
-    def api_source(self): return self.tools.api_source
+    def api_source(self): return self.config.api_source
     @property
     def color_config(self): return self.config.color_config
     @property
@@ -204,10 +212,11 @@ class Runner:
              os.makedirs(context.output_dir, exist_ok=True)
 
     def run_single_step(self, step: Step):
-        info_message = f"Step: {step.name}"
-        if step.description:
-            info_message += f" - {step.description}"
-        print(info_message)
+        if self.vis.info:
+            info_message = f"Step: {step.name}"
+            if step.description:
+                info_message += f" - {step.description}"
+            print(info_message)
         if step.run:
             step.run(self.context)
         if step.visualize:
@@ -219,8 +228,11 @@ class Runner:
         self.context.fragment_id = fragment_id
 
     def choose_crop(self, crop_idx: int):
-        print(f"Choosing crop index {crop_idx} for sub-image")
         self.context.config.img_idx = crop_idx
+        cropped = self.context.tablet_detector.get_cropped_images()
+        if cropped:
+            self.context.state.sub_image = cropped[crop_idx]
+            self.context.state.crop_info = self.context.tablet_detector.crop_coordinates[crop_idx]
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +240,7 @@ class Runner:
 # ---------------------------------------------------------------------------
 
 def _out(context: CropContext, suffix: str) -> str:
-    return os.path.join(context.output_dir, f"debug_{context.fragment_id}_{suffix}")
+    return os.path.join(context.output_dir, f"{context.task_type}_{context.fragment_id}_{suffix}")
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +300,8 @@ def _detect_signs(context: CropContext):
     s.detections = context.tablet_detector.detect(s.img)
     cropped = context.tablet_detector.get_cropped_images()
     img_idx = context.config.img_idx
+    if img_idx >= len(cropped):
+        img_idx = len(cropped) - 1
     s.sub_image = cropped[img_idx]
     s.crop_info = context.tablet_detector.crop_coordinates[img_idx]
 
@@ -802,22 +816,23 @@ def _visualize_protosnap_crops(context: CropContext, vis: VisOptions):
 
 def _create_psr_optimizer(context: CropContext):
     s = context.state
+    p = context.config.psr_params or {}
     device = "cuda" if torch.cuda.is_available() else "cpu"
     s.optimizer = PointSetRegistrationOptimizer(
         sub_tablet_text=s.sub_tablet_aligned,
         target_detections=s.sub_image.detections,
-        sigma=s.avg_width * 1.5,
-        w_noise=0.1,
-        lambda_data=2.0,
-        lambda_anchor=0.01,
-        lambda_seq=0.1,
-        lambda_height=0.01,
-        lambda_rows=5.0,
-        lambda_boundary=1.0,
-        rows_threshold_ratio_far=1 / 3.0,
-        rows_threshold_ratio_close=2 / 3.0,
-        rows_plateau_far=0.5,
-        rows_plateau_close=1.0,
+        sigma=s.avg_width * p.get('sigma_factor', 1.5),
+        w_noise=p.get('w_noise', 0.1),
+        lambda_data=p.get('lambda_data', 2.0),
+        lambda_anchor=p.get('lambda_anchor', 0.01),
+        lambda_seq=p.get('lambda_seq', 0.1),
+        lambda_height=p.get('lambda_height', 0.01),
+        lambda_rows=p.get('lambda_rows', 5.0),
+        lambda_boundary=p.get('lambda_boundary', 0.0),
+        rows_threshold_ratio_far=p.get('rows_threshold_ratio_far', 1 / 3.0),
+        rows_threshold_ratio_close=p.get('rows_threshold_ratio_close', 2 / 3.0),
+        rows_plateau_far=p.get('rows_plateau_far', 0.5),
+        rows_plateau_close=p.get('rows_plateau_close', 1.0),
         contour_mask=s.sub_image.mask,
         device=device,
     )
@@ -875,10 +890,11 @@ def _run_psr_optimization(context: CropContext):
               f"{s.snap_summary['accepted']}/{s.snap_summary['total']} "
               f"signs frozen.")
 
+    p = context.config.psr_params or {}
     s.sub_tablet_final = s.optimizer.optimize(
-        num_iterations=80,
-        lr=1.0,
-        sigma_anneal=True,
+        num_iterations=p.get('num_iterations', 80),
+        lr=p.get('lr', 1.0),
+        sigma_anneal=p.get('sigma_anneal', True),
         sigma_final=None,
         verbose=True,
         log_every=20,
@@ -1115,6 +1131,19 @@ step_offset_analysis = Step(
     visualize=_visualize_offset_analysis,
 )
 
+# ---------------------------------------------------------------------------
+# Step: Unload detector model (free GPU memory before DIFT / PSR)
+# ---------------------------------------------------------------------------
+
+def _unload_detector(context: CropContext):
+    context.tablet_detector.unload_model()
+
+step_unload_detector = Step(
+    name="Unload Detector Model (free GPU memory)",
+    description="Releases the sign detector from GPU so DIFT and PSR have more VRAM.",
+    run=_unload_detector,
+)
+
 step_protosnap = Step(
     name="ProtoSnap Setup (resolve period, build refiner)",
     run=_protosnap_setup,
@@ -1172,6 +1201,7 @@ DEBUG_STEPS = [
     step_align_text_rows,
     step_build_sign_match_info,
     step_offset_analysis,
+    step_unload_detector,
     step_create_psr_optimizer,
     step_run_psr_optimization,
     step_plot_loss_history,
@@ -1200,6 +1230,7 @@ DEBUG_STEPS_WITH_PROTOSNAP = [
     step_align_text_rows,
     step_build_sign_match_info,
     step_offset_analysis,
+    step_unload_detector,
     step_protosnap,
     step_create_psr_optimizer,
     step_run_psr_optimization,

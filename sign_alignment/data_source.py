@@ -1,9 +1,11 @@
 
 import json
 import os
+import re
 from typing import List, Optional, Tuple
 from pathlib import Path
 import cv2
+import numpy as np
 import requests
 from .sign import SignResolver
 
@@ -144,6 +146,89 @@ class LocalDataSource:
         return boxes if boxes else None
 
 
+class LocalTestDataSource:
+    """
+    Data source backed by a COCO-format dataset (val2017 split).
+
+    Directory layout expected::
+
+        coco_dir/
+            val2017/              # subtablet images
+            annotations/
+                instances_val2017.json
+
+    Each image file is treated as an independent fragment.  The ``fragment_id``
+    is the filename without the file-type suffix (e.g. ``NBC.1712-0``).
+    Subtablet images belonging to the same physical tablet are *not* merged.
+
+    Use :class:`SubtabletEBLAPISource` as the API source when the EBL API
+    must be queried with the bare fragment ID (without the ``-N`` suffix).
+    """
+
+    ANNOTATION_FILE = "annotations/instances_val2017.json"
+    IMAGES_DIR = "val2017"
+
+    def __init__(self, coco_dir: str):
+        self.coco_dir = Path(coco_dir)
+        self._data: Optional[dict] = None
+        self._image_by_stem: dict = {}         # stem (no ext) -> image info dict
+        self._annotations_by_image: dict = {}  # image_id -> [annotation, ...]
+        self._category_names: dict = {}        # category_id -> sign_name
+
+    def _ensure_loaded(self):
+        if self._data is not None:
+            return
+
+        ann_path = self.coco_dir / self.ANNOTATION_FILE
+        with open(ann_path, 'r', encoding='utf-8') as f:
+            self._data = json.load(f)
+
+        self._category_names = {c['id']: c['name'] for c in self._data['categories']}
+
+        for img in self._data['images']:
+            stem = img['file_name'].rsplit('.', 1)[0]
+            self._image_by_stem[stem] = img
+
+        for ann in self._data['annotations']:
+            self._annotations_by_image.setdefault(ann['image_id'], [])
+            self._annotations_by_image[ann['image_id']].append(ann)
+
+    def get_available_fragments(self) -> List[str]:
+        self._ensure_loaded()
+        return sorted(self._image_by_stem.keys())
+
+    def load_image(self, fragment_id: str) -> Optional[cv2.Mat]:
+        self._ensure_loaded()
+        img_info = self._image_by_stem.get(fragment_id)
+        if img_info is None:
+            return None
+        path = self.coco_dir / self.IMAGES_DIR / img_info['file_name']
+        return cv2.imread(str(path))
+
+    def load_annotation(self, fragment_id: str) -> Optional[GroundTruths]:
+        self._ensure_loaded()
+        img_info = self._image_by_stem.get(fragment_id)
+        if img_info is None:
+            return None
+
+        boxes: GroundTruths = []
+        for ann in self._annotations_by_image.get(img_info['id'], []):
+            if ann.get('iscrowd', 0):
+                continue
+            x, y, w, h = ann['bbox']
+            sign_name = self._category_names[ann['category_id']]
+            sign = SignResolver.resolve(sign_name, expected_type='SIGN')
+            boxes.append(BoundingBox(
+                x1=float(x),
+                y1=float(y),
+                x2=float(x + w),
+                y2=float(y + h),
+                score=1.0,
+                sign=sign,
+            ))
+        return boxes if boxes else None
+
+
 class EBLAPISource:    
     BASE_URL = "https://ebl.badw.de/api"
     
@@ -215,6 +300,21 @@ class EBLAPISource:
         if text_data:
             return SignTextParser.parse_text_lines(text_data, filter_broken, sign_resolver=sign_resolver)
         return None
+
+
+class SubtabletEBLAPISource(EBLAPISource):
+    """
+    EBL API source that strips trailing subtablet suffixes (``-0``, ``-1``, …)
+    from fragment IDs before querying the API.
+
+    Use this together with :class:`LocalTestDataSource` so that the text
+    transcription for a full tablet fragment is retrieved correctly even when
+    the ``fragment_id`` refers to one subtablet image (e.g. ``NBC.1712-0``).
+    """
+
+    def get_fragment_data(self, fragment_id: str) -> Optional[dict]:
+        api_id = re.sub(r'-\d+$', '', fragment_id)
+        return super().get_fragment_data(api_id)
 
 
 class SignTextParser:    
