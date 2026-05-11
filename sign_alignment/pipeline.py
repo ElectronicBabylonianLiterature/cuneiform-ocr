@@ -222,7 +222,12 @@ class Runner:
         if step.visualize:
             step.visualize(self.context, self.vis)
 
-    def choose_sample(self, idx: int):
+    def choose_sample(self, idx = 0, name=""):
+        if name:
+            if name in self._fragments:
+                idx = self._fragments.index(name)
+            else:
+                raise ValueError(f"Fragment name '{name}' not found in available fragments.")
         fragment_id = self._fragments[idx]
         print(f"Processing sample: {fragment_id}")
         self.context.fragment_id = fragment_id

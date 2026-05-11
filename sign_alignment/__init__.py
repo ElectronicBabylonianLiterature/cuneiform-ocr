@@ -70,6 +70,11 @@ from .psr_optimizer import (
     filter_boxes_by_mask,
 )
 
+from .hyperparam import (
+    hyperparameter_search,
+    SEARCH_AXES,
+)
+
 __all__ = [
     # Data sources
     'LocalDataSource',
@@ -126,4 +131,8 @@ __all__ = [
     'PointSetRegistrationOptimizer',
     'initialize_text_subtablet',
     'filter_boxes_by_mask',
+
+    # Hyperparameter search
+    'hyperparameter_search',
+    'SEARCH_AXES',
 ]

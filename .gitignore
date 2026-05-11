@@ -30,5 +30,6 @@ data_processing/division_checking_photos/
 data_processing/visualizations/
 evaluation_output_*/
 evaluation_results/
+evaluation_results_*/
 ngram_match_search_output/
 alignment_loss_functions/
