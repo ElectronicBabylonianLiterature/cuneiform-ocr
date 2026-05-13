@@ -8,10 +8,8 @@ from sign_alignment.visualizer import ColorConfig
 from sign_alignment.pipeline import (
     CropContext, PipelineConfig, SampleState, Runner, VisOptions,
     step_load_data, step_detect_signs, step_compute_statistics,
-    step_transform_gt_to_img, step_create_subtablets, step_detect_rows,
-    step_match_rows, step_match_signs_in_rows, step_align_text_rows,
-    step_build_sign_match_info, step_create_psr_optimizer, step_run_psr_optimization,
     step_results_comparison,
+    PIPELINE_STEPS_PER_CROP,
 )
 
 load_dotenv()
@@ -38,47 +36,35 @@ if __name__ == "__main__":
     )
 
     vis = VisOptions(info=True, display=False, save=True)
-    runner = Runner(context, steps=[], vis=vis)
+    crop_runner = Runner(context, steps=PIPELINE_STEPS_PER_CROP, vis=vis)
 
     summary = []
-    for idx in range(min(SAMPLE_LIMIT, len(runner._fragments))):
+    for idx in range(min(SAMPLE_LIMIT, len(crop_runner._fragments))):
         context.state = SampleState()
-        runner.choose_sample(idx)
+        crop_runner.choose_sample(idx)
         fid = context.fragment_id
         print(f"\n{'='*60}\n{fid}")
 
         try:
-            runner.run_single_step(step_load_data)
+            crop_runner.run_single_step(step_load_data)
         except Exception as e:
             print(f"  Load failed: {e}")
             continue
 
-        runner.run_single_step(step_detect_signs)
-        runner.run_single_step(step_compute_statistics)
+        crop_runner.run_single_step(step_detect_signs)
+        crop_runner.run_single_step(step_compute_statistics)
 
         s = context.state
         all_optimized_full = []
         for crop_idx in range(len(tablet_detector.get_cropped_images())):
-            runner.choose_crop(crop_idx)
+            crop_runner.choose_crop(crop_idx)
             if not s.sub_image.detections:
                 continue
             try:
-                runner.run_single_step(step_transform_gt_to_img)
-                runner.run_single_step(step_create_subtablets)
-                runner.run_single_step(step_detect_rows)
-                if not s.sub_tablet_detection.get_rows():
+                crop_runner.run_all()
+                if not s.sub_tablet_detection.get_rows() or not s.matches or not s.sub_tablet_aligned:
                     continue
-                runner.run_single_step(step_match_rows)
-                if not s.matches:
-                    continue
-                runner.run_single_step(step_match_signs_in_rows)
-                runner.run_single_step(step_align_text_rows)
-                if not s.sub_tablet_aligned:
-                    continue
-                runner.run_single_step(step_build_sign_match_info)
-                runner.run_single_step(step_create_psr_optimizer)
-                runner.run_single_step(step_run_psr_optimization)
-                runner.run_single_step(step_results_comparison)
+                crop_runner.run_single_step(step_results_comparison)
             except Exception as e:
                 print(f"  Crop {crop_idx} error: {e}")
                 continue

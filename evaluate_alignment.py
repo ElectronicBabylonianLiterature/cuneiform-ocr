@@ -35,14 +35,7 @@ from sign_alignment.pipeline import (
     step_load_data,
     step_detect_signs,
     step_compute_statistics,
-    step_transform_gt_to_img,
-    step_create_subtablets,
-    step_detect_rows,
-    step_match_rows,
-    step_match_signs_in_rows,
-    step_align_text_rows,
-    step_create_psr_optimizer,
-    step_run_psr_optimization,
+    PIPELINE_STEPS_PER_CROP,
 )
 
 load_dotenv()
@@ -659,20 +652,9 @@ def _predict_psr_crops(
         if not s.sub_image.detections:
             continue
         try:
-            runner.run_single_step(step_transform_gt_to_img)
-            runner.run_single_step(step_create_subtablets)
-            runner.run_single_step(step_detect_rows)
-            if not s.sub_tablet_detection.get_rows():
+            runner.run_all()
+            if not s.sub_tablet_detection.get_rows() or not s.matches or not s.sub_tablet_aligned:
                 continue
-            runner.run_single_step(step_match_rows)
-            if not s.matches:
-                continue
-            runner.run_single_step(step_match_signs_in_rows)
-            runner.run_single_step(step_align_text_rows)
-            if not s.sub_tablet_aligned:
-                continue
-            runner.run_single_step(step_create_psr_optimizer)
-            runner.run_single_step(step_run_psr_optimization)
         except Exception:
             continue
 
@@ -726,7 +708,7 @@ def run_predictions(
     """
     context.config.psr_params = psr_params  # None = step defaults
     vis = VisOptions(info=False, display=False, save=False)
-    runner = Runner(context, steps=[], vis=vis)
+    runner = Runner(context, steps=PIPELINE_STEPS_PER_CROP, vis=vis)
     all_results = []
     skipped = 0
 
@@ -985,7 +967,7 @@ if __name__ == "__main__":
     #   PredictionMode.PSR       – full PSR alignment optimization (default)
     #   PredictionMode.DETECTION – raw detection model output only
     # ----------------------------------------------------------------
-    PREDICTION_MODE = PredictionMode.DETECTION
+    PREDICTION_MODE = PredictionMode.PSR
 
     # --- STEP 1: Full evaluation with default params ---
     print(f"\n{'='*60}")

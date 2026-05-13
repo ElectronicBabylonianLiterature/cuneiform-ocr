@@ -36,6 +36,10 @@ from data_processing.line_process import (
     match_rows_dp,
     match_signs_in_row_dp,
 )
+from sign_alignment.features import (
+    SIFTExtractor, SparseFeatures, NNMatcher, MatchResult,
+    draw_keypoints, draw_matches,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +144,12 @@ class SampleState:
 
     # PSR optimizer
     optimizer: Optional[PointSetRegistrationOptimizer] = None
+
+    # Sparse features extracted from sub-image
+    sparse_features: Optional[SparseFeatures] = None
+    crop_features: Optional[SparseFeatures] = None  # features of one cropped sign
+    crop_box: Optional[tuple] = None                # (x1, y1, x2, y2) in sub_image
+    crop_match: Optional[MatchResult] = None        # matches: crop → sub_image
 
 
 # ---------------------------------------------------------------------------
@@ -1092,6 +1102,93 @@ class StepParamChanges(Step):
                   f"w={after.width-before.width:.1f}, h={after.height-before.height:.1f}")
 
 
+
+#  --- experimental steps
+class StepExtractFeatures(Step):
+    name = "Extract Features"
+    TOP_N_FULL = 30000  # top regular keypoints on sub-image (cyan)
+    TOP_N_CROP = 300   # top regular keypoints on crop (cyan)
+
+    def run(self, context: CropContext):
+        s = context.state
+        extractor = SIFTExtractor()
+        s.sparse_features = extractor.extract(s.sub_image.img)
+
+        dets = s.sub_image.detections
+        if dets:
+            det = dets[0]
+            img = s.sub_image.img
+            H, W = img.shape[:2]
+            x1 = max(0, int(det.x1)); y1 = max(0, int(det.y1))
+            x2 = min(W, int(det.x2)); y2 = min(H, int(det.y2))
+            crop = img[y1:y2, x1:x2]
+            s.crop_features = extractor.extract(crop)
+            s.crop_match = NNMatcher().match(s.crop_features, s.sparse_features)
+            s.crop_box = (x1, y1, x2, y2)
+
+    def visualize(self, context: CropContext, vis: VisOptions):
+        import matplotlib.pyplot as plt
+        s = context.state
+        feat = s.sparse_features
+        matched_in_full = s.crop_match.dst_pts if s.crop_match is not None else None
+        matched_in_crop = s.crop_match.src_pts if s.crop_match is not None else None
+        n_matched = len(matched_in_full) if matched_in_full is not None else 0
+
+        if vis.info:
+            print(f"Sub-image: {feat.n_keypoints} kps — top {self.TOP_N_FULL} (cyan) "
+                  f"+ {n_matched} matched (green)")
+            if s.crop_features is not None:
+                print(f"Crop {s.crop_box}: {s.crop_features.n_keypoints} kps — "
+                      f"top {self.TOP_N_CROP} (cyan) + {n_matched} matched (green)")
+
+        # --- Image 1: sub-image — top-N keypoints + all matched points highlighted ---
+        kp_vis = draw_keypoints(s.sub_image.img, feat,
+                                max_draw=self.TOP_N_FULL, highlight_pts=matched_in_full)
+        if vis.display:
+            plt.figure(figsize=(14, 9))
+            plt.imshow(cv2.cvtColor(kp_vis, cv2.COLOR_BGR2RGB))
+            plt.axis("off")
+            plt.title(f"Sub-image SIFT — top {self.TOP_N_FULL} of {feat.n_keypoints} (cyan) "
+                      f"+ {n_matched} matched (green)")
+            plt.tight_layout()
+            plt.show()
+        if vis.save:
+            cv2.imwrite(_out(context, "keypoints.jpg"), kp_vis)
+
+        if s.crop_features is None:
+            return
+        x1, y1, x2, y2 = s.crop_box
+        crop_img = s.sub_image.img[y1:y2, x1:x2]
+
+        # --- Image 2: crop — top-N keypoints + all matched points highlighted ---
+        crop_kp_vis = draw_keypoints(crop_img, s.crop_features,
+                                     max_draw=self.TOP_N_CROP, highlight_pts=matched_in_crop)
+        if vis.display:
+            plt.figure(figsize=(8, 8))
+            plt.imshow(cv2.cvtColor(crop_kp_vis, cv2.COLOR_BGR2RGB))
+            plt.axis("off")
+            plt.title(f"Crop SIFT — top {self.TOP_N_CROP} of {s.crop_features.n_keypoints} (cyan) "
+                      f"+ {n_matched} matched (green)")
+            plt.tight_layout()
+            plt.show()
+        if vis.save:
+            cv2.imwrite(_out(context, "keypoints_crop.jpg"), crop_kp_vis)
+
+        # --- Image 3: matches — crop (left) ↔ sub-image (right) ---
+        match_vis = draw_matches(crop_img, s.sub_image.img, s.crop_match)
+        if vis.display:
+            plt.figure(figsize=(18, 7))
+            plt.imshow(cv2.cvtColor(match_vis, cv2.COLOR_BGR2RGB))
+            plt.axis("off")
+            plt.title(f"SIFT matches: crop → sub-image ({s.crop_match.n_matches} matches)")
+            plt.tight_layout()
+            plt.show()
+        if vis.save:
+            cv2.imwrite(_out(context, "keypoints_crop_match.jpg"), match_vis)
+
+
+# --- 
+
 # ---------------------------------------------------------------------------
 # Step instances
 # ---------------------------------------------------------------------------
@@ -1119,6 +1216,8 @@ step_run_psr_optimization = StepRunPsrOptimization()
 step_plot_loss_history = StepPlotLossHistory()
 step_results_comparison = StepResultsComparison()
 step_param_changes = StepParamChanges()
+ # experimental
+step_extract_features = StepExtractFeatures() 
 
 
 DEBUG_STEPS = [
