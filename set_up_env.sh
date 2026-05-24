@@ -3,7 +3,7 @@
 set -ex
 
 export PATH=$HOME/.local/bin:$PATH
-export PYTHONPATH=$HOME/cuneiform-ocr/mmdetection:$PYTHONPATH
+export PYTHONPATH=$HOME/erc-src/cuneiform-ocr/mmdetection:$PYTHONPATH
 
 cd $HOME
 ls -la
