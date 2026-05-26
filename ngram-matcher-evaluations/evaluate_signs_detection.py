@@ -15,8 +15,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pymongo import MongoClient
 
-# Import broken sign filter
-sys.path.insert(0, str(Path(__file__).parent))
+# Import broken sign filter — ensure repo root is on sys.path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from data_processing.broken_sign_filter import filter_broken_from_text
 from data_processing.sign_resolver import SignToABZResolver
 
@@ -34,7 +34,7 @@ DETECTION_JSON_PATH = os.path.expanduser(
 )
 
 # Output directory
-OUTPUT_DIR = "./evaluation_output_new_line_det_0.8_0.35_2_0.006_20260225"
+OUTPUT_DIR = "./evaluation_output_new_line_det_0.8_0.35_2_0.006_20260525-anchor-test"
 
 # Training set directory (images to exclude from evaluation)
 TRAIN_SET_DIR = os.path.expanduser(
@@ -89,87 +89,98 @@ class FragmentModelWithOverlaps(FragmentModel):
 
 def fetch_all_ground_truth_signs() -> Dict[str, str]:
     """Fetch all ground truth signs from MongoDB with broken sign filtering and ABZ conversion"""
-    print("Connecting to MongoDB...")
-    
-    try:
-        client = MongoClient(MONGODB_URI)
-        db = client['ebl']
-        fragments_collection = db['fragments']
-        
-        print("Initializing ABZ resolver with cache...")
-        abz_resolver = SignToABZResolver(MONGODB_URI)
-        abz_resolver.connect()
-        
-        print("Fetching fragments from MongoDB...")
-        
-        # Query all fragments that have text data
-        cursor = fragments_collection.find(
-            {'text': {'$exists': True}},
-            {'_id': 1, 'text': 1}
-        )
-        total = fragments_collection.count_documents({'text': {'$exists': True}})
+    import time
 
-        class CursorWithLength:
-            def __init__(self, cursor, total):
-                self.cursor = cursor
-                self.total = total
-            def __iter__(self):
-                return iter(self.cursor)
-            def __len__(self):
-                return self.total
-        
-        cursor_with_length = CursorWithLength(cursor, total)
-        
-        ground_truth_map = {}
-        processed_count = 0
-        filtered_count = 0
-        
-        for doc in tqdm(cursor_with_length, desc="Processing fragments"):
-            fragment_id = doc.get('_id', '')
-            text_data = doc.get('text')
-            
-            if not fragment_id or not text_data:
-                continue
-            
-            processed_count += 1
-            
-            # Use broken_sign_filter to extract signs (with filtering)
-            try:
-                lines = filter_broken_from_text(text_data)
-                
-                if lines:
-                    # Convert to space-separated string format (sign names)
-                    signs_text = ' '.join(' '.join(line) for line in lines)
-                    
-                    # Convert sign names to ABZ format
-                    abz_text = abz_resolver.convert_signs_to_abz(signs_text)
-                    
-                    if abz_text.strip():
-                        ground_truth_map[fragment_id] = abz_text
-                        filtered_count += 1
-            except Exception as e:
-                print(f"\nError processing fragment {fragment_id}: {e}")
-                continue
-        
-        # Output cache statistics
-        cache_stats = abz_resolver.get_cache_stats()
-        print(f"\nABZ Resolver Cache Stats:")
-        print(f"  Cached signs: {cache_stats['cached_signs']}")
-        print(f"  Found in DB: {cache_stats['found']}")
-        print(f"  Not found: {cache_stats['not_found']}")
-        
-        abz_resolver.close()
-        client.close()
-        
-        print(f"\nProcessed {processed_count} fragments from MongoDB")
-        print(f"Successfully filtered {filtered_count} fragments with text data")
-        print(f"Loaded {len(ground_truth_map)} fragments with ground truth (ABZ format)\n")
-        
-        return ground_truth_map
-        
-    except Exception as e:
-        print(f"Error connecting to MongoDB: {e}")
-        raise
+    def _make_client():
+        return MongoClient(MONGODB_URI)
+
+    print("Connecting to MongoDB...")
+    client = _make_client()
+    db = client['ebl']
+    fragments_collection = db['fragments']
+
+    print("Initializing ABZ resolver with cache...")
+    abz_resolver = SignToABZResolver(MONGODB_URI)
+    abz_resolver.connect()
+
+    print("Fetching fragments from MongoDB...")
+
+    PAGE_SIZE = 5000
+    total = fragments_collection.count_documents({'text': {'$exists': True}})
+
+    ground_truth_map = {}
+    processed_count = 0
+    filtered_count = 0
+    last_id = None
+
+    with tqdm(total=total, desc="Processing fragments") as pbar:
+        while True:
+            # Fetch one page with retry/reconnect on connection drop
+            for attempt in range(5):
+                try:
+                    query = {'text': {'$exists': True}}
+                    if last_id is not None:
+                        query['_id'] = {'$gt': last_id}
+                    batch = list(fragments_collection.find(
+                        query, {'_id': 1, 'text': 1}
+                    ).sort('_id', 1).limit(PAGE_SIZE))
+                    break
+                except Exception as e:
+                    if attempt < 4:
+                        wait = 2 ** attempt
+                        tqdm.write(f"\nConnection error (attempt {attempt+1}/5): {e}. Reconnecting in {wait}s...")
+                        time.sleep(wait)
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+                        client = _make_client()
+                        db = client['ebl']
+                        fragments_collection = db['fragments']
+                    else:
+                        raise
+
+            if not batch:
+                break
+            last_id = batch[-1]['_id']
+
+            for doc in batch:
+                fragment_id = doc.get('_id', '')
+                text_data = doc.get('text')
+
+                if not fragment_id or not text_data:
+                    pbar.update(1)
+                    continue
+
+                processed_count += 1
+
+                try:
+                    lines = filter_broken_from_text(text_data)
+                    if lines:
+                        signs_text = ' '.join(' '.join(line) for line in lines)
+                        abz_text = abz_resolver.convert_signs_to_abz(signs_text)
+                        if abz_text.strip():
+                            ground_truth_map[fragment_id] = abz_text
+                            filtered_count += 1
+                except Exception as e:
+                    tqdm.write(f"\nError processing fragment {fragment_id}: {e}")
+                pbar.update(1)
+
+    # Output cache statistics
+    cache_stats = abz_resolver.get_cache_stats()
+    print(f"\nABZ Resolver Cache Stats:")
+    print(f"  Cached signs: {cache_stats['cached_signs']}")
+    print(f"  Found in DB: {cache_stats['found']}")
+    print(f"  Not found: {cache_stats['not_found']}")
+
+    abz_resolver.close()
+    client.close()
+
+    print(f"\nProcessed {processed_count} fragments from MongoDB")
+    print(f"Successfully filtered {filtered_count} fragments with text data")
+    print(f"Loaded {len(ground_truth_map)} fragments with ground truth (ABZ format)\n")
+
+    return ground_truth_map
 
 
 def load_detection_results(json_file_path: str) -> List[Dict]:
