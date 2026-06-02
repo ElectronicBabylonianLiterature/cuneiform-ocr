@@ -229,26 +229,31 @@ class LocalTestDataSource:
         return boxes if boxes else None
 
 
-class EBLAPISource:    
+class EBLAPISource:
     BASE_URL = "https://ebl.badw.de/api"
-    
-    def __init__(self, timeout: int = 10):
+
+    def __init__(self, timeout: int = 60, retries: int = 3):
         self.timeout = timeout
+        self.retries = retries
         self._fragment_cache = {}  # in-memory cache: fragment_id -> data
-    
+
     def get_fragment_data(self, fragment_id: str) -> Optional[dict]:
         if fragment_id in self._fragment_cache:
             return self._fragment_cache[fragment_id]
 
         url = f"{self.BASE_URL}/fragments/{fragment_id}"
-        try:
-            response = requests.get(url, timeout=self.timeout)
-            if response.status_code == 200:
-                data = response.json()
-                self._fragment_cache[fragment_id] = data
-                return data
-        except requests.RequestException as e:
-            print(f"API request failed for fragment {fragment_id}: {e}")
+        last_err = None
+        for attempt in range(self.retries + 1):
+            try:
+                response = requests.get(url, timeout=self.timeout)
+                if response.status_code == 200:
+                    data = response.json()
+                    self._fragment_cache[fragment_id] = data
+                    return data
+                last_err = f"HTTP {response.status_code}"
+            except requests.RequestException as e:
+                last_err = str(e)
+        print(f"API request failed for fragment {fragment_id} after {self.retries+1} attempts: {last_err}")
         return None
     
     def get_signs(self, fragment_id: str) -> Optional[str]:

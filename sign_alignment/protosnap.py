@@ -517,6 +517,38 @@ def load_dift_model(config: Optional["ProtoSnapConfig"]):
         return None
 
 
+def make_dift_wrapper(config: Optional["ProtoSnapConfig"], dift,
+                      prompt: str = "", img_size: int = 512):
+    """Build a ProtoSnap ``DiftWrapper`` around a pre-loaded SD-DIFT model.
+
+    Reuses the same sys.path-insertion machinery as :class:`DiftAffineEstimator`
+    so DIFT dense-feature extraction (``featurize`` / ``get_similaritity_tensor``)
+    can be invoked outside the center-freeze refiner.
+
+    Returns None if the model or repo_root is unavailable.
+    """
+    if dift is None or config is None or not config.repo_root:
+        return None
+    import sys
+    repo_root = str(config.repo_root)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from src.dift import DiftWrapper
+    from argparse import Namespace
+    return DiftWrapper(Namespace(prompt=prompt, img_size=img_size), dift)
+
+
+def dift_best_buddies(sim_tensor, img_size: int = 512):
+    """Thin re-export of ProtoSnap's ``get_best_buddies``.
+
+    `sim_tensor` is the (H, W, H, W) output of
+    ``DiftWrapper.get_similaritity_tensor(a, b)``. Returns a list of
+    ``((b_x, b_y), (a_x, a_y))`` mutual-NN pairs in `img_size`-pixel space.
+    """
+    from src.initialization import get_best_buddies
+    return get_best_buddies(sim_tensor, img_size)
+
+
 def make_estimator(config: ProtoSnapConfig, dift=None) -> Optional[TransformEstimator]:
     if config.repo_root and dift is not None:
         return DiftAffineEstimator(

@@ -1,11 +1,12 @@
 from collections import Counter
 from dataclasses import dataclass, field
 import os
-from typing import Optional
+from typing import Callable, List, Optional
 
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 
 from sign_alignment.detector import ModelConfig, SingleImage, TabletImageDetector
 from sign_alignment.data_source import EBLAPISource, LocalDataSource, GroundTruths, SignAPIResolver, SignTextParser
@@ -25,6 +26,8 @@ from sign_alignment.protosnap import (
     ProtoSnapConfig,
     SnapStatus,
     load_dift_model,
+    make_dift_wrapper,
+    dift_best_buddies,
     make_refiner,
     render_refinement_grid,
     summarize_refinements,
@@ -36,9 +39,12 @@ from data_processing.line_process import (
     match_rows_dp,
     match_signs_in_row_dp,
 )
-from sign_alignment.features import (
-    SIFTExtractor, SparseFeatures, NNMatcher, MatchResult,
-    draw_keypoints, draw_matches,
+from sign_alignment.dift_align import (
+    CanonicalSignSource, ProtoSnapCanonicalSource, EBLCanonicalSource,
+    CanonicalFeatureCache, DiscoveryConfig, GapDetectionConfig,
+    GapDetector, IdentificationConfig, SignIdentifier,
+    GapDiscovery, make_canonical_source,
+    render_discovery_grid, summarize_discoveries,
 )
 
 
@@ -77,6 +83,13 @@ class PipelineConfig:
     #       rows_threshold_ratio_far, rows_threshold_ratio_close,
     #       rows_plateau_far, rows_plateau_close, num_iterations, lr, sigma_anneal
     psr_params: Optional[dict] = None
+
+    # Gap-driven DIFT-discovery config. None = library defaults.
+    discovery: Optional["DiscoveryConfig"] = None
+    # Optional override: callable (period, ProtoSnapConfig) -> CanonicalSignSource.
+    # When None, defaults to ProtoSnapCanonicalSource (period -> Santakku/Assurbanipal).
+    # Use this hook to plug in the future eBL canonical-sign retrieval.
+    canonical_source_factory: Optional[Callable] = None
 
 
 class PipelineTools:
@@ -145,11 +158,15 @@ class SampleState:
     # PSR optimizer
     optimizer: Optional[PointSetRegistrationOptimizer] = None
 
-    # Sparse features extracted from sub-image
-    sparse_features: Optional[SparseFeatures] = None
-    crop_features: Optional[SparseFeatures] = None  # features of one cropped sign
-    crop_box: Optional[tuple] = None                # (x1, y1, x2, y2) in sub_image
-    crop_match: Optional[MatchResult] = None        # matches: crop → sub_image
+    # Gap-driven DIFT discovery state (period-driven canonical source + cache).
+    canonical_source: Optional["CanonicalSignSource"] = None
+    canonical_cache: Optional["CanonicalFeatureCache"] = None
+    discovery_meta: Optional[dict] = None
+    # Coordinate-based gap candidates (before identification).
+    gap_candidates: Optional[list] = None  # list[GapCandidate]
+    # Final per-gap discoveries (gap + assigned canonical sign).
+    discoveries: Optional[list] = None  # list[GapDiscovery]
+    discovery_summary: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +180,10 @@ class CropContext:
     state: SampleState = None
     # Cached SDFeaturizer for SD-DIFT; loaded once, reused across samples.
     _snap_dift: Optional[object] = field(default=None, repr=False, compare=False)
+    # Per-font CanonicalFeatureCache, shared across samples so the eager
+    # full-inventory precompute happens once per (Python session × font).
+    # Keys are short font identifiers like "Assurbanipal" or "Santakku".
+    _canonical_caches: dict = field(default_factory=dict, repr=False, compare=False)
 
     task_type: str = "debug"  
 
@@ -850,9 +871,22 @@ class StepCreatePsrOptimizer(Step):
         s = context.state
         p = context.config.psr_params or {}
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Augment target detections with DIFT-discovered gap bboxes (if any).
+        # Discoveries already carry an assigned sign label, so the GMM data
+        # term naturally pulls source signs of the same class onto them.
+        target_detections = list(s.sub_image.detections)
+        if s.discoveries:
+            extra = [d.to_bounding_box() for d in s.discoveries
+                     if not d.low_confidence]
+            target_detections.extend(extra)
+            s.discovery_augmented_count = len(extra)
+        else:
+            s.discovery_augmented_count = 0
+
         s.optimizer = PointSetRegistrationOptimizer(
             sub_tablet_text=s.sub_tablet_aligned,
-            target_detections=s.sub_image.detections,
+            target_detections=target_detections,
             sigma=s.avg_width * p.get('sigma_factor', 1.5),
             w_noise=p.get('w_noise', 0.1),
             lambda_data=p.get('lambda_data', 2.0),
@@ -875,6 +909,10 @@ class StepCreatePsrOptimizer(Step):
         if vis.info:
             print(f"=== PSR Optimizer ===")
             print(f"  Device: {opt.device}, Source (M): {opt.M}, Target (N): {opt.N}")
+            n_extra = getattr(s, "discovery_augmented_count", 0)
+            if n_extra:
+                print(f"    Target breakdown: {opt.N - n_extra} model detections "
+                      f"+ {n_extra} DIFT-discovered gap signs")
             print(f"  Sigma: {opt.sigma:.1f}, w_noise: {opt.w_noise}")
             print(f"  Lambdas: data={opt.lambda_data}, anchor={opt.lambda_anchor}, "
                   f"seq={opt.lambda_seq}, height={opt.lambda_height}, "
@@ -893,37 +931,11 @@ class StepRunPsrOptimization(Step):
 
     def run(self, context: CropContext):
         s = context.state
-        cfg = context.config.protosnap
-        refiner = s.snap_refiner
-        snap_iter = cfg.snap_at_iter if cfg is not None else None
-        fired = {"done": False}
-
-        def _snap_freeze_hook(opt, it):
-            if refiner is None or snap_iter is None:
-                return
-            if it != snap_iter or fired["done"]:
-                return
-            fired["done"] = True
-            # Build a SubTablet view that reflects current params, so the
-            # crops we feed to the refiner are correct after the first 10
-            # iterations of PSR have moved things around.
-            current = opt.get_optimized_subtablet()
-            refinements = refiner.refine_subtablet(current)
-            s.snap_refinements = refinements
-
-            accepted = [r for r in refinements if r.accepted]
-            idx = [r.sign_index for r in accepted]
-            new_centers = [(r.new_cx, r.new_cy) for r in accepted]
-            opt.freeze_centers(idx, new_centers)
-
-            s.snap_summary = summarize_refinements(refinements)
-            s.snap_used_prototype_paths = collect_used_prototype_paths(
-                refinements, refiner.bank, opt.sign_boxes_flat)
-
-            print(f"  [iter {it}] ProtoSnap fired: "
-                  f"{s.snap_summary['accepted']}/{s.snap_summary['total']} "
-                  f"signs frozen.")
-
+        # No mid-iteration freeze hook: DIFT-discovered gap signs were added
+        # to target_detections in step_create_psr_optimizer, so the GMM data
+        # term sees them as ordinary targets from iteration 0. Source signs
+        # of matching class are pulled onto them naturally — no special
+        # ProtoSnap-style center freeze.
         p = context.config.psr_params or {}
         s.sub_tablet_final = s.optimizer.optimize(
             num_iterations=p.get('num_iterations', 80),
@@ -932,7 +944,6 @@ class StepRunPsrOptimization(Step):
             sigma_final=None,
             verbose=True,
             log_every=20,
-            mid_iteration_hook=_snap_freeze_hook,
         )
 
     def visualize(self, context: CropContext, vis: VisOptions):
@@ -1103,91 +1114,300 @@ class StepParamChanges(Step):
 
 
 
-#  --- experimental steps
-class StepExtractFeatures(Step):
-    name = "Extract Features"
-    TOP_N_FULL = 30000  # top regular keypoints on sub-image (cyan)
-    TOP_N_CROP = 300   # top regular keypoints on crop (cyan)
+# ---------------------------------------------------------------------------
+# Step: Setup canonical-sign feature cache (period-driven, swappable source)
+# ---------------------------------------------------------------------------
+
+class StepSetupCanonicalSigns(Step):
+    name = "Setup Canonical Signs (period -> source + eager DIFT-feature cache)"
+    description = (
+        "Builds the canonical sign source for this fragment's period and "
+        "eagerly DIFT-featurises the entire prototype inventory. The cache "
+        "is stored on the CropContext keyed by font, so subsequent samples "
+        "in the same Python session reuse it (one-time ~5-8 min cost for "
+        "Assurbanipal's ~900 prototypes)."
+    )
 
     def run(self, context: CropContext):
         s = context.state
-        extractor = SIFTExtractor()
-        s.sparse_features = extractor.extract(s.sub_image.img)
+        s.canonical_source = None
+        s.canonical_cache = None
+        s.discovery_meta = None
 
-        dets = s.sub_image.detections
-        if dets:
-            det = dets[0]
-            img = s.sub_image.img
-            H, W = img.shape[:2]
-            x1 = max(0, int(det.x1)); y1 = max(0, int(det.y1))
-            x2 = min(W, int(det.x2)); y2 = min(H, int(det.y2))
-            crop = img[y1:y2, x1:x2]
-            s.crop_features = extractor.extract(crop)
-            s.crop_match = NNMatcher().match(s.crop_features, s.sparse_features)
-            s.crop_box = (x1, y1, x2, y2)
+        cfg = context.config.protosnap
+        if cfg is None:
+            s.discovery_meta = {"enabled": False, "reason": "ProtoSnapConfig is None"}
+            return
+
+        # Resolve period from the eBL API; the source uses it to pick a font.
+        period = None
+        fragment_data = context.api_source.get_fragment_data(context.fragment_id)
+        if fragment_data is not None:
+            script = fragment_data.get("script") or {}
+            period = script.get("period") or None
+
+        # SD-DIFT model: load once per session, cached on the context.
+        if context._snap_dift is None:
+            print("  [Canonical] Loading SD-DIFT model (first time, ~30 s)...")
+            context._snap_dift = load_dift_model(cfg)
+            if context._snap_dift is None:
+                s.discovery_meta = {"enabled": False, "reason": "SD-DIFT model failed to load"}
+                return
+
+        wrapper = make_dift_wrapper(cfg, context._snap_dift, prompt="", img_size=512)
+        if wrapper is None:
+            s.discovery_meta = {"enabled": False, "reason": "DiftWrapper unavailable"}
+            return
+
+        # User-pluggable source factory; defaults to the ProtoSnap prototype bank.
+        factory = getattr(context.config, "canonical_source_factory", None)
+        if factory is not None:
+            source = factory(period, cfg)
+            source_kind = type(source).__name__
+            reason = f'custom factory -> {source_kind}'
+        else:
+            source, reason = make_canonical_source(period, cfg)
+            source_kind = type(source).__name__ if source is not None else "None"
+
+        s.canonical_source = source
+        meta = {
+            "enabled": source is not None and source.is_ready(),
+            "period": period,
+            "source_kind": source_kind,
+            "reason": reason,
+            "precompute": None,
+        }
+        s.discovery_meta = meta
+        if source is None or not source.is_ready():
+            return
+
+        # Cross-sample cache: keyed by a stable id of the source (font name
+        # for ProtoSnap-backed sources). First sample pays the precompute
+        # cost; the rest reuse the populated cache.
+        cache_key = self._cache_key(source)
+        cache = context._canonical_caches.get(cache_key)
+
+        disc_cfg = context.config.discovery or DiscoveryConfig()
+        if cache is None:
+            cache = CanonicalFeatureCache(source=source, wrapper=wrapper)
+            print(f"  [Canonical] Eager precompute: featurising "
+                  f"{len(source.list_sign_names())} prototypes "
+                  f"(this takes a few minutes on first call)...")
+            stats = cache.precompute_all(
+                verbose=True, limit=disc_cfg.precompute_limit,
+                progress_every=50,
+            )
+            meta["precompute"] = stats
+            context._canonical_caches[cache_key] = cache
+        else:
+            meta["precompute"] = {"reused": True, "size": len(cache)}
+
+        s.canonical_cache = cache
+
+    @staticmethod
+    def _cache_key(source: CanonicalSignSource) -> str:
+        if isinstance(source, ProtoSnapCanonicalSource):
+            return f"protosnap:{source.font}"
+        return type(source).__name__
 
     def visualize(self, context: CropContext, vis: VisOptions):
-        import matplotlib.pyplot as plt
         s = context.state
-        feat = s.sparse_features
-        matched_in_full = s.crop_match.dst_pts if s.crop_match is not None else None
-        matched_in_crop = s.crop_match.src_pts if s.crop_match is not None else None
-        n_matched = len(matched_in_full) if matched_in_full is not None else 0
-
-        if vis.info:
-            print(f"Sub-image: {feat.n_keypoints} kps — top {self.TOP_N_FULL} (cyan) "
-                  f"+ {n_matched} matched (green)")
-            if s.crop_features is not None:
-                print(f"Crop {s.crop_box}: {s.crop_features.n_keypoints} kps — "
-                      f"top {self.TOP_N_CROP} (cyan) + {n_matched} matched (green)")
-
-        # --- Image 1: sub-image — top-N keypoints + all matched points highlighted ---
-        kp_vis = draw_keypoints(s.sub_image.img, feat,
-                                max_draw=self.TOP_N_FULL, highlight_pts=matched_in_full)
-        if vis.display:
-            plt.figure(figsize=(14, 9))
-            plt.imshow(cv2.cvtColor(kp_vis, cv2.COLOR_BGR2RGB))
-            plt.axis("off")
-            plt.title(f"Sub-image SIFT — top {self.TOP_N_FULL} of {feat.n_keypoints} (cyan) "
-                      f"+ {n_matched} matched (green)")
-            plt.tight_layout()
-            plt.show()
-        if vis.save:
-            cv2.imwrite(_out(context, "keypoints.jpg"), kp_vis)
-
-        if s.crop_features is None:
+        if not vis.info:
             return
-        x1, y1, x2, y2 = s.crop_box
-        crop_img = s.sub_image.img[y1:y2, x1:x2]
-
-        # --- Image 2: crop — top-N keypoints + all matched points highlighted ---
-        crop_kp_vis = draw_keypoints(crop_img, s.crop_features,
-                                     max_draw=self.TOP_N_CROP, highlight_pts=matched_in_crop)
-        if vis.display:
-            plt.figure(figsize=(8, 8))
-            plt.imshow(cv2.cvtColor(crop_kp_vis, cv2.COLOR_BGR2RGB))
-            plt.axis("off")
-            plt.title(f"Crop SIFT — top {self.TOP_N_CROP} of {s.crop_features.n_keypoints} (cyan) "
-                      f"+ {n_matched} matched (green)")
-            plt.tight_layout()
-            plt.show()
-        if vis.save:
-            cv2.imwrite(_out(context, "keypoints_crop.jpg"), crop_kp_vis)
-
-        # --- Image 3: matches — crop (left) ↔ sub-image (right) ---
-        match_vis = draw_matches(crop_img, s.sub_image.img, s.crop_match)
-        if vis.display:
-            plt.figure(figsize=(18, 7))
-            plt.imshow(cv2.cvtColor(match_vis, cv2.COLOR_BGR2RGB))
-            plt.axis("off")
-            plt.title(f"SIFT matches: crop → sub-image ({s.crop_match.n_matches} matches)")
-            plt.tight_layout()
-            plt.show()
-        if vis.save:
-            cv2.imwrite(_out(context, "keypoints_crop_match.jpg"), match_vis)
+        meta = s.discovery_meta or {}
+        print("=== Canonical Signs Setup ===")
+        print(f"  Enabled:      {meta.get('enabled')}")
+        print(f"  API period:   {meta.get('period')!r}")
+        print(f"  Source:       {meta.get('source_kind')}  ({meta.get('reason')})")
+        if s.canonical_source is not None:
+            print(f"  Source info:  {s.canonical_source.describe()}")
+        if s.canonical_cache is not None:
+            print(f"  Cache size:   {len(s.canonical_cache)} cached prototypes")
+        pre = meta.get("precompute")
+        if isinstance(pre, dict):
+            if pre.get("reused"):
+                print(f"  Precompute:   reused cross-sample cache "
+                      f"(size={pre.get('size')})")
+            else:
+                print(f"  Precompute:   total={pre.get('total')}  "
+                      f"computed={pre.get('computed')}  cached={pre.get('cached')}  "
+                      f"missing={pre.get('missing_image')}  errors={pre.get('errors')}")
 
 
-# --- 
+# ---------------------------------------------------------------------------
+# Step: Discover missing signs via DIFT on interpolated row-gap candidates
+# ---------------------------------------------------------------------------
+
+class StepIdentifyGapSigns(Step):
+    name = "Identify Gap Signs (coordinate-based gap detection + DIFT ranking)"
+    description = (
+        "Scans detection rows for coordinate gaps where a sign is likely "
+        "missing (centre-to-centre stride approximately N x avg_width). For "
+        "each pending bbox, crops the sub-image and ranks the entire cached "
+        "prototype inventory by DIFT best-buddy similarity; the top-scoring "
+        "sign is assigned as the label. Discovered bboxes are added to "
+        "target_detections in step_create_psr_optimizer."
+    )
+
+    def run(self, context: CropContext):
+        s = context.state
+        s.gap_candidates = None
+        s.discoveries = None
+        s.discovery_summary = None
+
+        cache = s.canonical_cache
+        if cache is None or len(cache) == 0:
+            return
+        if s.sub_tablet_detection is None:
+            return
+
+        cfg = context.config.discovery or DiscoveryConfig()
+
+        # ---- 1. Coordinate-based gap detection ----------------------------
+        detector = GapDetector(cfg.gap)
+        gaps = detector.find_gaps(s.sub_tablet_detection, s.sub_image.img)
+        s.gap_candidates = gaps
+        if not gaps:
+            s.discoveries = []
+            s.discovery_summary = summarize_discoveries([], 0)
+            return
+
+        # ---- 2. DIFT identification per gap -------------------------------
+        identifier = SignIdentifier(cache, cfg.identification)
+        top_k_show = max(1, cfg.identification.top_k)
+        discoveries: List[GapDiscovery] = []
+        for g in gaps:
+            if g.crop_img is None:
+                continue
+            ranked = identifier.identify(g.crop_img)
+            if not ranked:
+                continue
+            best = ranked[0]
+            disc = GapDiscovery(
+                gap=g, best=best,
+                top_k=ranked[:top_k_show],
+                low_confidence=best.score < cfg.identification.min_score,
+            )
+            discoveries.append(disc)
+
+        s.discoveries = discoveries
+        s.discovery_summary = summarize_discoveries(discoveries, len(gaps))
+
+    def visualize(self, context: CropContext, vis: VisOptions):
+        s = context.state
+        if s.gap_candidates is None:
+            if vis.info:
+                print("Discovery: skipped (no canonical cache available).")
+            return
+
+        summ = s.discovery_summary or {}
+        if vis.info:
+            print("=== Gap-Driven Sign Identification ===")
+            print(f"  Gaps found:           {summ.get('gaps_total', 0)}")
+            print(f"  Discoveries:          {summ.get('discoveries', 0)} "
+                  f"(confident={summ.get('confident', 0)}, "
+                  f"low_confidence={summ.get('low_confidence', 0)})")
+            top_signs = summ.get("by_sign_top10", {})
+            if top_signs:
+                print("  Top assigned signs:")
+                for name, count in top_signs.items():
+                    print(f"    {count}x  {name}")
+            # Per-gap detailed log
+            if s.discoveries:
+                print("  Per-gap top-3 assignments (score):")
+                for d in s.discoveries:
+                    g = d.gap
+                    line = (f"    R{g.row_idx} ins{g.insert_idx+1}/{g.n_inserts} "
+                            f"@({g.cx:.0f},{g.cy:.0f})  ")
+                    line += " | ".join(
+                        f"{r.sign_name[:10]}:{r.score:.3f}"
+                        for r in d.top_k[:3]
+                    )
+                    print(line)
+
+        # Per-gap grid is only useful when there is at least one discovery.
+        if s.discoveries:
+            grid = render_discovery_grid(s.discoveries, thumb=120,
+                                         top_k_show=min(4, len(s.discoveries[0].top_k)))
+        else:
+            grid = None
+        if grid is not None:
+            if vis.display:
+                import matplotlib.pyplot as plt
+                grid_rgb = cv2.cvtColor(grid, cv2.COLOR_BGR2RGB)
+                h, w = grid_rgb.shape[:2]
+                fig_w = min(20.0, w / 60.0)
+                fig_h = max(2.0, fig_w * h / max(w, 1))
+                plt.figure(figsize=(fig_w, fig_h))
+                plt.imshow(grid_rgb)
+                plt.axis("off")
+                plt.title("Gap Identification: crop | top-K canonical (green = assigned)")
+                plt.tight_layout(pad=0.3)
+                plt.show()
+            if vis.save:
+                cv2.imwrite(_out(context, "discovery_grid.jpg"), grid,
+                            [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+        # Sub-image overlay: detection bboxes (red) + discovered bboxes (green)
+        # with the assigned sign name and score annotated.
+        if vis.display or vis.save:
+            overlay = s.sub_image.img.copy()
+            avg_size = (s.avg_width + s.avg_height) / 2.0 if s.avg_width else 60.0
+            t_line = max(2, int(round(avg_size / 30.0)))
+            font_scale = max(0.6, avg_size / 250.0)
+            font_thick = max(2, int(round(avg_size / 60.0)))
+
+            RED = (60, 60, 220)        # model detections
+            GREEN = (80, 200, 80)      # accepted gap discoveries
+            AMBER = (40, 170, 220)     # low-confidence
+
+            # Existing model detections (for context).
+            for det in s.sub_image.detections:
+                cv2.rectangle(overlay,
+                              (int(det.x1), int(det.y1)), (int(det.x2), int(det.y2)),
+                              RED, t_line, cv2.LINE_AA)
+
+            # Gap discoveries.
+            # Outline EVERY gap candidate even if no sign was confidently
+            # assigned, so the user can verify the gap-detection coverage.
+            CYAN = (210, 210, 0)
+            disc_by_gap = {id(d.gap): d for d in s.discoveries}
+            for g in s.gap_candidates or []:
+                d = disc_by_gap.get(id(g))
+                if d is not None:
+                    color = AMBER if d.low_confidence else GREEN
+                    thick = t_line + 1
+                else:
+                    color = CYAN
+                    thick = t_line
+                cv2.rectangle(overlay,
+                              (int(g.cx - g.width / 2), int(g.cy - g.height / 2)),
+                              (int(g.cx + g.width / 2), int(g.cy + g.height / 2)),
+                              color, thick, cv2.LINE_AA)
+                if d is not None:
+                    label = f"{d.sign_name[:10]} {d.score:.2f}"
+                else:
+                    label = f"R{g.row_idx} (no match)"
+                tx = int(g.cx - g.width / 2)
+                ty = int(g.cy - g.height / 2 - 6)
+                cv2.putText(overlay, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                            font_scale, (0, 0, 0), font_thick + 2, cv2.LINE_AA)
+                cv2.putText(overlay, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                            font_scale, color, font_thick, cv2.LINE_AA)
+
+            if vis.save:
+                cv2.imwrite(_out(context, "discovery_overlay.jpg"), overlay)
+            if vis.display:
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(14, 9))
+                plt.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+                plt.axis("off")
+                plt.title("Discovery overlay  "
+                          "(red=model detection, green=gap discovery (assigned), "
+                          "amber=low confidence)")
+                plt.tight_layout()
+                plt.show()
+
 
 # ---------------------------------------------------------------------------
 # Step instances
@@ -1216,8 +1436,9 @@ step_run_psr_optimization = StepRunPsrOptimization()
 step_plot_loss_history = StepPlotLossHistory()
 step_results_comparison = StepResultsComparison()
 step_param_changes = StepParamChanges()
- # experimental
-step_extract_features = StepExtractFeatures() 
+# Gap-driven DIFT identification
+step_setup_canonical_signs = StepSetupCanonicalSigns()
+step_identify_gap_signs = StepIdentifyGapSigns()
 
 
 DEBUG_STEPS = [
@@ -1268,6 +1489,35 @@ DEBUG_STEPS_WITH_PROTOSNAP = [
     step_run_psr_optimization,
     step_protosnap_freeze_vis,
     step_protosnap_crop_vis,
+    step_plot_loss_history,
+    step_results_comparison,
+    step_param_changes,
+]
+
+
+# Detector + coordinate-based gap detection + DIFT full-inventory ranking.
+# We do NOT use the ProtoSnap CenterFreezeRefiner (position correction on
+# already-detected signs) and no PSR-internal freeze hook. Only ProtoSnap's
+# prototype PNGs and SD-DIFT are reused, wrapped by sign_alignment.dift_align.
+# Discovered gap bboxes are appended to target_detections BEFORE PSR runs.
+DEBUG_STEPS_WITH_DIFT = [
+    step_load_data,
+    step_detect_signs,
+    step_transform_gt_to_img,
+    step_compute_statistics,
+    step_create_subtablets,
+    step_detect_rows,
+    step_match_rows,
+    step_visualize_detection_rows,
+    step_match_signs_in_rows,
+    step_align_text_rows,
+    step_build_sign_match_info,
+    step_offset_analysis,
+    step_unload_detector,
+    step_setup_canonical_signs,
+    step_identify_gap_signs,
+    step_create_psr_optimizer,
+    step_run_psr_optimization,
     step_plot_loss_history,
     step_results_comparison,
     step_param_changes,
