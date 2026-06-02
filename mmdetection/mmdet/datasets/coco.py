@@ -46,7 +46,7 @@ classes_173to120 = [item if item in classes2 else 'UnclearSign' for item in clas
 @DATASETS.register_module()
 class CocoDataset(BaseDetDataset):
     """Dataset for COCO."""
-    classes = classes1
+    classes = classes3
 
     print('classes setting in current coco.py: {} '.format(classes))
     
