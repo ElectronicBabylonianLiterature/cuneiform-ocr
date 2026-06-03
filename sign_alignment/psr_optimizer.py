@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle as MplRectangle
 from PIL import Image, ImageDraw, ImageFont
 import cv2
-from typing import Callable, List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple
 from collections import defaultdict
 
 from .sign import CLASSES_ABZ as DEFAULT_CLASSES_ABZ
@@ -299,16 +299,6 @@ class PointSetRegistrationOptimizer:
         self.params = torch.tensor(init, dtype=torch.float32,
                                    device=self.device, requires_grad=True)
         self.initial_params = self.params.clone().detach()
-
-        # ---- Freeze plumbing (per-parameter mask + anchor) --------------
-        # frozen_mask[i, k] == True means params[i, k] is held at anchor[i, k]
-        # for the rest of optimization. Used by ProtoSnap center-freeze and
-        # any other component that wants to pin selected params.
-        self.frozen_mask = torch.zeros_like(self.params, dtype=torch.bool,
-                                            device=self.device)
-        self.anchor = self.params.detach().clone()
-        # Set in optimize() so freeze_centers() can reset Adam state.
-        self._optimizer: Optional[torch.optim.Optimizer] = None
 
         # ---- Sigma -------------------------------------------------------
         avg_size = (sub_tablet_text.avg_width + sub_tablet_text.avg_height) / 2
@@ -706,93 +696,6 @@ class PointSetRegistrationOptimizer:
         return L_total, L_data, L_anchor, L_seq, L_height, L_rows, L_boundary
 
     # ==================================================================
-    #  Freeze API (used by ProtoSnap center-freeze; generic enough for
-    #  other components that need to pin specific parameters)
-    # ==================================================================
-
-    def freeze_centers(
-        self,
-        indices: List[int],
-        new_centers: Optional[List[Tuple[float, float]]] = None,
-    ) -> None:
-        """Pin (cx, cy) of the given source signs.
-
-        Parameters
-        ----------
-        indices : list[int]
-            Flat indices into ``sign_boxes_flat``.
-        new_centers : list[(cx, cy)], optional
-            If provided, snap each sign's (cx, cy) to the supplied value
-            BEFORE freezing — i.e., overwrite both ``params`` and
-            ``anchor`` at indices [i, 0] / [i, 1]. If None, signs are
-            frozen at their current values.
-
-        Width and height (params[:, 2:]) remain free to optimize.
-
-        Adam moments for newly-frozen entries are zeroed so that prior
-        momentum doesn't bleed past the freeze.
-        """
-        if not indices:
-            return
-        if new_centers is not None and len(new_centers) != len(indices):
-            raise ValueError("new_centers length must match indices length")
-
-        with torch.no_grad():
-            for k, i in enumerate(indices):
-                if new_centers is not None:
-                    cx, cy = new_centers[k]
-                    self.params[i, 0] = float(cx)
-                    self.params[i, 1] = float(cy)
-                    self.anchor[i, 0] = float(cx)
-                    self.anchor[i, 1] = float(cy)
-                else:
-                    # Freeze at the current value.
-                    self.anchor[i, 0] = self.params[i, 0].detach()
-                    self.anchor[i, 1] = self.params[i, 1].detach()
-                self.frozen_mask[i, 0] = True
-                self.frozen_mask[i, 1] = True
-
-            # Reset Adam state for the newly-frozen entries so leftover
-            # momentum/variance doesn't push them on the next step (relevant
-            # if the freeze happens mid-optimization).
-            opt = self._optimizer
-            if opt is not None:
-                state = opt.state.get(self.params, None)
-                if state is not None:
-                    for buf_key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-                        if buf_key in state and isinstance(state[buf_key], torch.Tensor):
-                            buf = state[buf_key]
-                            for i in indices:
-                                buf[i, 0] = 0.0
-                                buf[i, 1] = 0.0
-
-    def freeze_widths_heights(
-        self, indices: List[int],
-        new_sizes: Optional[List[Tuple[float, float]]] = None,
-    ) -> None:
-        """Symmetric helper — kept for completeness; not used by ProtoSnap."""
-        if not indices:
-            return
-        with torch.no_grad():
-            for k, i in enumerate(indices):
-                if new_sizes is not None:
-                    w, h = new_sizes[k]
-                    self.params[i, 2] = float(w)
-                    self.params[i, 3] = float(h)
-                    self.anchor[i, 2] = float(w)
-                    self.anchor[i, 3] = float(h)
-                else:
-                    self.anchor[i, 2] = self.params[i, 2].detach()
-                    self.anchor[i, 3] = self.params[i, 3].detach()
-                self.frozen_mask[i, 2] = True
-                self.frozen_mask[i, 3] = True
-
-    def get_frozen_indices(self) -> List[int]:
-        """Indices whose (cx, cy) are both frozen."""
-        cx_cy = self.frozen_mask[:, :2].all(dim=1)
-        return cx_cy.nonzero(as_tuple=True)[0].tolist()
-
-    # ==================================================================
     #  Optimisation loop
     # ==================================================================
 
@@ -804,7 +707,6 @@ class PointSetRegistrationOptimizer:
         sigma_final: float = None,
         verbose: bool = True,
         log_every: int = 10,
-        mid_iteration_hook: Optional[Callable[["PointSetRegistrationOptimizer", int], None]] = None,
     ) -> SubTablet:
         """
         Run gradient-descent optimisation.
@@ -828,9 +730,6 @@ class PointSetRegistrationOptimizer:
             Optimised sign positions.
         """
         opt = torch.optim.Adam([self.params], lr=lr)
-        # Expose for freeze_centers() so it can clear Adam state on
-        # newly-frozen entries when the freeze happens mid-loop.
-        self._optimizer = opt
 
         sigma_init = self.sigma
         if sigma_final is None:
@@ -855,12 +754,6 @@ class PointSetRegistrationOptimizer:
             print("-" * 60)
 
         for it in range(num_iterations):
-            # Mid-iteration hook: runs BEFORE this iteration's gradient
-            # computation, so the hook can call freeze_centers() and the
-            # very next backward()/step() will already see the new mask.
-            if mid_iteration_hook is not None:
-                mid_iteration_hook(self, it)
-
             # Optional sigma annealing
             if sigma_anneal:
                 t = it / max(1, num_iterations - 1)
@@ -876,12 +769,6 @@ class PointSetRegistrationOptimizer:
                 torch.nn.utils.clip_grad_norm_([self.params], max_norm=1e4)
                 if torch.isnan(self.params.grad).any():
                     self.params.grad.nan_to_num_(nan=0.0)
-                # Freeze plumbing: zero out gradient at frozen positions so
-                # Adam can't move them. Coupled losses (anchor/seq/rows)
-                # still see the frozen positions as fixed inputs to peers'
-                # gradients, which is exactly the desired anchor behaviour.
-                if self.frozen_mask.any():
-                    self.params.grad[self.frozen_mask] = 0.0
 
             opt.step()
 
@@ -889,12 +776,6 @@ class PointSetRegistrationOptimizer:
             with torch.no_grad():
                 self.params[:, 2].clamp_(min=10.0)
                 self.params[:, 3].clamp_(min=10.0)
-                # Defensive projection: snap frozen entries back to anchor
-                # in case any numerical drift slipped through (e.g. Adam
-                # bias correction on residual moments).
-                if self.frozen_mask.any():
-                    self.params.data = torch.where(
-                        self.frozen_mask, self.anchor, self.params.data)
 
             self.loss_history.append(L_total.item())
             self.loss_components_history.append({

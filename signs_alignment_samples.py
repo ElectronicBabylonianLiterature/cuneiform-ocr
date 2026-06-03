@@ -45,11 +45,7 @@ if __name__ == "__main__":
         fid = context.fragment_id
         print(f"\n{'='*60}\n{fid}")
 
-        try:
-            crop_runner.run_single_step(step_load_data)
-        except Exception as e:
-            print(f"  Load failed: {e}")
-            continue
+        crop_runner.run_single_step(step_load_data)
 
         crop_runner.run_single_step(step_detect_signs)
         crop_runner.run_single_step(step_compute_statistics)
@@ -60,14 +56,10 @@ if __name__ == "__main__":
             crop_runner.choose_crop(crop_idx)
             if not s.sub_image.detections:
                 continue
-            try:
-                crop_runner.run_all()
-                if not s.sub_tablet_detection.get_rows() or not s.matches or not s.sub_tablet_aligned:
-                    continue
-                crop_runner.run_single_step(step_results_comparison)
-            except Exception as e:
-                print(f"  Crop {crop_idx} error: {e}")
+            crop_runner.run_all()
+            if not s.sub_tablet_detection.get_rows() or not s.matches or not s.sub_tablet_aligned:
                 continue
+            crop_runner.run_single_step(step_results_comparison)
 
             ox, oy = s.crop_info['x'], s.crop_info['y']
             for sb in s.sub_tablet_final.sign_boxes:
@@ -93,4 +85,3 @@ if __name__ == "__main__":
     with open(os.path.join(OUTPUT_DIR, "alignment_summary.json"), 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"\nResults saved to {OUTPUT_DIR}/")
-

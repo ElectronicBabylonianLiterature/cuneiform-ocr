@@ -8,7 +8,7 @@ Also includes a fast coordinate-wise hyperparameter sweep for the
 PointSetRegistrationOptimizer.
 
 Uses the step functions from sign_alignment/pipeline.py for the alignment
-pipeline. No ProtoSnap.
+pipeline.
 """
 
 import json
@@ -22,7 +22,6 @@ from PIL import Image as PILImage, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 from sign_alignment import (
-    LocalDataSource,
     LocalTestDataSource,
     SubtabletEBLAPISource,
     ModelConfig, TabletImageDetector,
@@ -41,7 +40,6 @@ from sign_alignment.pipeline import (
 load_dotenv()
 
 # ============ Configuration ============
-ANNOTATIONS_DIR = os.path.expanduser("~/erc-work-data/data-of-cuneiform-ocr-data/filtered_annotations")
 COCO_TEST_DIR = os.path.expanduser("~/erc-work-data/ready-for-training/coco-recognition-2025-09/data/coco")
 CONFIG_FILE = "configs/detr.py"
 CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/epoch_1000.pth")
@@ -563,10 +561,7 @@ def _load_and_detect_fragment(runner: Runner, context: CropContext, fid: str) ->
     context.state = SampleState()
     context.fragment_id = fid
 
-    try:
-        runner.run_single_step(step_load_data)
-    except Exception:
-        return False
+    runner.run_single_step(step_load_data)
 
     s = context.state
     if s.img is None or not s.text_lines or not s.gt_boxes:
@@ -651,11 +646,8 @@ def _predict_psr_crops(
         runner.choose_crop(crop_idx)
         if not s.sub_image.detections:
             continue
-        try:
-            runner.run_all()
-            if not s.sub_tablet_detection.get_rows() or not s.matches or not s.sub_tablet_aligned:
-                continue
-        except Exception:
+        runner.run_all()
+        if not s.sub_tablet_detection.get_rows() or not s.matches or not s.sub_tablet_aligned:
             continue
 
         ox, oy = s.crop_info['x'], s.crop_info['y']
@@ -929,7 +921,6 @@ if __name__ == "__main__":
     print("=" * 60)
 
     test_source = LocalTestDataSource(COCO_TEST_DIR)
-    alignment_source = LocalDataSource(ANNOTATIONS_DIR)
     fragments = test_source.get_available_fragments()
     print(f"Found {len(fragments)} fragments in COCO test set")
 

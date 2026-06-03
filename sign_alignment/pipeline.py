@@ -6,7 +6,6 @@ from typing import Callable, List, Optional
 import cv2
 import numpy as np
 import torch
-from PIL import Image
 
 from sign_alignment.detector import ModelConfig, SingleImage, TabletImageDetector
 from sign_alignment.data_source import EBLAPISource, LocalDataSource, GroundTruths, SignAPIResolver, SignTextParser
@@ -20,19 +19,7 @@ from sign_alignment.visualizer import (
 from sign_alignment.heatmap import compute_avg_dimensions, transform_gt_to_cropped_region
 from sign_alignment.tablet import SubTablet
 from sign_alignment.psr_optimizer import PointSetRegistrationOptimizer
-from sign_alignment.protosnap import (
-    CenterFreezeRefiner,
-    CenterRefinement,
-    ProtoSnapConfig,
-    SnapStatus,
-    load_dift_model,
-    make_dift_wrapper,
-    dift_best_buddies,
-    make_refiner,
-    render_refinement_grid,
-    summarize_refinements,
-    collect_used_prototype_paths,
-)
+from sign_alignment.dift_model import DiftConfig, load_dift_model, make_dift_wrapper
 from data_processing.line_process import (
     align_text_to_detection_rows,
     create_row_mapping,
@@ -40,10 +27,10 @@ from data_processing.line_process import (
     match_signs_in_row_dp,
 )
 from sign_alignment.dift_align import (
-    CanonicalSignSource, ProtoSnapCanonicalSource, EBLCanonicalSource,
-    CanonicalFeatureCache, DiscoveryConfig, GapDetectionConfig,
-    GapDetector, IdentificationConfig, SignIdentifier,
-    GapDiscovery, make_canonical_source,
+    CanonicalSignSource,
+    CanonicalFeatureCache, DiscoveryConfig,
+    GapDetector, SignIdentifier,
+    GapDiscovery,
     render_discovery_grid, summarize_discoveries,
 )
 
@@ -73,10 +60,7 @@ class PipelineConfig:
     output_dir: str
     api_source: EBLAPISource = field(default_factory=EBLAPISource)
     img_idx: int = 1          # which cropped sub-image to use
-    # ProtoSnap is opt-in. None disables the step (default behavior).
-    # Pass a ProtoSnapConfig to enable; the step still no-ops gracefully if
-    # assets/weights are missing.
-    protosnap: Optional[ProtoSnapConfig] = None
+    dift: Optional[DiftConfig] = None
     # Optional PSR optimizer parameter overrides (dict or None for defaults).
     # Keys: sigma_factor, w_noise, lambda_data, lambda_anchor, lambda_seq,
     #       lambda_height, lambda_rows, lambda_boundary,
@@ -84,12 +68,9 @@ class PipelineConfig:
     #       rows_plateau_far, rows_plateau_close, num_iterations, lr, sigma_anneal
     psr_params: Optional[dict] = None
 
-    # Gap-driven DIFT-discovery config. None = library defaults.
     discovery: Optional["DiscoveryConfig"] = None
-    # Optional override: callable (period, ProtoSnapConfig) -> CanonicalSignSource.
-    # When None, defaults to ProtoSnapCanonicalSource (period -> Santakku/Assurbanipal).
-    # Use this hook to plug in the future eBL canonical-sign retrieval.
     canonical_source_factory: Optional[Callable] = None
+    canonical_feature_dir: Optional[str] = None
 
 
 class PipelineTools:
@@ -133,13 +114,6 @@ class SampleState:
     sub_tablet_aligned: Optional[SubTablet] = None     # coarse-aligned (formerly optim)
     sub_tablet_final: Optional[SubTablet] = None       # after PSR optimization
 
-    # ProtoSnap center-freeze refiner + diagnostics.
-    snap_refiner: Optional[CenterFreezeRefiner] = None
-    snap_meta: Optional[dict] = None                   # period, font, repo_root, etc.
-    snap_refinements: Optional[list] = None            # list[CenterRefinement] after hook fires
-    snap_summary: Optional[dict] = None
-    snap_used_prototype_paths: Optional[list] = None
-
     # row matching
     det_row_sequences: Optional[list] = None
     text_row_sequences: Optional[list] = None
@@ -179,10 +153,8 @@ class CropContext:
     tools: PipelineTools = field(default_factory=PipelineTools)
     state: SampleState = None
     # Cached SDFeaturizer for SD-DIFT; loaded once, reused across samples.
-    _snap_dift: Optional[object] = field(default=None, repr=False, compare=False)
-    # Per-font CanonicalFeatureCache, shared across samples so the eager
-    # full-inventory precompute happens once per (Python session × font).
-    # Keys are short font identifiers like "Assurbanipal" or "Santakku".
+    _dift_model: Optional[object] = field(default=None, repr=False, compare=False)
+    # CanonicalFeatureCache instances shared across samples.
     _canonical_caches: dict = field(default_factory=dict, repr=False, compare=False)
 
     task_type: str = "debug"  
@@ -312,8 +284,13 @@ class StepDetectSigns(Step):
         s.detections = context.tablet_detector.detect(s.img)
         cropped = context.tablet_detector.get_cropped_images()
         img_idx = context.config.img_idx
-        if img_idx >= len(cropped):
-            img_idx = len(cropped) - 1
+        if not cropped:
+            raise RuntimeError("detector produced no cropped images")
+        if img_idx < 0 or img_idx >= len(cropped):
+            raise IndexError(
+                f"crop index {img_idx} is out of range after detection; "
+                f"available crop indices are 0..{len(cropped) - 1}"
+            )
         s.sub_image = cropped[img_idx]
         s.crop_info = context.tablet_detector.crop_coordinates[img_idx]
 
@@ -749,118 +726,6 @@ class StepUnloadDetector(Step):
 
 
 # ---------------------------------------------------------------------------
-# Step: ProtoSnap setup (build refiner, resolve period; no compute yet)
-# ---------------------------------------------------------------------------
-
-class StepProtoSnap(Step):
-    name = "ProtoSnap Setup (resolve period, build refiner)"
-
-    def run(self, context: CropContext):
-        """Build the ProtoSnap CenterFreezeRefiner if enabled.
-
-        Resolves `period` from the EBL fragment API (script.period), maps it
-        to a font, and instantiates the refiner. Does NOT run any feature
-        matching here — that happens inside the PSR mid-iteration hook.
-
-        No-op (graceful) when:
-          - config.protosnap is None
-          - the prototype bank cannot find its repo / fonts directory
-        """
-        s = context.state
-        s.snap_refiner = None
-        s.snap_refinements = None
-        s.snap_summary = None
-        s.snap_used_prototype_paths = None
-
-        cfg = context.config.protosnap
-        period = None
-        fragment_data = context.api_source.get_fragment_data(context.fragment_id)
-        if fragment_data is not None:
-            script = fragment_data.get("script") or {}
-            period = script.get("period") or None
-
-        # Pre-load SD-DIFT model once per session (cached on context, not state).
-        if cfg is not None and context._snap_dift is None:
-            print("  [ProtoSnap] Loading SD-DIFT model (first time, ~30 s)...")
-            context._snap_dift = load_dift_model(cfg)
-            if context._snap_dift is None:
-                print("  [ProtoSnap] WARNING: SD-DIFT model failed to load; step will be disabled.")
-
-        refiner, meta = make_refiner(cfg, period=period, dift=context._snap_dift)
-        s.snap_meta = meta
-        s.snap_refiner = refiner
-
-    def visualize(self, context: CropContext, vis: VisOptions):
-        s = context.state
-        if not vis.info:
-            return
-        meta = s.snap_meta or {}
-        print("=== ProtoSnap Setup ===")
-        print(f"  API period:    {meta.get('period')!r}")
-        print(f"  Resolved font: {meta.get('font')!r}  ({meta.get('font_reason')})")
-        print(f"  repo_root:     {meta.get('repo_root')}")
-        print(f"  estimator:     {meta.get('estimator')}")
-        print(f"  enabled:       {meta.get('enabled')}")
-        if s.snap_refiner is not None:
-            cov = s.snap_refiner.bank.coverage(s.sub_tablet_aligned.sign_boxes)
-            print(f"  prototype coverage: {cov['with_prototype']}/{cov['total']} "
-                  f"(metadata_size={cov['metadata_size']})")
-            if cov["missing_sign_top10"]:
-                print(f"  top missing signs: {', '.join(cov['missing_sign_top10'])}")
-
-
-# ---------------------------------------------------------------------------
-# Step: ProtoSnap per-sign crop grid visualization
-# ---------------------------------------------------------------------------
-
-class StepProtoSnapCropVis(Step):
-    name = "ProtoSnap Crop Grid (prototype | annotated crop per sign)"
-
-    def visualize(self, context: CropContext, vis: VisOptions):
-        """Render a grid showing every sign that passed through ProtoSnap.
-
-        Each cell shows the prototype (left) and the sign crop (right) with
-        the original bbox center (cyan circle) and the ProtoSnap-estimated
-        center (green cross = accepted, red cross = rejected) connected by an
-        arrow.  A color-coded border and text header/footer indicate the
-        acceptance status and gate reason.
-        """
-        s = context.state
-        if not s.snap_refinements:
-            if vis.info:
-                print("ProtoSnap crop grid: no refinements to show.")
-            return
-
-        if vis.info:
-            n_ok  = sum(1 for r in s.snap_refinements if r.accepted)
-            n_all = len(s.snap_refinements)
-            print(f"=== ProtoSnap Crop Grid ({n_all} signs, {n_ok} accepted) ===")
-            print("  Legend: cyan circle = original center  "
-                  "green cross = accepted  red cross = rejected")
-
-        grid = render_refinement_grid(s.snap_refinements, thumb=128, cols=5)
-
-        if vis.display:
-            import matplotlib.pyplot as plt
-            grid_rgb = cv2.cvtColor(grid, cv2.COLOR_BGR2RGB)
-            h, w = grid_rgb.shape[:2]
-            fig_w = min(20.0, w / 60.0)
-            fig_h = fig_w * h / max(w, 1)
-            plt.figure(figsize=(fig_w, fig_h))
-            plt.imshow(grid_rgb)
-            plt.axis("off")
-            plt.title("ProtoSnap: prototype (left) | annotated crop (right)")
-            plt.tight_layout(pad=0.3)
-            plt.show()
-
-        if vis.save:
-            out_path = _out(context, "protosnap_crop_grid.jpg")
-            cv2.imwrite(out_path, grid, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            if vis.info:
-                print(f"  Saved: {out_path}")
-
-
-# ---------------------------------------------------------------------------
 # Step: Create PSR Optimizer
 # ---------------------------------------------------------------------------
 
@@ -931,11 +796,6 @@ class StepRunPsrOptimization(Step):
 
     def run(self, context: CropContext):
         s = context.state
-        # No mid-iteration freeze hook: DIFT-discovered gap signs were added
-        # to target_detections in step_create_psr_optimizer, so the GMM data
-        # term sees them as ordinary targets from iteration 0. Source signs
-        # of matching class are pulled onto them naturally — no special
-        # ProtoSnap-style center freeze.
         p = context.config.psr_params or {}
         s.sub_tablet_final = s.optimizer.optimize(
             num_iterations=p.get('num_iterations', 80),
@@ -950,72 +810,6 @@ class StepRunPsrOptimization(Step):
         if vis.info:
             s = context.state
             print(f"=== Optimization Complete: {len(s.sub_tablet_final)} signs ===")
-
-
-# ---------------------------------------------------------------------------
-# Step: Visualize ProtoSnap freeze (blue=frozen, orange=free)
-# ---------------------------------------------------------------------------
-
-class StepProtoSnapFreezeVis(Step):
-    name = "ProtoSnap Freeze Visualization (blue=frozen, orange=free)"
-
-    def visualize(self, context: CropContext, vis: VisOptions):
-        """Show the optimizer-state at the moment ProtoSnap fired.
-
-        Frozen-center bboxes are drawn in **blue**, the rest (still being
-        optimized) in **orange**. We render two snapshots side-by-side:
-          (a) snapshot taken right after freeze (before further optimization);
-          (b) final SubTablet after optimization completed.
-        """
-        s = context.state
-        if s.snap_refinements is None:
-            if vis.info:
-                print("ProtoSnap freeze visualization: nothing to show "
-                      "(refiner disabled or no signs accepted).")
-            return
-
-        if vis.info:
-            summ = s.snap_summary or {}
-            print("=== ProtoSnap Freeze Summary ===")
-            print(f"  Total refined: {summ.get('total')}, Accepted: {summ.get('accepted')}")
-            for status_value, count in sorted(summ.get("by_status", {}).items()):
-                print(f"    {status_value}: {count}")
-            # Top reasons for rejection (helps gate tuning)
-            reasons = Counter(
-                (r.info or {}).get("gate_reason", "?")
-                for r in s.snap_refinements if not r.accepted
-            )
-            if reasons:
-                print("  Top rejection reasons:")
-                for reason, n in reasons.most_common(5):
-                    print(f"    [{n}] {reason}")
-            if s.snap_used_prototype_paths:
-                print(f"  Used {len(s.snap_used_prototype_paths)} unique prototype PNGs.")
-
-        # Build a per-sign color function based on which indices are frozen.
-        accepted_idx = {r.sign_index for r in s.snap_refinements if r.accepted}
-        final_boxes = s.sub_tablet_final.to_detection_list()
-
-        BLUE = (0, 102, 255)     # frozen
-        ORANGE = (255, 128, 0)   # free
-
-        def _color_func_factory(idx_to_box):
-            # Identity-based lookup: BboxVisualizer iterates boxes in order,
-            # so we use a counter via id(box) -> index.
-            index_lookup = {id(b): i for i, b in enumerate(idx_to_box)}
-            def _color(box):
-                i = index_lookup.get(id(box), -1)
-                return BLUE if i in accepted_idx else ORANGE
-            return _color
-
-        final_vis = BboxVisualizer()
-        final_vis.color_func = _color_func_factory(final_boxes)
-        final_vis.draw_boxes(s.sub_image.img.copy(), final_boxes)
-
-        if vis.display:
-            final_vis.display_result(vis_opt="draw")
-        if vis.save:
-            final_vis.save(_out(context, "protosnap_freeze_final.jpg"))
 
 
 # ---------------------------------------------------------------------------
@@ -1122,10 +916,9 @@ class StepSetupCanonicalSigns(Step):
     name = "Setup Canonical Signs (period -> source + eager DIFT-feature cache)"
     description = (
         "Builds the canonical sign source for this fragment's period and "
-        "eagerly DIFT-featurises the entire prototype inventory. The cache "
-        "is stored on the CropContext keyed by font, so subsequent samples "
-        "in the same Python session reuse it (one-time ~5-8 min cost for "
-        "Assurbanipal's ~900 prototypes)."
+        "eagerly DIFT-featurises its inventory. The in-memory cache is "
+        "stored on the CropContext keyed by source, and an optional disk "
+        "cache can persist per-sign features across Python sessions."
     )
 
     def run(self, context: CropContext):
@@ -1134,64 +927,49 @@ class StepSetupCanonicalSigns(Step):
         s.canonical_cache = None
         s.discovery_meta = None
 
-        cfg = context.config.protosnap
-        if cfg is None:
-            s.discovery_meta = {"enabled": False, "reason": "ProtoSnapConfig is None"}
-            return
-
-        # Resolve period from the eBL API; the source uses it to pick a font.
-        period = None
         fragment_data = context.api_source.get_fragment_data(context.fragment_id)
-        if fragment_data is not None:
-            script = fragment_data.get("script") or {}
-            period = script.get("period") or None
+        period = fragment_data["script"]["period"]
 
-        # SD-DIFT model: load once per session, cached on the context.
-        if context._snap_dift is None:
+        dift_cfg = context.config.dift
+        if dift_cfg is None:
+            raise ValueError("PipelineConfig.dift is required for canonical DIFT features")
+
+        if context._dift_model is None:
             print("  [Canonical] Loading SD-DIFT model (first time, ~30 s)...")
-            context._snap_dift = load_dift_model(cfg)
-            if context._snap_dift is None:
-                s.discovery_meta = {"enabled": False, "reason": "SD-DIFT model failed to load"}
-                return
+            context._dift_model = load_dift_model(dift_cfg)
 
-        wrapper = make_dift_wrapper(cfg, context._snap_dift, prompt="", img_size=512)
-        if wrapper is None:
-            s.discovery_meta = {"enabled": False, "reason": "DiftWrapper unavailable"}
-            return
+        wrapper = make_dift_wrapper(dift_cfg, context._dift_model, prompt="")
 
-        # User-pluggable source factory; defaults to the ProtoSnap prototype bank.
         factory = getattr(context.config, "canonical_source_factory", None)
-        if factory is not None:
-            source = factory(period, cfg)
-            source_kind = type(source).__name__
-            reason = f'custom factory -> {source_kind}'
-        else:
-            source, reason = make_canonical_source(period, cfg)
-            source_kind = type(source).__name__ if source is not None else "None"
+        if factory is None:
+            raise ValueError("PipelineConfig.canonical_source_factory is required")
+
+        source = factory(period, context.config)
+        source_kind = type(source).__name__
 
         s.canonical_source = source
         meta = {
-            "enabled": source is not None and source.is_ready(),
+            "enabled": source.is_ready(),
             "period": period,
             "source_kind": source_kind,
-            "reason": reason,
             "precompute": None,
         }
         s.discovery_meta = meta
-        if source is None or not source.is_ready():
-            return
+        if not source.is_ready():
+            raise RuntimeError(f"canonical source is not ready: {source.describe()}")
 
-        # Cross-sample cache: keyed by a stable id of the source (font name
-        # for ProtoSnap-backed sources). First sample pays the precompute
-        # cost; the rest reuse the populated cache.
         cache_key = self._cache_key(source)
         cache = context._canonical_caches.get(cache_key)
 
         disc_cfg = context.config.discovery or DiscoveryConfig()
         if cache is None:
-            cache = CanonicalFeatureCache(source=source, wrapper=wrapper)
+            cache = CanonicalFeatureCache(
+                source=source,
+                wrapper=wrapper,
+                disk_dir=context.config.canonical_feature_dir,
+            )
             print(f"  [Canonical] Eager precompute: featurising "
-                  f"{len(source.list_sign_names())} prototypes "
+                  f"{len(source.list_sign_names())} canonical images "
                   f"(this takes a few minutes on first call)...")
             stats = cache.precompute_all(
                 verbose=True, limit=disc_cfg.precompute_limit,
@@ -1206,9 +984,7 @@ class StepSetupCanonicalSigns(Step):
 
     @staticmethod
     def _cache_key(source: CanonicalSignSource) -> str:
-        if isinstance(source, ProtoSnapCanonicalSource):
-            return f"protosnap:{source.font}"
-        return type(source).__name__
+        return source.cache_namespace()
 
     def visualize(self, context: CropContext, vis: VisOptions):
         s = context.state
@@ -1218,11 +994,11 @@ class StepSetupCanonicalSigns(Step):
         print("=== Canonical Signs Setup ===")
         print(f"  Enabled:      {meta.get('enabled')}")
         print(f"  API period:   {meta.get('period')!r}")
-        print(f"  Source:       {meta.get('source_kind')}  ({meta.get('reason')})")
+        print(f"  Source:       {meta.get('source_kind')}")
         if s.canonical_source is not None:
             print(f"  Source info:  {s.canonical_source.describe()}")
         if s.canonical_cache is not None:
-            print(f"  Cache size:   {len(s.canonical_cache)} cached prototypes")
+            print(f"  Cache size:   {len(s.canonical_cache)} cached canonical signs")
         pre = meta.get("precompute")
         if isinstance(pre, dict):
             if pre.get("reused"):
@@ -1231,7 +1007,7 @@ class StepSetupCanonicalSigns(Step):
             else:
                 print(f"  Precompute:   total={pre.get('total')}  "
                       f"computed={pre.get('computed')}  cached={pre.get('cached')}  "
-                      f"missing={pre.get('missing_image')}  errors={pre.get('errors')}")
+                      f"disk={pre.get('disk_cached')}")
 
 
 # ---------------------------------------------------------------------------
@@ -1244,7 +1020,7 @@ class StepIdentifyGapSigns(Step):
         "Scans detection rows for coordinate gaps where a sign is likely "
         "missing (centre-to-centre stride approximately N x avg_width). For "
         "each pending bbox, crops the sub-image and ranks the entire cached "
-        "prototype inventory by DIFT best-buddy similarity; the top-scoring "
+        "canonical inventory by DIFT best-buddy similarity; the top-scoring "
         "sign is assigned as the label. Discovered bboxes are added to "
         "target_detections in step_create_psr_optimizer."
     )
@@ -1257,9 +1033,9 @@ class StepIdentifyGapSigns(Step):
 
         cache = s.canonical_cache
         if cache is None or len(cache) == 0:
-            return
+            raise RuntimeError("canonical feature cache is empty; run step_setup_canonical_signs first")
         if s.sub_tablet_detection is None:
-            return
+            raise RuntimeError("sub_tablet_detection is missing; run row setup steps first")
 
         cfg = context.config.discovery or DiscoveryConfig()
 
@@ -1277,11 +1053,9 @@ class StepIdentifyGapSigns(Step):
         top_k_show = max(1, cfg.identification.top_k)
         discoveries: List[GapDiscovery] = []
         for g in gaps:
-            if g.crop_img is None:
-                continue
             ranked = identifier.identify(g.crop_img)
             if not ranked:
-                continue
+                raise RuntimeError("DIFT identification returned no candidates")
             best = ranked[0]
             disc = GapDiscovery(
                 gap=g, best=best,
@@ -1428,9 +1202,6 @@ step_align_text_rows = StepAlignTextRows()
 step_build_sign_match_info = StepBuildSignMatchInfo()
 step_offset_analysis = StepOffsetAnalysis()
 step_unload_detector = StepUnloadDetector()
-step_protosnap = StepProtoSnap()
-step_protosnap_freeze_vis = StepProtoSnapFreezeVis()
-step_protosnap_crop_vis = StepProtoSnapCropVis()
 step_create_psr_optimizer = StepCreatePsrOptimizer()
 step_run_psr_optimization = StepRunPsrOptimization()
 step_plot_loss_history = StepPlotLossHistory()
@@ -1463,43 +1234,8 @@ DEBUG_STEPS = [
 ]
 
 
-# Opt-in variant that wires ProtoSnap center-freeze into the PSR
-# optimizer as a mid-iteration hook (fires at config.protosnap.snap_at_iter,
-# default 10). step_protosnap only builds the refiner; the actual freeze
-# happens inside step_run_psr_optimization. step_protosnap_freeze_vis
-# renders blue (frozen) / orange (free) bboxes after optimization.
-#
-# Default DEBUG_STEPS is unchanged so existing notebooks keep working.
-DEBUG_STEPS_WITH_PROTOSNAP = [
-    step_load_data,
-    step_detect_signs,
-    step_transform_gt_to_img,
-    step_compute_statistics,
-    step_create_subtablets,
-    step_detect_rows,
-    step_match_rows,
-    step_visualize_detection_rows,
-    step_match_signs_in_rows,
-    step_align_text_rows,
-    step_build_sign_match_info,
-    step_offset_analysis,
-    step_unload_detector,
-    step_protosnap,
-    step_create_psr_optimizer,
-    step_run_psr_optimization,
-    step_protosnap_freeze_vis,
-    step_protosnap_crop_vis,
-    step_plot_loss_history,
-    step_results_comparison,
-    step_param_changes,
-]
-
-
 # Detector + coordinate-based gap detection + DIFT full-inventory ranking.
-# We do NOT use the ProtoSnap CenterFreezeRefiner (position correction on
-# already-detected signs) and no PSR-internal freeze hook. Only ProtoSnap's
-# prototype PNGs and SD-DIFT are reused, wrapped by sign_alignment.dift_align.
-# Discovered gap bboxes are appended to target_detections BEFORE PSR runs.
+# Discovered gap bboxes are appended to target_detections before PSR runs.
 DEBUG_STEPS_WITH_DIFT = [
     step_load_data,
     step_detect_signs,
@@ -1551,8 +1287,8 @@ class Runner:
         context.state.fragments = fragments
         print(f"Found {len(fragments)} fragments with both image and annotation")
 
-        if vis.save:
-             os.makedirs(context.output_dir, exist_ok=True)
+        if self.vis.save:
+            os.makedirs(context.output_dir, exist_ok=True)
 
     def run_single_step(self, step: Step):
         if self.vis.info:
@@ -1576,11 +1312,17 @@ class Runner:
                 raise ValueError(f"Fragment name '{name}' not found in available fragments.")
         fragment_id = self._fragments[idx]
         print(f"Processing sample: {fragment_id}")
-        self.context.fragment_id = fragment_id
+        self.context.state = SampleState(fragments=self._fragments, fragment_id=fragment_id)
 
     def choose_crop(self, crop_idx: int):
         self.context.config.img_idx = crop_idx
         cropped = self.context.tablet_detector.get_cropped_images()
-        if cropped:
-            self.context.state.sub_image = cropped[crop_idx]
-            self.context.state.crop_info = self.context.tablet_detector.crop_coordinates[crop_idx]
+        if not cropped or self.context.state.detections is None:
+            return
+        if crop_idx < 0 or crop_idx >= len(cropped):
+            raise IndexError(
+                f"crop index {crop_idx} is out of range; "
+                f"available crop indices are 0..{len(cropped) - 1}"
+            )
+        self.context.state.sub_image = cropped[crop_idx]
+        self.context.state.crop_info = self.context.tablet_detector.crop_coordinates[crop_idx]

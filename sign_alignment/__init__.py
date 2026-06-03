@@ -37,6 +37,10 @@ from .detector import (
     TabletImageDetector,
 )
 
+from .dift_model import (
+    DiftConfig,
+)
+
 from .visualizer import (
     BboxVisualizer,
     TextVisualizer,
@@ -103,6 +107,7 @@ __all__ = [
     'BaseDetector',
     'SingleImageDetector',
     'TabletImageDetector',
+    'DiftConfig',
     
     # Visualization
     'BboxVisualizer',
