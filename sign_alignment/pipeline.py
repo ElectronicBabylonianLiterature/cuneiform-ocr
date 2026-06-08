@@ -1,7 +1,7 @@
 from collections import Counter
 from dataclasses import dataclass, field
 import os
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -28,10 +28,14 @@ from data_processing.line_process import (
 )
 from sign_alignment.dift_align import (
     CanonicalSignSource,
-    CanonicalFeatureCache, DiscoveryConfig,
-    GapDetector, SignIdentifier,
-    GapDiscovery,
-    render_discovery_grid, summarize_discoveries,
+    CanonicalFeatureCache,
+    DiftAlignmentConfig,
+    DiscoveryConfig,
+    build_dift_affine_probe,
+    collect_detected_canonical_feature_rows,
+    render_canonical_feature_grid,
+    render_canonical_sign_overlay,
+    render_dift_affine_probe,
 )
 
 
@@ -68,6 +72,8 @@ class PipelineConfig:
     #       rows_plateau_far, rows_plateau_close, num_iterations, lr, sigma_anneal
     psr_params: Optional[dict] = None
 
+    dift_alignment: Optional["DiftAlignmentConfig"] = None
+    # Backward-compatible name used by older notebooks. Prefer dift_alignment.
     discovery: Optional["DiscoveryConfig"] = None
     canonical_source_factory: Optional[Callable] = None
     canonical_feature_dir: Optional[str] = None
@@ -132,15 +138,18 @@ class SampleState:
     # PSR optimizer
     optimizer: Optional[PointSetRegistrationOptimizer] = None
 
-    # Gap-driven DIFT discovery state (period-driven canonical source + cache).
+    # Canonical DIFT feature cache and diagnostics.
     canonical_source: Optional["CanonicalSignSource"] = None
     canonical_cache: Optional["CanonicalFeatureCache"] = None
-    discovery_meta: Optional[dict] = None
-    # Coordinate-based gap candidates (before identification).
-    gap_candidates: Optional[list] = None  # list[GapCandidate]
-    # Final per-gap discoveries (gap + assigned canonical sign).
-    discoveries: Optional[list] = None  # list[GapDiscovery]
-    discovery_summary: Optional[dict] = None
+    canonical_meta: Optional[dict] = None
+    dift_affine_probe_iteration: Optional[int] = None
+    dift_affine_probe_subtablet: Optional[SubTablet] = None
+    dift_affine_probe_results: Optional[list] = None
+    dift_affine_probe_error: Optional[str] = None
+    canonical_overlay_iteration: Optional[int] = None
+    canonical_overlay_image: Optional[np.ndarray] = None
+    canonical_overlay_stats: Optional[dict] = None
+    canonical_overlay_error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +229,35 @@ class Step:
 
 def _out(context: CropContext, suffix: str) -> str:
     return os.path.join(context.output_dir, f"{context.task_type}_{context.fragment_id}_{suffix}")
+
+
+def _dift_alignment_config(config: PipelineConfig) -> DiftAlignmentConfig:
+    return config.dift_alignment or config.discovery or DiftAlignmentConfig()
+
+
+def _display_bgr(img: np.ndarray, title: str, px_per_in: float = 80.0) -> None:
+    import matplotlib.pyplot as plt
+
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h, w = rgb.shape[:2]
+    fig_w = min(20.0, w / px_per_in)
+    fig_h = max(2.0, fig_w * h / max(w, 1))
+    plt.figure(figsize=(fig_w, fig_h))
+    plt.imshow(rgb)
+    plt.axis("off")
+    plt.title(title)
+    plt.tight_layout(pad=0.3)
+    plt.show()
+
+
+def _dift_diagnostic_error(s: SampleState) -> Optional[str]:
+    if s.optimizer is None:
+        return "PSR optimizer is not available"
+    if s.canonical_cache is None:
+        return "canonical feature cache is not available"
+    if s.sub_image is None or s.sub_image.img is None:
+        return "sub-image is not available"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -737,17 +775,7 @@ class StepCreatePsrOptimizer(Step):
         p = context.config.psr_params or {}
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Augment target detections with DIFT-discovered gap bboxes (if any).
-        # Discoveries already carry an assigned sign label, so the GMM data
-        # term naturally pulls source signs of the same class onto them.
         target_detections = list(s.sub_image.detections)
-        if s.discoveries:
-            extra = [d.to_bounding_box() for d in s.discoveries
-                     if not d.low_confidence]
-            target_detections.extend(extra)
-            s.discovery_augmented_count = len(extra)
-        else:
-            s.discovery_augmented_count = 0
 
         s.optimizer = PointSetRegistrationOptimizer(
             sub_tablet_text=s.sub_tablet_aligned,
@@ -774,10 +802,6 @@ class StepCreatePsrOptimizer(Step):
         if vis.info:
             print(f"=== PSR Optimizer ===")
             print(f"  Device: {opt.device}, Source (M): {opt.M}, Target (N): {opt.N}")
-            n_extra = getattr(s, "discovery_augmented_count", 0)
-            if n_extra:
-                print(f"    Target breakdown: {opt.N - n_extra} model detections "
-                      f"+ {n_extra} DIFT-discovered gap signs")
             print(f"  Sigma: {opt.sigma:.1f}, w_noise: {opt.w_noise}")
             print(f"  Lambdas: data={opt.lambda_data}, anchor={opt.lambda_anchor}, "
                   f"seq={opt.lambda_seq}, height={opt.lambda_height}, "
@@ -794,11 +818,47 @@ class StepCreatePsrOptimizer(Step):
 class StepRunPsrOptimization(Step):
     name = "Run PSR Optimization"
 
+    def __init__(
+        self,
+        num_iterations: Optional[int] = None,
+        num_iterations_from_affine_probe: bool = False,
+        remaining_after_affine_probe: bool = False,
+        name: Optional[str] = None,
+    ):
+        self.num_iterations = num_iterations
+        self.num_iterations_from_affine_probe = num_iterations_from_affine_probe
+        self.remaining_after_affine_probe = remaining_after_affine_probe
+        if name is not None:
+            self.name = name
+
+    def _num_iterations(self, context: CropContext) -> int:
+        p = context.config.psr_params or {}
+        total = int(p.get('num_iterations', 80))
+        if self.num_iterations is not None:
+            return max(0, int(self.num_iterations))
+
+        cfg = _dift_alignment_config(context.config)
+        probe_iter = cfg.affine_probe_iteration
+        if probe_iter is None:
+            probe_iter = total
+        probe_iter = max(0, int(probe_iter))
+
+        if self.num_iterations_from_affine_probe:
+            return min(total, probe_iter)
+        if self.remaining_after_affine_probe:
+            return max(0, total - probe_iter)
+        return total
+
     def run(self, context: CropContext):
         s = context.state
         p = context.config.psr_params or {}
+        num_iterations = self._num_iterations(context)
+        if num_iterations <= 0:
+            s.sub_tablet_final = s.optimizer.get_optimized_subtablet()
+            return
+
         s.sub_tablet_final = s.optimizer.optimize(
-            num_iterations=p.get('num_iterations', 80),
+            num_iterations=num_iterations,
             lr=p.get('lr', 1.0),
             sigma_anneal=p.get('sigma_anneal', True),
             sigma_final=None,
@@ -807,9 +867,158 @@ class StepRunPsrOptimization(Step):
         )
 
     def visualize(self, context: CropContext, vis: VisOptions):
+        s = context.state
         if vis.info:
-            s = context.state
             print(f"=== Optimization Complete: {len(s.sub_tablet_final)} signs ===")
+
+
+# ---------------------------------------------------------------------------
+# Step: Paste canonical signs at current PSR boxes
+# ---------------------------------------------------------------------------
+
+class StepVisualizeCanonicalSignsAtPsrBoxes(Step):
+    name = "Visualize Canonical Signs at Current Optimization Boxes"
+    description = (
+        "Snapshots the current PSR boxes and pastes each sign's canonical "
+        "image into that box for visualization only."
+    )
+
+    def run(self, context: CropContext):
+        s = context.state
+        s.canonical_overlay_iteration = None
+        s.canonical_overlay_image = None
+        s.canonical_overlay_stats = None
+        s.canonical_overlay_error = None
+
+        s.canonical_overlay_error = _dift_diagnostic_error(s)
+        if s.canonical_overlay_error:
+            return
+
+        cfg = _dift_alignment_config(context.config)
+        try:
+            current_subtablet = s.optimizer.get_optimized_subtablet()
+            overlay, stats = render_canonical_sign_overlay(
+                image=s.sub_image.img,
+                subtablet=current_subtablet,
+                cache=s.canonical_cache,
+                max_boxes=cfg.canonical_overlay_max_boxes,
+                draw_boxes=False,
+                draw_labels=False,
+            )
+            s.canonical_overlay_iteration = len(s.optimizer.loss_history)
+            s.canonical_overlay_image = overlay
+            s.canonical_overlay_stats = stats
+        except Exception as exc:
+            s.canonical_overlay_error = f"{type(exc).__name__}: {exc}"
+
+    def visualize(self, context: CropContext, vis: VisOptions):
+        s = context.state
+        if vis.info:
+            if s.canonical_overlay_stats is not None:
+                st = s.canonical_overlay_stats
+                print(f"=== Canonical Sign Overlay @ iter {s.canonical_overlay_iteration}: "
+                      f"{st.get('pasted', 0)}/{st.get('total', 0)} pasted ===")
+                missing = st.get("missing_names") or []
+                if missing:
+                    shown = ", ".join(missing[:20])
+                    suffix = " ..." if len(missing) > 20 else ""
+                    print(f"  Missing canonical images: {shown}{suffix}")
+            elif s.canonical_overlay_error:
+                print(f"=== Canonical Sign Overlay skipped: {s.canonical_overlay_error} ===")
+
+        if not (vis.display or vis.save):
+            return
+        if s.canonical_overlay_image is None:
+            return
+
+        if vis.save:
+            iter_tag = f"iter{s.canonical_overlay_iteration}"
+            cv2.imwrite(_out(context, f"canonical_sign_overlay_{iter_tag}.jpg"),
+                        s.canonical_overlay_image,
+                        [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if vis.display:
+            _display_bgr(
+                s.canonical_overlay_image,
+                f"Canonical signs pasted at PSR boxes @ iter {s.canonical_overlay_iteration}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Step: DIFT affine probe for current PSR state
+# ---------------------------------------------------------------------------
+
+class StepDiftAffineProbe(Step):
+    name = "DIFT Affine Probe"
+    description = (
+        "Snapshots the current PSR optimizer boxes and estimates canonical "
+        "DIFT affine transforms for visualization."
+    )
+
+    def run(self, context: CropContext):
+        s = context.state
+        cfg = _dift_alignment_config(context.config)
+
+        s.dift_affine_probe_iteration = None
+        s.dift_affine_probe_subtablet = None
+        s.dift_affine_probe_results = None
+        s.dift_affine_probe_error = None
+
+        s.dift_affine_probe_error = _dift_diagnostic_error(s)
+        if s.dift_affine_probe_error:
+            return
+
+        try:
+            probe_subtablet = s.optimizer.get_optimized_subtablet()
+            results = build_dift_affine_probe(
+                image=s.sub_image.img,
+                subtablet=probe_subtablet,
+                cache=s.canonical_cache,
+                padding_ratio=cfg.affine_probe_padding_ratio,
+                max_boxes=cfg.affine_probe_max_boxes,
+                max_matches=cfg.affine_probe_max_matches,
+                min_matches=cfg.affine_probe_min_matches,
+                ransac_threshold=cfg.affine_probe_ransac_threshold,
+            )
+            s.dift_affine_probe_iteration = len(s.optimizer.loss_history)
+            s.dift_affine_probe_subtablet = probe_subtablet
+            s.dift_affine_probe_results = results
+        except Exception as exc:
+            s.dift_affine_probe_error = f"{type(exc).__name__}: {exc}"
+
+    def visualize(self, context: CropContext, vis: VisOptions):
+        s = context.state
+        if vis.info:
+            if s.dift_affine_probe_results is not None:
+                ok = sum(1 for r in s.dift_affine_probe_results if r.affine is not None)
+                print(f"=== DIFT Affine Probe @ iter {s.dift_affine_probe_iteration}: "
+                      f"{ok}/{len(s.dift_affine_probe_results)} affine estimates ===")
+            elif s.dift_affine_probe_error:
+                print(f"=== DIFT Affine Probe skipped: {s.dift_affine_probe_error} ===")
+
+        if not (vis.display or vis.save):
+            return
+        if s.dift_affine_probe_results is None or s.dift_affine_probe_subtablet is None:
+            return
+
+        cfg = _dift_alignment_config(context.config)
+        overlay, grid = render_dift_affine_probe(
+            image=s.sub_image.img,
+            subtablet=s.dift_affine_probe_subtablet,
+            results=s.dift_affine_probe_results,
+            iteration=s.dift_affine_probe_iteration,
+            thumb=cfg.affine_probe_thumb,
+        )
+        if vis.save:
+            iter_tag = f"iter{s.dift_affine_probe_iteration}"
+            cv2.imwrite(_out(context, f"dift_affine_probe_{iter_tag}_boxes.jpg"), overlay)
+            cv2.imwrite(_out(context, f"dift_affine_probe_{iter_tag}_grid.jpg"), grid,
+                        [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if vis.display:
+            for title, img in [
+                (f"DIFT affine probe boxes @ iter {s.dift_affine_probe_iteration}", overlay),
+                (f"DIFT affine probe grid @ iter {s.dift_affine_probe_iteration}", grid),
+            ]:
+                _display_bgr(img, title)
 
 
 # ---------------------------------------------------------------------------
@@ -925,7 +1134,7 @@ class StepSetupCanonicalSigns(Step):
         s = context.state
         s.canonical_source = None
         s.canonical_cache = None
-        s.discovery_meta = None
+        s.canonical_meta = None
 
         fragment_data = context.api_source.get_fragment_data(context.fragment_id)
         period = fragment_data["script"]["period"]
@@ -954,14 +1163,14 @@ class StepSetupCanonicalSigns(Step):
             "source_kind": source_kind,
             "precompute": None,
         }
-        s.discovery_meta = meta
+        s.canonical_meta = meta
         if not source.is_ready():
             raise RuntimeError(f"canonical source is not ready: {source.describe()}")
 
         cache_key = self._cache_key(source)
         cache = context._canonical_caches.get(cache_key)
 
-        disc_cfg = context.config.discovery or DiscoveryConfig()
+        dift_align_cfg = _dift_alignment_config(context.config)
         if cache is None:
             cache = CanonicalFeatureCache(
                 source=source,
@@ -972,7 +1181,7 @@ class StepSetupCanonicalSigns(Step):
                   f"{len(source.list_sign_names())} canonical images "
                   f"(this takes a few minutes on first call)...")
             stats = cache.precompute_all(
-                verbose=True, limit=disc_cfg.precompute_limit,
+                verbose=True, limit=dift_align_cfg.precompute_limit,
                 progress_every=50,
             )
             meta["precompute"] = stats
@@ -988,199 +1197,48 @@ class StepSetupCanonicalSigns(Step):
 
     def visualize(self, context: CropContext, vis: VisOptions):
         s = context.state
-        if not vis.info:
-            return
-        meta = s.discovery_meta or {}
-        print("=== Canonical Signs Setup ===")
-        print(f"  Enabled:      {meta.get('enabled')}")
-        print(f"  API period:   {meta.get('period')!r}")
-        print(f"  Source:       {meta.get('source_kind')}")
-        if s.canonical_source is not None:
-            print(f"  Source info:  {s.canonical_source.describe()}")
-        if s.canonical_cache is not None:
-            print(f"  Cache size:   {len(s.canonical_cache)} cached canonical signs")
-        pre = meta.get("precompute")
-        if isinstance(pre, dict):
-            if pre.get("reused"):
-                print(f"  Precompute:   reused cross-sample cache "
-                      f"(size={pre.get('size')})")
-            else:
-                print(f"  Precompute:   total={pre.get('total')}  "
-                      f"computed={pre.get('computed')}  cached={pre.get('cached')}  "
-                      f"disk={pre.get('disk_cached')}")
-
-
-# ---------------------------------------------------------------------------
-# Step: Discover missing signs via DIFT on interpolated row-gap candidates
-# ---------------------------------------------------------------------------
-
-class StepIdentifyGapSigns(Step):
-    name = "Identify Gap Signs (coordinate-based gap detection + DIFT ranking)"
-    description = (
-        "Scans detection rows for coordinate gaps where a sign is likely "
-        "missing (centre-to-centre stride approximately N x avg_width). For "
-        "each pending bbox, crops the sub-image and ranks the entire cached "
-        "canonical inventory by DIFT best-buddy similarity; the top-scoring "
-        "sign is assigned as the label. Discovered bboxes are added to "
-        "target_detections in step_create_psr_optimizer."
-    )
-
-    def run(self, context: CropContext):
-        s = context.state
-        s.gap_candidates = None
-        s.discoveries = None
-        s.discovery_summary = None
-
-        cache = s.canonical_cache
-        if cache is None or len(cache) == 0:
-            raise RuntimeError("canonical feature cache is empty; run step_setup_canonical_signs first")
-        if s.sub_tablet_detection is None:
-            raise RuntimeError("sub_tablet_detection is missing; run row setup steps first")
-
-        cfg = context.config.discovery or DiscoveryConfig()
-
-        # ---- 1. Coordinate-based gap detection ----------------------------
-        detector = GapDetector(cfg.gap)
-        gaps = detector.find_gaps(s.sub_tablet_detection, s.sub_image.img)
-        s.gap_candidates = gaps
-        if not gaps:
-            s.discoveries = []
-            s.discovery_summary = summarize_discoveries([], 0)
-            return
-
-        # ---- 2. DIFT identification per gap -------------------------------
-        identifier = SignIdentifier(cache, cfg.identification)
-        top_k_show = max(1, cfg.identification.top_k)
-        discoveries: List[GapDiscovery] = []
-        for g in gaps:
-            ranked = identifier.identify(g.crop_img)
-            if not ranked:
-                raise RuntimeError("DIFT identification returned no candidates")
-            best = ranked[0]
-            disc = GapDiscovery(
-                gap=g, best=best,
-                top_k=ranked[:top_k_show],
-                low_confidence=best.score < cfg.identification.min_score,
-            )
-            discoveries.append(disc)
-
-        s.discoveries = discoveries
-        s.discovery_summary = summarize_discoveries(discoveries, len(gaps))
-
-    def visualize(self, context: CropContext, vis: VisOptions):
-        s = context.state
-        if s.gap_candidates is None:
-            if vis.info:
-                print("Discovery: skipped (no canonical cache available).")
-            return
-
-        summ = s.discovery_summary or {}
         if vis.info:
-            print("=== Gap-Driven Sign Identification ===")
-            print(f"  Gaps found:           {summ.get('gaps_total', 0)}")
-            print(f"  Discoveries:          {summ.get('discoveries', 0)} "
-                  f"(confident={summ.get('confident', 0)}, "
-                  f"low_confidence={summ.get('low_confidence', 0)})")
-            top_signs = summ.get("by_sign_top10", {})
-            if top_signs:
-                print("  Top assigned signs:")
-                for name, count in top_signs.items():
-                    print(f"    {count}x  {name}")
-            # Per-gap detailed log
-            if s.discoveries:
-                print("  Per-gap top-3 assignments (score):")
-                for d in s.discoveries:
-                    g = d.gap
-                    line = (f"    R{g.row_idx} ins{g.insert_idx+1}/{g.n_inserts} "
-                            f"@({g.cx:.0f},{g.cy:.0f})  ")
-                    line += " | ".join(
-                        f"{r.sign_name[:10]}:{r.score:.3f}"
-                        for r in d.top_k[:3]
-                    )
-                    print(line)
-
-        # Per-gap grid is only useful when there is at least one discovery.
-        if s.discoveries:
-            grid = render_discovery_grid(s.discoveries, thumb=120,
-                                         top_k_show=min(4, len(s.discoveries[0].top_k)))
-        else:
-            grid = None
-        if grid is not None:
-            if vis.display:
-                import matplotlib.pyplot as plt
-                grid_rgb = cv2.cvtColor(grid, cv2.COLOR_BGR2RGB)
-                h, w = grid_rgb.shape[:2]
-                fig_w = min(20.0, w / 60.0)
-                fig_h = max(2.0, fig_w * h / max(w, 1))
-                plt.figure(figsize=(fig_w, fig_h))
-                plt.imshow(grid_rgb)
-                plt.axis("off")
-                plt.title("Gap Identification: crop | top-K canonical (green = assigned)")
-                plt.tight_layout(pad=0.3)
-                plt.show()
-            if vis.save:
-                cv2.imwrite(_out(context, "discovery_grid.jpg"), grid,
-                            [cv2.IMWRITE_JPEG_QUALITY, 90])
-
-        # Sub-image overlay: detection bboxes (red) + discovered bboxes (green)
-        # with the assigned sign name and score annotated.
-        if vis.display or vis.save:
-            overlay = s.sub_image.img.copy()
-            avg_size = (s.avg_width + s.avg_height) / 2.0 if s.avg_width else 60.0
-            t_line = max(2, int(round(avg_size / 30.0)))
-            font_scale = max(0.6, avg_size / 250.0)
-            font_thick = max(2, int(round(avg_size / 60.0)))
-
-            RED = (60, 60, 220)        # model detections
-            GREEN = (80, 200, 80)      # accepted gap discoveries
-            AMBER = (40, 170, 220)     # low-confidence
-
-            # Existing model detections (for context).
-            for det in s.sub_image.detections:
-                cv2.rectangle(overlay,
-                              (int(det.x1), int(det.y1)), (int(det.x2), int(det.y2)),
-                              RED, t_line, cv2.LINE_AA)
-
-            # Gap discoveries.
-            # Outline EVERY gap candidate even if no sign was confidently
-            # assigned, so the user can verify the gap-detection coverage.
-            CYAN = (210, 210, 0)
-            disc_by_gap = {id(d.gap): d for d in s.discoveries}
-            for g in s.gap_candidates or []:
-                d = disc_by_gap.get(id(g))
-                if d is not None:
-                    color = AMBER if d.low_confidence else GREEN
-                    thick = t_line + 1
+            meta = s.canonical_meta or {}
+            print("=== Canonical Signs Setup ===")
+            print(f"  Enabled:      {meta.get('enabled')}")
+            print(f"  API period:   {meta.get('period')!r}")
+            print(f"  Source:       {meta.get('source_kind')}")
+            if s.canonical_source is not None:
+                print(f"  Source info:  {s.canonical_source.describe()}")
+            if s.canonical_cache is not None:
+                print(f"  Cache size:   {len(s.canonical_cache)} cached canonical signs")
+            pre = meta.get("precompute")
+            if isinstance(pre, dict):
+                if pre.get("reused"):
+                    print(f"  Precompute:   reused cross-sample cache "
+                          f"(size={pre.get('size')})")
                 else:
-                    color = CYAN
-                    thick = t_line
-                cv2.rectangle(overlay,
-                              (int(g.cx - g.width / 2), int(g.cy - g.height / 2)),
-                              (int(g.cx + g.width / 2), int(g.cy + g.height / 2)),
-                              color, thick, cv2.LINE_AA)
-                if d is not None:
-                    label = f"{d.sign_name[:10]} {d.score:.2f}"
-                else:
-                    label = f"R{g.row_idx} (no match)"
-                tx = int(g.cx - g.width / 2)
-                ty = int(g.cy - g.height / 2 - 6)
-                cv2.putText(overlay, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
-                            font_scale, (0, 0, 0), font_thick + 2, cv2.LINE_AA)
-                cv2.putText(overlay, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
-                            font_scale, color, font_thick, cv2.LINE_AA)
+                    print(f"  Precompute:   total={pre.get('total')}  "
+                          f"computed={pre.get('computed')}  cached={pre.get('cached')}  "
+                          f"disk={pre.get('disk_cached')}")
 
-            if vis.save:
-                cv2.imwrite(_out(context, "discovery_overlay.jpg"), overlay)
-            if vis.display:
-                import matplotlib.pyplot as plt
-                plt.figure(figsize=(14, 9))
-                plt.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-                plt.axis("off")
-                plt.title("Discovery overlay  "
-                          "(red=model detection, green=gap discovery (assigned), "
-                          "amber=low confidence)")
-                plt.tight_layout()
-                plt.show()
+        if not (vis.display or vis.save):
+            return
+
+        cfg = _dift_alignment_config(context.config)
+        rows, missing, total = collect_detected_canonical_feature_rows(
+            s.sub_tablet_detection,
+            s.canonical_cache,
+            max_signs=cfg.feature_viz_max_signs,
+        )
+        if vis.info and total:
+            print(f"  Feature-map viz: detected unique signs={total}, shown={len(rows)}")
+            if missing:
+                print("  Missing canonical features: " + ", ".join(missing[:20]))
+        if not rows:
+            return
+
+        grid = render_canonical_feature_grid(rows)
+        if vis.display:
+            _display_bgr(grid, "Canonical DIFT feature maps", px_per_in=60.0)
+        if vis.save:
+            cv2.imwrite(_out(context, "canonical_feature_maps.jpg"), grid,
+                        [cv2.IMWRITE_JPEG_QUALITY, 90])
 
 
 # ---------------------------------------------------------------------------
@@ -1204,12 +1262,20 @@ step_offset_analysis = StepOffsetAnalysis()
 step_unload_detector = StepUnloadDetector()
 step_create_psr_optimizer = StepCreatePsrOptimizer()
 step_run_psr_optimization = StepRunPsrOptimization()
+step_run_psr_optimization_until_dift_probe = StepRunPsrOptimization(
+    num_iterations_from_affine_probe=True,
+    name="Run PSR Optimization (before DIFT affine probe)",
+)
+step_visualize_canonical_signs_at_psr_boxes = StepVisualizeCanonicalSignsAtPsrBoxes()
+step_dift_affine_probe = StepDiftAffineProbe()
+step_run_psr_optimization_after_dift_probe = StepRunPsrOptimization(
+    remaining_after_affine_probe=True,
+    name="Run PSR Optimization (after DIFT affine probe)",
+)
 step_plot_loss_history = StepPlotLossHistory()
 step_results_comparison = StepResultsComparison()
 step_param_changes = StepParamChanges()
-# Gap-driven DIFT identification
 step_setup_canonical_signs = StepSetupCanonicalSigns()
-step_identify_gap_signs = StepIdentifyGapSigns()
 
 
 DEBUG_STEPS = [
@@ -1234,8 +1300,7 @@ DEBUG_STEPS = [
 ]
 
 
-# Detector + coordinate-based gap detection + DIFT full-inventory ranking.
-# Discovered gap bboxes are appended to target_detections before PSR runs.
+# Detector + canonical DIFT feature diagnostics.
 DEBUG_STEPS_WITH_DIFT = [
     step_load_data,
     step_detect_signs,
@@ -1251,9 +1316,11 @@ DEBUG_STEPS_WITH_DIFT = [
     step_offset_analysis,
     step_unload_detector,
     step_setup_canonical_signs,
-    step_identify_gap_signs,
     step_create_psr_optimizer,
-    step_run_psr_optimization,
+    step_run_psr_optimization_until_dift_probe,
+    step_visualize_canonical_signs_at_psr_boxes,
+    step_dift_affine_probe,
+    step_run_psr_optimization_after_dift_probe,
     step_plot_loss_history,
     step_results_comparison,
     step_param_changes,

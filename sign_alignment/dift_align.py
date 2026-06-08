@@ -1,30 +1,20 @@
-"""
-Gap-driven DIFT identification of missing cuneiform signs.
+"""DIFT utilities for canonical sign features and alignment diagnostics.
 
-This module identifies signs that the object detector missed, using only
-the detection-row layout as a prior. The flow is:
+The active pipeline uses DIFT only for diagnostics:
 
-    1. Pre-compute DIFT features for the ENTIRE canonical sign inventory
-       (eager, cached on the CropContext so it amortizes across samples).
-    2. Scan each detection row's coordinates: where adjacent boxes are
-       further apart than expected by avg sign width, insert one or more
-       pending bboxes at evenly-spaced positions inside the gap.
-    3. For each pending bbox, crop the sub-image, run DIFT, and score
-       it against every cached canonical image. The highest-scoring sign is
-       assigned to that bbox.
-    4. The discovered (assigned) bboxes are appended to
-       `sub_image.detections` BEFORE the PSR optimizer is constructed,
-       so the GMM data term naturally sees them — no PSR-internal hooks.
-
-The canonical source used by the current pipeline is eBL MongoDB.
+    1. Pre-compute DIFT features for the canonical sign inventory.
+    2. Optionally visualize canonical feature maps for detected signs.
+    3. At selected pipeline points, crop the current PSR boxes from the tablet
+       image and estimate a ProtoSnap-style affine transform from the matching
+       canonical sign to each crop.  These transforms are visualized only; they
+       do not change the optimization state or loss.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import base64
-from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import hashlib
 import io
 from pathlib import Path
@@ -36,7 +26,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .bounding_box import BoundingBox
 from .sign import Sign, SignResolver
 from .tablet import SignBox, SubTablet
 
@@ -324,17 +313,12 @@ class CanonicalFeatureCache:
         rec = self._cache.get(sid)
         if rec is not None:
             return rec
+
         rec = self._load_from_disk(sign, sid)
-        if rec is not None:
-            self._cache[sid] = rec
-            self._ordered_ids.append(sid)
-            return rec
-        rec = self._featurize_sign(sign, sid)
-        if rec is not None:
-            self._cache[sid] = rec
-            self._ordered_ids.append(sid)
+        if rec is None:
+            rec = self._featurize_sign(sign, sid)
             self._save_to_disk(sign, rec)
-        return rec
+        return self._remember(sid, rec)
 
     # ---- eager full-inventory precompute -------------------------------
 
@@ -359,30 +343,40 @@ class CanonicalFeatureCache:
             sid = self.source.get_id(sign)
             if sid is None:
                 raise KeyError(f"{name} is listed by the source but has no source id")
+
             if sid in self._cache:
                 stats["cached"] += 1
             else:
                 rec = self._load_from_disk(sign, sid)
                 if rec is not None:
-                    self._cache[sid] = rec
-                    self._ordered_ids.append(sid)
                     stats["disk_cached"] += 1
-                    if verbose and (i % progress_every == 0 or i == len(names)):
-                        print(f"    [precompute] {i}/{len(names)} "
-                              f"(computed={stats['computed']}, cached={stats['cached']}, "
-                              f"disk={stats['disk_cached']})")
-                    continue
-                rec = self._featurize_sign(sign, sid)
-                self._cache[sid] = rec
-                self._ordered_ids.append(sid)
-                self._save_to_disk(sign, rec)
-                stats["computed"] += 1
+                else:
+                    rec = self._featurize_sign(sign, sid)
+                    self._save_to_disk(sign, rec)
+                    stats["computed"] += 1
+                self._remember(sid, rec)
 
-            if verbose and (i % progress_every == 0 or i == len(names)):
-                print(f"    [precompute] {i}/{len(names)} "
-                      f"(computed={stats['computed']}, cached={stats['cached']}, "
-                      f"disk={stats['disk_cached']})")
+            self._report_precompute(i, len(names), stats, verbose, progress_every)
         return stats
+
+    def _remember(self, sid: str, rec: CanonicalFeatureRecord) -> CanonicalFeatureRecord:
+        self._cache[sid] = rec
+        if sid not in self._ordered_ids:
+            self._ordered_ids.append(sid)
+        return rec
+
+    @staticmethod
+    def _report_precompute(
+        i: int,
+        total: int,
+        stats: Dict[str, int],
+        verbose: bool,
+        progress_every: int,
+    ) -> None:
+        if verbose and (i % progress_every == 0 or i == total):
+            print(f"    [precompute] {i}/{total} "
+                  f"(computed={stats['computed']}, cached={stats['cached']}, "
+                  f"disk={stats['disk_cached']})")
 
     def _disk_path(self, sign: Sign) -> Optional[Path]:
         if self.disk_dir is None:
@@ -435,11 +429,8 @@ class CanonicalFeatureCache:
         img = self.source.get_image(sign)
         if img is None:
             raise KeyError(f"{sign.name} has no canonical image")
-        rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB) if img.ndim == 2 \
-              else cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
         with torch.no_grad():
-            fm = self.wrapper.featurize(pil)
+            fm = self.wrapper.featurize(Image.fromarray(_to_rgb(img)))
         # Move to CPU + fp16 so all 900 features fit in RAM, not VRAM.
         fm_cpu = fm.detach().to(device=self.store_device, dtype=self.store_dtype,
                                 non_blocking=False)
@@ -463,363 +454,697 @@ class CanonicalFeatureCache:
 
 
 # ===========================================================================
-# Gap detection: where do we expect to insert a "pending" bbox?
+# DIFT alignment diagnostics
 # ===========================================================================
 
 @dataclass
-class GapDetectionConfig:
-    # If centre-to-centre distance / avg_width rounds to N (>= 2), there are
-    # N-1 missing signs in that row gap. Tolerance band: a ratio close to 2 is
-    # interpreted as "1 missing", close to 3 as "2 missing", etc.
-    # tolerance_ratio: how close to integer N to count as N (e.g. 0.4 means
-    # round to N if |stride/avg_w - N| <= tolerance_ratio).
-    tolerance_ratio: float = 0.4
-    # Maximum signs to insert in one gap (guards against single huge gap
-    # generating many wild candidates).
-    max_inserts_per_gap: int = 3
-    # Padding around the candidate bbox when cropping for DIFT featurization
-    # (fraction of bbox size).
-    crop_padding_ratio: float = 0.3
-    # If a row has only one detection, we cannot interpolate any gap — skip.
-    require_two_anchors: bool = True
+class DiftAlignmentConfig:
+    """Configuration for canonical DIFT diagnostics.
 
-
-@dataclass
-class GapCandidate:
-    """A pending bbox identified from row-coordinate gaps.
-
-    No sign label yet — `SignIdentifier` assigns one. `crop_img` is the
-    sub-image patch used for DIFT featurization; `crop_offset` is its
-    top-left corner in sub-image coords (so we can map features back to
-    sub-image pixel space).
-    """
-    cx: float
-    cy: float
-    width: float
-    height: float
-    row_idx: int
-    insert_idx: int                 # which insert within the gap (0..N-1)
-    n_inserts: int                  # total inserts placed in this gap
-    left_anchor_col: int            # col_idx of the left detected box
-    right_anchor_col: int           # col_idx of the right detected box
-    expected_stride: float          # the stride (avg sign width) used
-    crop_img: np.ndarray
-    crop_offset: Optional[Tuple[int, int]] = None
-
-
-class GapDetector:
-    """Coordinate-based gap finder.
-
-    For each detected row (sorted by x), scan adjacent box pairs. If the
-    centre-to-centre distance is approximately N×avg_width (with N >= 2),
-    insert N-1 candidate bboxes spaced evenly between the two anchors.
-    The candidate bbox uses avg_width × avg_height; the centre is placed
-    on the line connecting the two anchors (so it follows the row's slope).
+    In the default DIFT debug pipeline, `affine_probe_iteration` controls how
+    many PSR optimizer updates run before the standalone affine-probe step.
     """
 
-    def __init__(self, config: Optional[GapDetectionConfig] = None):
-        self.config = config or GapDetectionConfig()
-
-    def find_gaps(self, sub_tablet_detection: SubTablet,
-                  image: np.ndarray) -> List[GapCandidate]:
-        cfg = self.config
-        avg_w = float(sub_tablet_detection.avg_width or 0.0)
-        avg_h = float(sub_tablet_detection.avg_height or 0.0)
-        if avg_w <= 0 or avg_h <= 0:
-            return []
-
-        H, W = image.shape[:2]
-        gaps: List[GapCandidate] = []
-
-        rows = sub_tablet_detection.get_rows_dict()
-        for row_idx, row_boxes in rows.items():
-            if row_idx < 0:
-                continue
-            if cfg.require_two_anchors and len(row_boxes) < 2:
-                continue
-
-            # Boxes already sorted by col_idx (== sort by cx). Defensive sort.
-            row_sorted: List[SignBox] = sorted(row_boxes, key=lambda sb: sb.cx)
-            for i in range(len(row_sorted) - 1):
-                left = row_sorted[i]
-                right = row_sorted[i + 1]
-                stride = right.cx - left.cx
-                if stride <= 0:
-                    continue
-                # How many sign-widths fit in this stride?
-                n_units = stride / avg_w
-                n_total = int(round(n_units))
-                # Acceptance: must round to >= 2 (= at least 1 missing sign)
-                # AND the rounding error must be within tolerance.
-                if n_total < 2:
-                    continue
-                if abs(n_units - n_total) > cfg.tolerance_ratio:
-                    continue
-                n_insert = min(n_total - 1, cfg.max_inserts_per_gap)
-
-                # Place inserts evenly along the line from left to right
-                # centre. y interpolates linearly along the row's actual slope.
-                for j in range(n_insert):
-                    t = (j + 1) / (n_insert + 1)
-                    cx = left.cx + t * (right.cx - left.cx)
-                    cy = left.cy + t * (right.cy - left.cy)
-                    crop, off = self._crop(image, cx, cy, avg_w, avg_h,
-                                            (H, W), cfg.crop_padding_ratio)
-                    gaps.append(GapCandidate(
-                        cx=cx, cy=cy, width=avg_w, height=avg_h,
-                        row_idx=row_idx,
-                        insert_idx=j, n_inserts=n_insert,
-                        left_anchor_col=left.col_idx,
-                        right_anchor_col=right.col_idx,
-                        expected_stride=avg_w,
-                        crop_img=crop, crop_offset=off,
-                    ))
-        return gaps
-
-    @staticmethod
-    def _crop(image: np.ndarray, cx: float, cy: float, w: float, h: float,
-              sub_image_shape: Tuple[int, int], pad_ratio: float
-              ) -> Tuple[np.ndarray, Tuple[int, int]]:
-        H, W = sub_image_shape
-        pad_x = w * pad_ratio
-        pad_y = h * pad_ratio
-        x1 = int(max(0, round(cx - w / 2 - pad_x)))
-        y1 = int(max(0, round(cy - h / 2 - pad_y)))
-        x2 = int(min(W, round(cx + w / 2 + pad_x)))
-        y2 = int(min(H, round(cy + h / 2 + pad_y)))
-        if x2 <= x1 or y2 <= y1:
-            raise ValueError(f"invalid gap crop at ({cx:.1f}, {cy:.1f})")
-        return image[y1:y2, x1:x2].copy(), (x1, y1)
+    precompute_limit: Optional[int] = None
+    feature_viz_max_signs: int = 12
+    affine_probe_iteration: Optional[int] = 10
+    affine_probe_padding_ratio: float = 0.2
+    affine_probe_max_boxes: Optional[int] = None
+    affine_probe_max_matches: int = 300
+    affine_probe_min_matches: int = 3
+    affine_probe_ransac_threshold: Optional[float] = None
+    affine_probe_thumb: int = 128
+    canonical_overlay_max_boxes: Optional[int] = None
 
 
-# ===========================================================================
-# Sign identification: rank cached canonical signs by DIFT-feature similarity.
-# ===========================================================================
-
-@dataclass
-class IdentificationConfig:
-    # Number of top results to return for diagnostics / visualisation.
-    top_k: int = 5
-    # K used in "mean of top-K best-buddy similarities". Higher = more
-    # robust but tends to converge across all canonical signs; lower = noisy.
-    score_top_k: int = 20
-    # Below this score the assignment is marked as low-confidence (still
-    # included as a discovery, but flagged for downstream filtering).
-    min_score: float = 0.0
+class DiscoveryConfig(DiftAlignmentConfig):
+    """Backward-compatible alias for older notebooks/configs."""
 
 
 @dataclass
-class IdentificationResult:
-    """One ranked sign candidate for a crop."""
+class DiftAffineProbeResult:
     sign_name: str
-    score: float
-    record: CanonicalFeatureRecord
+    sign_box: SignBox
+    crop_img: np.ndarray
+    crop_offset: Tuple[int, int]
+    padded_bbox: Tuple[int, int, int, int]
+    canonical_img: Optional[np.ndarray]
+    affine: Optional[np.ndarray]
+    affine_full: Optional[np.ndarray]
+    n_matches: int
+    n_inliers: int
+    mean_inlier_similarity: float
+    message: str = ""
 
 
-class SignIdentifier:
-    """DIFT feature scorer: crop -> ranked list of canonical signs.
-
-    Score: mean cosine similarity of the top-K mutual-NN (best-buddy)
-    pairs between canonical and crop feature grids. Cheap (a single
-    matmul + two argmaxes per canonical sign) and discriminative.
-    """
-
-    def __init__(self, cache: CanonicalFeatureCache,
-                 config: Optional[IdentificationConfig] = None):
-        self.cache = cache
-        self.config = config or IdentificationConfig()
-
-    def featurize_crop(self, crop: np.ndarray) -> torch.Tensor:
-        if crop.ndim == 2:
-            rgb = cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB)
-        else:
-            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
-        with torch.no_grad():
-            return self.cache.wrapper.featurize(pil).detach()
-
-    def identify(self, crop: np.ndarray) -> List[IdentificationResult]:
-        """Return all cached canonical signs sorted by score (best first).
-
-        Caller typically takes [0] as the assigned label; the rest are
-        kept for diagnostics / visualization.
-        """
-        if not self.cache.ready:
-            return []
-        crop_ft = self.featurize_crop(crop)
-        # Move crop features to fp16 too, so the matmul uses uniform dtype
-        # (saves both VRAM and FLOPs).
-        crop_ft = crop_ft.to(dtype=torch.float16)
-        device = crop_ft.device
-        scored: List[IdentificationResult] = []
-        for rec in self.cache.ordered_records:
-            # Bring the canonical feature to the same device just for scoring.
-            proto_ft = rec.feature_map.to(device=device, dtype=torch.float16,
-                                          non_blocking=True)
-            s = self._score(proto_ft, crop_ft)
-            scored.append(IdentificationResult(rec.sign_name, s, rec))
-            # Release the temporary copy.
-            del proto_ft
-        scored.sort(key=lambda r: -r.score)
-        return scored
-
-    def _score(self, proto_ft: torch.Tensor, crop_ft: torch.Tensor) -> float:
-        # proto_ft, crop_ft: (C, 64, 64), L2-normalized on C.
-        # Compute (Hp*Wp, Ht*Wt) cosine similarity matrix by matmul.
-        C = proto_ft.shape[0]
-        p_flat = proto_ft.reshape(C, -1)        # (C, 4096)
-        t_flat = crop_ft.reshape(C, -1)         # (C, 4096)
-        sim = p_flat.T @ t_flat                  # (4096, 4096) fp16
-
-        # Mutual NN (best-buddy) mask.
-        p2t = sim.argmax(dim=1)
-        t2p = sim.argmax(dim=0)
-        idx = torch.arange(sim.shape[0], device=sim.device)
-        is_mutual = (t2p[p2t] == idx)
-        if not is_mutual.any():
-            return 0.0
-
-        bb_sims = sim[idx[is_mutual], p2t[is_mutual]]
-        k = min(self.config.score_top_k, int(bb_sims.numel()))
-        if k <= 0:
-            return 0.0
-        return float(torch.topk(bb_sims.float(), k).values.mean().item())
+def _probe_result(
+    sb: SignBox,
+    crop_img: np.ndarray,
+    crop_offset: Tuple[int, int],
+    padded_bbox: Tuple[int, int, int, int],
+    canonical_img: Optional[np.ndarray] = None,
+    affine: Optional[np.ndarray] = None,
+    affine_full: Optional[np.ndarray] = None,
+    n_matches: int = 0,
+    n_inliers: int = 0,
+    mean_inlier_similarity: float = 0.0,
+    message: str = "",
+) -> DiftAffineProbeResult:
+    return DiftAffineProbeResult(
+        sign_name=sb.sign_name,
+        sign_box=sb.copy(),
+        crop_img=crop_img,
+        crop_offset=crop_offset,
+        padded_bbox=padded_bbox,
+        canonical_img=canonical_img,
+        affine=affine,
+        affine_full=affine_full,
+        n_matches=n_matches,
+        n_inliers=n_inliers,
+        mean_inlier_similarity=mean_inlier_similarity,
+        message=message,
+    )
 
 
-# ===========================================================================
-# Discovery: gap detection + identification + summary container
-# ===========================================================================
-
-@dataclass
-class GapDiscovery:
-    """A gap candidate after sign identification."""
-    gap: GapCandidate
-    best: IdentificationResult
-    top_k: List[IdentificationResult] = field(default_factory=list)
-    low_confidence: bool = False
-
-    @property
-    def sign_name(self) -> str: return self.best.sign_name
-    @property
-    def score(self) -> float: return self.best.score
-
-    def to_bounding_box(self) -> BoundingBox:
-        """Convert into a BoundingBox so PSR can treat this as a detection."""
-        sign = SignResolver.from_name(self.best.sign_name)
-        return BoundingBox(
-            x1=self.gap.cx - self.gap.width / 2,
-            y1=self.gap.cy - self.gap.height / 2,
-            x2=self.gap.cx + self.gap.width / 2,
-            y2=self.gap.cy + self.gap.height / 2,
-            score=float(self.best.score),
-            sign=sign,
-        )
+def canonical_feature_norm_image(feature_map: torch.Tensor) -> np.ndarray:
+    fm = feature_map.detach().float().cpu()
+    feat = torch.linalg.vector_norm(fm, dim=0).numpy()
+    return _normalize01(feat)
 
 
-@dataclass
-class DiscoveryConfig:
-    gap: GapDetectionConfig = field(default_factory=GapDetectionConfig)
-    identification: IdentificationConfig = field(default_factory=IdentificationConfig)
-    precompute_limit: Optional[int] = None   # cap (None = all)
+def canonical_feature_overlay(record: CanonicalFeatureRecord) -> np.ndarray:
+    img = record.img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    heat = canonical_feature_norm_image(record.feature_map)
+    heat = cv2.resize(heat, (gray.shape[1], gray.shape[0]),
+                      interpolation=cv2.INTER_CUBIC)
+    heat_bgr = cv2.applyColorMap((heat * 255).astype(np.uint8),
+                                 cv2.COLORMAP_VIRIDIS)
+    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return cv2.addWeighted(gray_bgr, 0.45, heat_bgr, 0.55, 0)
 
 
-def summarize_discoveries(discoveries: List[GapDiscovery],
-                          n_gaps_total: int) -> Dict[str, Any]:
-    confident = sum(1 for d in discoveries if not d.low_confidence)
-    low = sum(1 for d in discoveries if d.low_confidence)
-    by_sign = Counter(d.sign_name for d in discoveries)
-    return {
-        "gaps_total": n_gaps_total,
-        "discoveries": len(discoveries),
-        "confident": confident,
-        "low_confidence": low,
-        "by_sign_top10": dict(by_sign.most_common(10)),
+def render_canonical_feature_grid(
+    rows: List[Tuple[str, CanonicalFeatureRecord]],
+    thumb: int = 120,
+) -> np.ndarray:
+    """Render [canonical | feature norm | overlay] rows for canonical signs."""
+    grid_rows = []
+    for name, rec in rows:
+        grid_rows.append([
+            (name[:18], _to_bgr(rec.img)),
+            ("DIFT feature norm", _heat_to_bgr(canonical_feature_norm_image(rec.feature_map))),
+            ("overlay", canonical_feature_overlay(rec)),
+        ])
+    return _render_grid(grid_rows, thumb, "No canonical features", header_h=24)
+
+
+def collect_detected_canonical_feature_rows(
+    sub_tablet_detection: Optional[SubTablet],
+    cache: Optional[CanonicalFeatureCache],
+    max_signs: int = 12,
+) -> Tuple[List[Tuple[str, CanonicalFeatureRecord]], List[str], int]:
+    if sub_tablet_detection is None or cache is None:
+        return [], [], 0
+
+    detected_names = list(dict.fromkeys(
+        sb.sign_name for sb in sub_tablet_detection.sign_boxes
+    ))
+    rows: List[Tuple[str, CanonicalFeatureRecord]] = []
+    missing: List[str] = []
+    for name in detected_names:
+        rec = cache.get(SignResolver.from_name(name))
+        if rec is None:
+            missing.append(name)
+            continue
+        rows.append((name, rec))
+        if len(rows) >= max_signs:
+            break
+    return rows, missing, len(detected_names)
+
+
+def render_canonical_sign_overlay(
+    image: np.ndarray,
+    subtablet: SubTablet,
+    cache: CanonicalFeatureCache,
+    max_boxes: Optional[int] = None,
+    draw_boxes: bool = True,
+    draw_labels: bool = True,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Paste canonical sign images into the current sign boxes."""
+    overlay = _to_bgr(image).copy()
+    stats: Dict[str, Any] = {
+        "total": 0,
+        "pasted": 0,
+        "missing": 0,
+        "skipped": 0,
+        "missing_names": [],
     }
+    if image is None or subtablet is None or cache is None:
+        return overlay, stats
+
+    boxes = subtablet.sign_boxes
+    if max_boxes is not None:
+        boxes = boxes[:max_boxes]
+
+    missing_names = []
+    for sb in boxes:
+        stats["total"] += 1
+        rec = cache.get(sb.sign)
+        if rec is None or rec.img is None:
+            stats["missing"] += 1
+            missing_names.append(sb.sign_name)
+            if draw_boxes:
+                _draw_sign_box(overlay, sb, color=(140, 140, 140),
+                               draw_label=draw_labels)
+            continue
+
+        pasted = _paste_canonical_into_box(overlay, rec.img, sb)
+        if pasted:
+            stats["pasted"] += 1
+        else:
+            stats["skipped"] += 1
+
+        if draw_boxes:
+            _draw_sign_box(overlay, sb, color=_OPTIMIZED_BBOX_COLOR,
+                           draw_label=draw_labels)
+
+    stats["missing_names"] = list(dict.fromkeys(missing_names))
+    return overlay, stats
 
 
-# ===========================================================================
-# Visualisation: per-gap grid (crop + top-K canonical signs)
-# ===========================================================================
+def build_dift_affine_probe(
+    image: np.ndarray,
+    subtablet: SubTablet,
+    cache: CanonicalFeatureCache,
+    padding_ratio: float = 0.2,
+    max_boxes: Optional[int] = None,
+    max_matches: int = 300,
+    min_matches: int = 3,
+    ransac_threshold: Optional[float] = None,
+) -> List[DiftAffineProbeResult]:
+    """Estimate canonical-to-crop affine transforms for current sign boxes."""
+    if image is None or subtablet is None or cache is None:
+        return []
 
-def render_discovery_grid(discoveries: List[GapDiscovery],
-                          thumb: int = 96, top_k_show: int = 3) -> np.ndarray:
-    """One row per discovery: [crop | top-1 proto (assigned) | top-2 | ...].
+    results: List[DiftAffineProbeResult] = []
+    boxes = subtablet.sign_boxes
+    if max_boxes is not None:
+        boxes = boxes[:max_boxes]
 
-    Each cell is annotated with the sign name and the DIFT score.  The
-    assigned (top-1) cell gets a green border, the rest gray.
-    """
-    if not discoveries:
-        return np.full((thumb + 30, thumb * (top_k_show + 1) + 20, 3), 15, np.uint8)
+    for sb in boxes:
+        crop, offset, padded_bbox = crop_sign_box(image, sb, padding_ratio)
+        rec = cache.get(sb.sign)
+        if rec is None:
+            results.append(_probe_result(sb, crop, offset, padded_bbox, message="missing canonical"))
+            continue
 
-    HDR_H = 22
-    BORDER = 2
-    GAP = 4
-    CELL = thumb + 2 * BORDER + HDR_H + GAP
-    n_cols = top_k_show + 1   # crop + K canonical signs
-    n_rows = len(discoveries)
-    W = GAP + n_cols * (thumb + 2 * BORDER + GAP)
-    Hh = GAP + n_rows * CELL
-    grid = np.full((Hh, W, 3), 18, np.uint8)
+        crop_ft = _featurize_image(cache.wrapper, crop)
+        affine, n_matches, n_inliers, mean_sim = estimate_dift_affine(
+            rec.feature_map,
+            crop_ft,
+            src_img_shape=rec.img.shape[:2],
+            dst_img_shape=crop.shape[:2],
+            max_matches=max_matches,
+            min_matches=min_matches,
+            ransac_threshold=ransac_threshold,
+        )
+        affine_full = _affine_with_offset(affine, offset)
+        results.append(_probe_result(
+            sb, crop, offset, padded_bbox,
+            canonical_img=rec.img,
+            affine=affine,
+            affine_full=affine_full,
+            n_matches=n_matches,
+            n_inliers=n_inliers,
+            mean_inlier_similarity=mean_sim,
+            message="" if affine is not None else "affine failed",
+        ))
+    return results
 
-    GREEN = (80, 200, 80)
-    GRAY = (110, 110, 110)
-    AMBER = (40, 170, 220)
 
-    def _fit(img: np.ndarray) -> np.ndarray:
-        canvas = np.full((thumb, thumb, 3), 40, np.uint8)
-        if img is None:
-            return canvas
-        im = img
-        if im.ndim == 2:
-            im = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
-        h, w = im.shape[:2]
-        if max(h, w) == 0:
-            return canvas
-        sc = thumb / max(h, w)
-        nw, nh = max(1, int(round(w * sc))), max(1, int(round(h * sc)))
-        rsz = cv2.resize(im, (nw, nh), interpolation=cv2.INTER_AREA)
-        yo, xo = (thumb - nh) // 2, (thumb - nw) // 2
-        canvas[yo:yo + nh, xo:xo + nw] = rsz
+def crop_sign_box(
+    image: np.ndarray,
+    sb: SignBox,
+    padding_ratio: float,
+) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int, int, int]]:
+    h, w = image.shape[:2]
+    pad_x = sb.width * padding_ratio
+    pad_y = sb.height * padding_ratio
+    x1 = int(max(0, np.floor(sb.x1 - pad_x)))
+    y1 = int(max(0, np.floor(sb.y1 - pad_y)))
+    x2 = int(min(w, np.ceil(sb.x2 + pad_x)))
+    y2 = int(min(h, np.ceil(sb.y2 + pad_y)))
+    if x2 <= x1:
+        x2 = min(w, x1 + 1)
+    if y2 <= y1:
+        y2 = min(h, y1 + 1)
+    return image[y1:y2, x1:x2].copy(), (x1, y1), (x1, y1, x2, y2)
+
+
+def estimate_dift_affine(
+    src_ft: torch.Tensor,
+    dst_ft: torch.Tensor,
+    src_img_shape: Tuple[int, int],
+    dst_img_shape: Tuple[int, int],
+    max_matches: int = 300,
+    min_matches: int = 3,
+    ransac_threshold: Optional[float] = None,
+) -> Tuple[Optional[np.ndarray], int, int, float]:
+    """Estimate a 2x3 affine from source canonical pixels to crop pixels."""
+    src_pts, dst_pts, sims = _best_buddies_points(
+        src_ft, dst_ft, src_img_shape, dst_img_shape, max_matches=max_matches
+    )
+    n_matches = len(src_pts)
+    if n_matches < min_matches:
+        return None, n_matches, 0, 0.0
+
+    threshold = ransac_threshold
+    if threshold is None:
+        threshold = max(3.0, 0.06 * max(dst_img_shape))
+
+    src32 = src_pts.astype(np.float32)
+    dst32 = dst_pts.astype(np.float32)
+    affine = inliers = None
+    for estimator in (cv2.estimateAffine2D, cv2.estimateAffinePartial2D):
+        affine, inliers = estimator(
+            src32,
+            dst32,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=float(threshold),
+            maxIters=2000,
+            confidence=0.99,
+            refineIters=10,
+        )
+        if affine is not None:
+            break
+    if affine is None:
+        return None, n_matches, 0, 0.0
+
+    mask = inliers.ravel().astype(bool) if inliers is not None else np.ones(n_matches, dtype=bool)
+    n_inliers = int(mask.sum())
+    mean_sim = float(sims[mask].mean()) if n_inliers else 0.0
+    return affine, n_matches, n_inliers, mean_sim
+
+
+_OPTIMIZED_BBOX_COLOR = (0, 165, 255)      # orange, BGR
+_TRANSFORMED_BBOX_COLOR = (255, 0, 255)    # magenta, BGR
+_CENTER_LINK_COLOR = (235, 235, 235)
+
+
+def render_dift_affine_probe(
+    image: np.ndarray,
+    subtablet: SubTablet,
+    results: List[DiftAffineProbeResult],
+    iteration: Optional[int],
+    thumb: int = 128,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (overlay image, per-box grid image) for affine diagnostics."""
+    overlay = _to_bgr(image).copy()
+    for sb in subtablet.sign_boxes:
+        _draw_sign_box(overlay, sb, _OPTIMIZED_BBOX_COLOR,
+                       draw_label=True, thickness=2)
+    for res in results:
+        if res.affine_full is None or res.canonical_img is None:
+            continue
+        warped = _transformed_image_corners(
+            res.canonical_img.shape[:2], res.affine_full
+        )
+        cv2.polylines(overlay, [warped.astype(np.int32)], isClosed=True,
+                      color=_TRANSFORMED_BBOX_COLOR,
+                      thickness=2, lineType=cv2.LINE_AA)
+        before_center = _as_int_point((res.sign_box.cx, res.sign_box.cy))
+        after_center = _as_int_point(
+            _transformed_image_center(res.canonical_img.shape[:2], res.affine_full)
+        )
+        _draw_dashed_line(overlay, before_center, after_center, _CENTER_LINK_COLOR,
+                          thickness=2)
+        _draw_center_marker(overlay, before_center, _OPTIMIZED_BBOX_COLOR)
+        _draw_center_marker(overlay, after_center, _TRANSFORMED_BBOX_COLOR)
+
+    grid_rows = []
+    for res in results:
+        crop_vis = _draw_local_bbox(res.crop_img, res.sign_box, res.crop_offset)
+        canon_vis = _to_bgr(res.canonical_img) if res.canonical_img is not None else None
+        warp_vis = _warp_overlay(res)
+        status = (
+            f"{res.sign_name[:10]} {res.n_inliers}/{res.n_matches} "
+            f"{res.mean_inlier_similarity:.2f}"
+            if res.affine is not None
+            else f"{res.sign_name[:10]} {res.message}"
+        )
+        grid_rows.append([
+            (f"crop iter {iteration}", crop_vis),
+            ("canonical", canon_vis),
+            (status, warp_vis),
+        ])
+
+    grid = _render_grid(
+        grid_rows,
+        thumb,
+        f"No DIFT affine probe results at iter {iteration}",
+        header_h=30,
+        bg=25,
+        cell_bg=34,
+    )
+    return overlay, grid
+
+
+def _featurize_image(wrapper, img: np.ndarray) -> torch.Tensor:
+    with torch.no_grad():
+        return wrapper.featurize(Image.fromarray(_to_rgb(img))).detach()
+
+
+def _best_buddies_points(
+    src_ft: torch.Tensor,
+    dst_ft: torch.Tensor,
+    src_img_shape: Tuple[int, int],
+    dst_img_shape: Tuple[int, int],
+    max_matches: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    src = src_ft.detach().float()
+    dst = dst_ft.detach().float()
+    device = dst.device
+    src = src.to(device=device)
+
+    c = src.shape[0]
+    src_flat = src.reshape(c, -1)
+    dst_flat = dst.reshape(c, -1)
+    sim = src_flat.T @ dst_flat
+
+    src_to_dst = sim.argmax(dim=1)
+    dst_to_src = sim.argmax(dim=0)
+    src_idx = torch.arange(sim.shape[0], device=device)
+    is_mutual = dst_to_src[src_to_dst] == src_idx
+    mutual_src = src_idx[is_mutual]
+    mutual_dst = src_to_dst[is_mutual]
+    mutual_sim = sim[mutual_src, mutual_dst]
+
+    if mutual_src.numel() > max_matches:
+        vals, keep = torch.topk(mutual_sim, k=max_matches)
+        mutual_src = mutual_src[keep]
+        mutual_dst = mutual_dst[keep]
+        mutual_sim = vals
+
+    src_pts = _feature_indices_to_image_points(
+        mutual_src.detach().cpu().numpy(),
+        src.shape[1], src.shape[2],
+        src_img_shape[0], src_img_shape[1],
+    )
+    dst_pts = _feature_indices_to_image_points(
+        mutual_dst.detach().cpu().numpy(),
+        dst.shape[1], dst.shape[2],
+        dst_img_shape[0], dst_img_shape[1],
+    )
+    return src_pts, dst_pts, mutual_sim.detach().cpu().numpy()
+
+
+def _feature_indices_to_image_points(
+    indices: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    img_h: int,
+    img_w: int,
+) -> np.ndarray:
+    if indices.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    ys = indices // grid_w
+    xs = indices % grid_w
+    pts_x = (xs + 0.5) / grid_w * img_w
+    pts_y = (ys + 0.5) / grid_h * img_h
+    return np.stack([pts_x, pts_y], axis=1).astype(np.float32)
+
+
+def _warp_overlay(res: DiftAffineProbeResult) -> np.ndarray:
+    crop = _to_bgr(res.crop_img)
+    if res.canonical_img is None or res.affine is None:
+        return _draw_local_bbox(crop, res.sign_box, res.crop_offset)
+    src = _to_bgr(res.canonical_img)
+    h, w = crop.shape[:2]
+    warped = cv2.warpAffine(src, res.affine, (w, h), flags=cv2.INTER_LINEAR)
+    mask_src = np.full(src.shape[:2], 255, np.uint8)
+    mask = cv2.warpAffine(mask_src, res.affine, (w, h), flags=cv2.INTER_NEAREST) > 0
+    out = crop.copy()
+    out[mask] = (crop[mask].astype(np.float32) * 0.55
+                 + warped[mask].astype(np.float32) * 0.45).astype(np.uint8)
+    _draw_local_bbox_inplace(out, res.sign_box, res.crop_offset,
+                             _OPTIMIZED_BBOX_COLOR)
+    warped_corners = _transformed_image_corners(
+        res.canonical_img.shape[:2], res.affine
+    )
+    cv2.polylines(out, [warped_corners.astype(np.int32)], isClosed=True,
+                  color=_TRANSFORMED_BBOX_COLOR, thickness=2,
+                  lineType=cv2.LINE_AA)
+    before_center = _as_int_point(
+        (res.sign_box.cx - res.crop_offset[0], res.sign_box.cy - res.crop_offset[1])
+    )
+    after_center = _as_int_point(
+        _transformed_image_center(res.canonical_img.shape[:2], res.affine)
+    )
+    _draw_dashed_line(out, before_center, after_center, _CENTER_LINK_COLOR,
+                      thickness=1)
+    _draw_center_marker(out, before_center, _OPTIMIZED_BBOX_COLOR, radius=3)
+    _draw_center_marker(out, after_center, _TRANSFORMED_BBOX_COLOR, radius=3)
+    return out
+
+
+def _affine_with_offset(
+    affine: Optional[np.ndarray],
+    offset: Tuple[int, int],
+) -> Optional[np.ndarray]:
+    if affine is None:
+        return None
+    full = affine.copy()
+    full[:, 2] += np.array(offset, dtype=full.dtype)
+    return full
+
+
+def _draw_local_bbox(
+    img: np.ndarray,
+    sb: SignBox,
+    offset: Tuple[int, int],
+    color: Tuple[int, int, int] = _OPTIMIZED_BBOX_COLOR,
+) -> np.ndarray:
+    out = _to_bgr(img).copy()
+    _draw_local_bbox_inplace(out, sb, offset, color)
+    return out
+
+
+def _draw_local_bbox_inplace(
+    out: np.ndarray,
+    sb: SignBox,
+    offset: Tuple[int, int],
+    color: Tuple[int, int, int],
+) -> None:
+    ox, oy = offset
+    p1 = (int(round(sb.x1 - ox)), int(round(sb.y1 - oy)))
+    p2 = (int(round(sb.x2 - ox)), int(round(sb.y2 - oy)))
+    cv2.rectangle(out, p1, p2, color, 2, cv2.LINE_AA)
+
+
+def _draw_sign_box(
+    out: np.ndarray,
+    sb: SignBox,
+    color: Tuple[int, int, int],
+    draw_label: bool = True,
+    thickness: int = 1,
+) -> None:
+    p1 = (int(round(sb.x1)), int(round(sb.y1)))
+    p2 = (int(round(sb.x2)), int(round(sb.y2)))
+    cv2.rectangle(out, p1, p2, color, thickness, cv2.LINE_AA)
+    if draw_label:
+        _draw_text(out, sb.sign_name[:10], max(12, p1[1] - 5),
+                   x=max(0, p1[0]), color=color, scale=0.42)
+
+
+def _paste_canonical_into_box(
+    out: np.ndarray,
+    canonical_img: np.ndarray,
+    sb: SignBox,
+) -> bool:
+    img_h, img_w = out.shape[:2]
+    x1 = int(np.floor(sb.x1))
+    y1 = int(np.floor(sb.y1))
+    x2 = int(np.ceil(sb.x2))
+    y2 = int(np.ceil(sb.y2))
+    box_w = x2 - x1
+    box_h = y2 - y1
+    if box_w <= 0 or box_h <= 0:
+        return False
+
+    clip_x1 = max(0, x1)
+    clip_y1 = max(0, y1)
+    clip_x2 = min(img_w, x2)
+    clip_y2 = min(img_h, y2)
+    if clip_x2 <= clip_x1 or clip_y2 <= clip_y1:
+        return False
+
+    canonical_bgr = _to_bgr(canonical_img)
+    patch = cv2.resize(canonical_bgr, (box_w, box_h),
+                       interpolation=cv2.INTER_AREA)
+
+    px1 = clip_x1 - x1
+    py1 = clip_y1 - y1
+    px2 = px1 + (clip_x2 - clip_x1)
+    py2 = py1 + (clip_y2 - clip_y1)
+
+    roi = out[clip_y1:clip_y2, clip_x1:clip_x2]
+    roi[:] = patch[py1:py2, px1:px2]
+    return True
+
+
+def _transformed_image_corners(
+    img_shape: Tuple[int, int],
+    affine: np.ndarray,
+) -> np.ndarray:
+    h, w = img_shape[:2]
+    corners = np.array([[[0, 0], [w, 0], [w, h], [0, h]]], dtype=np.float32)
+    return cv2.transform(corners, affine)[0]
+
+
+def _transformed_image_center(
+    img_shape: Tuple[int, int],
+    affine: np.ndarray,
+) -> Tuple[float, float]:
+    h, w = img_shape[:2]
+    center = np.array([[[w / 2.0, h / 2.0]]], dtype=np.float32)
+    pt = cv2.transform(center, affine)[0, 0]
+    return float(pt[0]), float(pt[1])
+
+
+def _as_int_point(pt: Tuple[float, float]) -> Tuple[int, int]:
+    return int(round(float(pt[0]))), int(round(float(pt[1])))
+
+
+def _draw_center_marker(
+    img: np.ndarray,
+    center: Tuple[int, int],
+    color: Tuple[int, int, int],
+    radius: int = 4,
+) -> None:
+    cv2.circle(img, center, radius + 2, (20, 20, 20), -1, cv2.LINE_AA)
+    cv2.circle(img, center, radius, color, -1, cv2.LINE_AA)
+
+
+def _draw_dashed_line(
+    img: np.ndarray,
+    p1: Tuple[int, int],
+    p2: Tuple[int, int],
+    color: Tuple[int, int, int],
+    thickness: int = 1,
+    dash: int = 10,
+    gap: int = 7,
+) -> None:
+    start = np.array(p1, dtype=np.float32)
+    end = np.array(p2, dtype=np.float32)
+    dist = float(np.linalg.norm(end - start))
+    if dist < 1e-3:
+        return
+    direction = (end - start) / dist
+    step = dash + gap
+    for t in np.arange(0.0, dist, step):
+        seg_start = start + direction * t
+        seg_end = start + direction * min(t + dash, dist)
+        cv2.line(img, _as_int_point(seg_start), _as_int_point(seg_end),
+                 color, thickness, cv2.LINE_AA)
+
+
+def _heat_to_bgr(heat: np.ndarray) -> np.ndarray:
+    cmap = getattr(cv2, "COLORMAP_MAGMA", cv2.COLORMAP_JET)
+    return cv2.applyColorMap((_normalize01(heat) * 255).astype(np.uint8),
+                             cmap)
+
+
+def _fit_to_square(img: Optional[np.ndarray], size: int) -> np.ndarray:
+    canvas = np.full((size, size, 3), 42, np.uint8)
+    if img is None:
         return canvas
+    im = _to_bgr(img)
+    h, w = im.shape[:2]
+    if h <= 0 or w <= 0:
+        return canvas
+    scale = size / max(h, w)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(im, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    y0 = (size - new_h) // 2
+    x0 = (size - new_w) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
 
-    def _text(canvas, txt, y, color=(220, 220, 220), scale=0.36, x=4):
-        cv2.putText(canvas, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    scale, (0, 0, 0), 2, cv2.LINE_AA)
-        cv2.putText(canvas, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    scale, color, 1, cv2.LINE_AA)
 
-    for r, disc in enumerate(discoveries):
-        y0 = GAP + r * CELL
-        x0 = GAP
+def _blank_panel(width: int, height: int, text: str) -> np.ndarray:
+    panel = np.full((height, width, 3), 30, np.uint8)
+    _draw_text(panel, text, height // 2, color=(220, 220, 220), scale=0.5)
+    return panel
 
-        # column 0: crop with header (row/col + score)
-        crop_cell_w = thumb + 2 * BORDER
-        cell = np.full((HDR_H + thumb, crop_cell_w, 3), 24, np.uint8)
-        _text(cell, f"R{disc.gap.row_idx} insert{disc.gap.insert_idx+1}/"
-                    f"{disc.gap.n_inserts}", HDR_H - 6,
-              AMBER if disc.low_confidence else GREEN, scale=0.36)
-        cell[HDR_H:, BORDER:BORDER + thumb] = _fit(_crop_to_show(disc))
-        grid[y0:y0 + cell.shape[0], x0:x0 + cell.shape[1]] = cell
 
-        # column 1..K: top-K canonical signs (column 1 = assigned)
-        for k in range(top_k_show):
-            xk = x0 + (k + 1) * (thumb + 2 * BORDER + GAP)
-            color = GREEN if k == 0 else GRAY
-            if disc.low_confidence and k == 0:
-                color = AMBER
-            sub = disc.top_k[k] if k < len(disc.top_k) else None
-            cell = np.full((HDR_H + thumb, crop_cell_w, 3), 30, np.uint8)
-            cv2.rectangle(cell, (0, 0), (cell.shape[1] - 1, cell.shape[0] - 1),
-                          color, BORDER)
-            if sub is not None:
-                name = sub.sign_name[:12]
-                _text(cell, f"{name}  {sub.score:.3f}",
-                      HDR_H - 6, color, scale=0.34)
-                cell[HDR_H:, BORDER:BORDER + thumb] = _fit(sub.record.img)
-            grid[y0:y0 + cell.shape[0], xk:xk + cell.shape[1]] = cell
+def _render_grid(
+    rows: List[List[Tuple[str, Optional[np.ndarray]]]],
+    thumb: int,
+    empty_text: str,
+    header_h: int = 24,
+    gap: int = 6,
+    bg: int = 28,
+    cell_bg: int = 35,
+) -> np.ndarray:
+    if not rows:
+        return _blank_panel(thumb * 3 + 24, thumb + header_h + 18, empty_text)
 
+    n_cols = max(len(row) for row in rows)
+    cell_h = header_h + thumb
+    width = gap + n_cols * (thumb + gap)
+    height = gap + len(rows) * (cell_h + gap)
+    grid = np.full((height, width, 3), bg, np.uint8)
+    label_y = max(12, header_h - 7)
+
+    for r, row in enumerate(rows):
+        y0 = gap + r * (cell_h + gap)
+        for c, (label, img) in enumerate(row):
+            x0 = gap + c * (thumb + gap)
+            cell = np.full((cell_h, thumb, 3), cell_bg, np.uint8)
+            _draw_text(cell, label, label_y, color=(220, 220, 220), scale=0.38)
+            cell[header_h:, :] = _fit_to_square(img, thumb)
+            grid[y0:y0 + cell_h, x0:x0 + thumb] = cell
     return grid
 
 
-def _crop_to_show(disc: GapDiscovery) -> Optional[np.ndarray]:
-    return disc.gap.crop_img
+def _draw_text(
+    canvas: np.ndarray,
+    text: str,
+    y: int,
+    color: Tuple[int, int, int] = (220, 220, 220),
+    scale: float = 0.4,
+    x: int = 4,
+) -> None:
+    cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, color, 1, cv2.LINE_AA)
+
+
+def _to_bgr(img: Optional[np.ndarray]) -> np.ndarray:
+    if img is None:
+        return np.zeros((1, 1, 3), np.uint8)
+    arr = np.asarray(img)
+    if arr.ndim == 2:
+        return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    if arr.shape[2] == 4:
+        return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_RGBA2BGR)
+    return arr.astype(np.uint8)
+
+
+def _to_rgb(img: np.ndarray) -> np.ndarray:
+    arr = np.asarray(img)
+    if arr.ndim == 2:
+        return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+    if arr.shape[2] == 4:
+        return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_RGBA2RGB)
+    return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_BGR2RGB)
+
+
+def _normalize01(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    mn = float(arr.min()) if arr.size else 0.0
+    ptp = float(np.ptp(arr)) if arr.size else 0.0
+    return (arr - mn) / (ptp + 1e-6)

@@ -23,14 +23,8 @@ Structural losses preserve the row topology of S:
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle as MplRectangle
-from PIL import Image, ImageDraw, ImageFont
-import cv2
-from typing import List, Optional, Dict, Tuple
-from collections import defaultdict
+from typing import Dict, List, Optional
 
 from .sign import CLASSES_ABZ as DEFAULT_CLASSES_ABZ
 from .tablet import SignBox, SubTablet
@@ -923,6 +917,15 @@ class PointSetRegistrationOptimizer:
 
         saved_files = []
 
+        def finish(fig, filename: str) -> None:
+            path = os.path.join(save_dir, filename)
+            fig.savefig(path, dpi=150, bbox_inches='tight')
+            saved_files.append(path)
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
+
         # ---- 1. Rows loss (asymmetric piecewise) ----
         fig, ax = plt.subplots(1, 1, figsize=(8, 5))
         r_far = self.rows_threshold_ratio_far
@@ -957,13 +960,7 @@ class PointSetRegistrationOptimizer:
         ax.legend(loc='upper left')
         ax.grid(True, alpha=0.3)
         ax.set_ylim(-0.05, max(p_far, p_close) * 1.3)
-        path = os.path.join(save_dir, 'loss_rows.png')
-        fig.savefig(path, dpi=150, bbox_inches='tight')
-        saved_files.append(path)
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+        finish(fig, 'loss_rows.png')
 
         # ---- 2. Anchor loss (quadratic deviation from baseline) ----
         fig, ax = plt.subplots(1, 1, figsize=(8, 5))
@@ -975,13 +972,7 @@ class PointSetRegistrationOptimizer:
         ax.set_title('$L_{anchor}$: Squared Deviation from Row Baseline')
         ax.grid(True, alpha=0.3)
         ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
-        path = os.path.join(save_dir, 'loss_anchor.png')
-        fig.savefig(path, dpi=150, bbox_inches='tight')
-        saved_files.append(path)
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+        finish(fig, 'loss_anchor.png')
 
         # ---- 3. Seq loss (gap deviation) ----
         fig, ax = plt.subplots(1, 1, figsize=(8, 5))
@@ -996,13 +987,7 @@ class PointSetRegistrationOptimizer:
         ax.axvline(0, color='gray', linestyle='--', alpha=0.5,
                    label='ideal gap')
         ax.legend()
-        path = os.path.join(save_dir, 'loss_seq.png')
-        fig.savefig(path, dpi=150, bbox_inches='tight')
-        saved_files.append(path)
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+        finish(fig, 'loss_seq.png')
 
         # ---- 4. Height loss (variance) ----
         fig, ax = plt.subplots(1, 1, figsize=(8, 5))
@@ -1026,13 +1011,7 @@ class PointSetRegistrationOptimizer:
         ax.legend()
         ax.grid(True, alpha=0.3)
         ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
-        path = os.path.join(save_dir, 'loss_height.png')
-        fig.savefig(path, dpi=150, bbox_inches='tight')
-        saved_files.append(path)
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+        finish(fig, 'loss_height.png')
 
         # ---- 5. Data loss (GMM likelihood for one source) ----
         fig, ax = plt.subplots(1, 1, figsize=(8, 5))
@@ -1059,13 +1038,7 @@ class PointSetRegistrationOptimizer:
                      f'(σ={sigma:.1f}, w={w})')
         ax.legend()
         ax.grid(True, alpha=0.3)
-        path = os.path.join(save_dir, 'loss_data.png')
-        fig.savefig(path, dpi=150, bbox_inches='tight')
-        saved_files.append(path)
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+        finish(fig, 'loss_data.png')
 
         # ---- 6. Boundary loss (steep IoR penalty) ----
         if self.lambda_boundary > 0:
@@ -1093,156 +1066,9 @@ class PointSetRegistrationOptimizer:
             ax.grid(True, alpha=0.3)
             ax.set_xlim(-0.05, 1.05)
             ax.set_ylim(-0.1, k + 0.5)
-            path = os.path.join(save_dir, 'loss_boundary.png')
-            fig.savefig(path, dpi=150, bbox_inches='tight')
-            saved_files.append(path)
-            if show:
-                plt.show()
-            else:
-                plt.close(fig)
+            finish(fig, 'loss_boundary.png')
 
         print(f"Loss curve plots saved to {save_dir}/:")
         for f in saved_files:
             print(f"  {f}")
         return saved_files
-
-    # ------------------------------------------------------------------
-
-    def plot_topology(
-        self,
-        figsize: tuple = (16, 10),
-        title: str = "Optimisation Point Set — Topology",
-        show_labels: bool = True,
-    ):
-        """
-        Standalone topology visualisation of the source point set S.
-
-        * Rows are coloured distinctly.
-        * Intra-row edges (adjacent signs) are drawn.
-        * Sign class name is annotated above each box.
-        * Row indices are labelled on the left.
-        """
-        fig, ax = plt.subplots(1, 1, figsize=figsize)
-        p = self.params.detach().cpu().numpy()
-
-        cmap = plt.cm.tab10
-        n_colors = max(self.num_rows, 1)
-
-        for ri in range(self.num_rows):
-            off = self.row_offsets[ri]
-            rl = self.row_lengths[ri]
-            color = cmap(ri / n_colors)
-
-            # Intra-row edges
-            for j in range(rl - 1):
-                x1, y1 = p[off + j, 0], p[off + j, 1]
-                x2, y2 = p[off + j + 1, 0], p[off + j + 1, 1]
-                ax.plot([x1, x2], [y1, y2], '-', color=color,
-                        linewidth=2, alpha=0.6)
-
-            # Signs
-            for j in range(rl):
-                idx = off + j
-                cx, cy, w, h = p[idx]
-                sb = self.sign_boxes_flat[idx]
-
-                rect = MplRectangle(
-                    (cx - w / 2, cy - h / 2), w, h,
-                    linewidth=1.5, edgecolor=color,
-                    facecolor=color, alpha=0.15,
-                )
-                ax.add_patch(rect)
-                ax.plot(cx, cy, 'o', color=color, markersize=4)
-
-                if show_labels:
-                    ax.text(cx, cy - h / 2 - 3, sb.sign_name[:8],
-                            fontsize=6, ha='center', va='bottom',
-                            color='black', fontweight='bold')
-
-            # Row label
-            if rl > 0:
-                first_cx = p[off, 0]
-                first_w = p[off, 2]
-                first_cy = p[off, 1]
-                ax.text(first_cx - first_w - 5, first_cy,
-                        f'R{ri}', fontsize=10, ha='right', va='center',
-                        color=color, fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.2',
-                                  facecolor=color, alpha=0.25))
-
-        ax.set_aspect('equal')
-        ax.invert_yaxis()
-        ax.set_xlabel('x (pixels)')
-        ax.set_ylabel('y (pixels)')
-        ax.set_title(title)
-        ax.grid(True, alpha=0.2)
-        plt.tight_layout()
-        plt.show()
-
-    # ------------------------------------------------------------------
-
-    def plot_point_sets(
-        self,
-        img: np.ndarray = None,
-        figsize: tuple = (16, 10),
-        title: str = "Source S (blue) and Target X (red)",
-    ):
-        """
-        Overlay both source (S) and target (X) point sets, optionally
-        on the tablet image.
-
-        * Source boxes: blue / cyan  (with intra-row connections)
-        * Target boxes: red
-        """
-        fig, ax = plt.subplots(1, 1, figsize=figsize)
-
-        if img is not None:
-            ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-        # ---- Target X  (red) ----
-        if self.N > 0:
-            Xp = self.X_pos.cpu().numpy()
-            Xs = self.X_size.cpu().numpy()
-            for n in range(self.N):
-                cx, cy = Xp[n]
-                w, h = Xs[n]
-                rect = MplRectangle(
-                    (cx - w / 2, cy - h / 2), w, h,
-                    linewidth=1, edgecolor='red',
-                    facecolor='red', alpha=0.12,
-                )
-                ax.add_patch(rect)
-            ax.scatter(Xp[:, 0], Xp[:, 1], c='red', s=20, zorder=5,
-                       label=f'Target X ({self.N})')
-
-        # ---- Source S  (blue / cyan) ----
-        p = self.params.detach().cpu().numpy()
-        for ri in range(self.num_rows):
-            off = self.row_offsets[ri]
-            rl = self.row_lengths[ri]
-            for j in range(rl - 1):
-                x1, y1 = p[off + j, 0], p[off + j, 1]
-                x2, y2 = p[off + j + 1, 0], p[off + j + 1, 1]
-                ax.plot([x1, x2], [y1, y2], '-', color='cyan',
-                        linewidth=1, alpha=0.5)
-            for j in range(rl):
-                idx = off + j
-                cx, cy, w, h = p[idx]
-                rect = MplRectangle(
-                    (cx - w / 2, cy - h / 2), w, h,
-                    linewidth=1, edgecolor='blue',
-                    facecolor='cyan', alpha=0.12,
-                )
-                ax.add_patch(rect)
-
-        ax.scatter(p[:, 0], p[:, 1], c='blue', s=15, zorder=5,
-                   marker='s', label=f'Source S ({self.M})')
-
-        ax.legend(fontsize=10)
-        ax.set_title(title)
-        if img is None:
-            ax.set_aspect('equal')
-            ax.invert_yaxis()
-        ax.grid(True, alpha=0.2)
-        plt.tight_layout()
-        plt.show()
