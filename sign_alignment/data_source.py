@@ -5,11 +5,10 @@ import re
 from typing import List, Optional, Tuple
 from pathlib import Path
 import cv2
-import numpy as np
 import requests
 from .sign import SignResolver
 
-from .bounding_box import BoundingBox, Detection, GroundTruths
+from .box import Box, Boxes
 
 
 class SignAPIResolver:
@@ -107,7 +106,7 @@ class LocalDataSource:
                 return cv2.imread(str(filepath))
         return None
     
-    def load_annotation(self, fragment_id: str) -> Optional[GroundTruths]:
+    def load_annotation(self, fragment_id: str) -> Optional[Boxes]:
         """
         Load ground truth annotations for a fragment.
         
@@ -115,13 +114,13 @@ class LocalDataSource:
             fragment_id: Fragment identifier
             
         Returns:
-            List of BoundingBox objects or None if not found
+            List of Box objects or None if not found
         """
         gt_file = self.annotations_path / f"gt_{fragment_id}.txt"
         if not gt_file.exists():
             return None
         
-        boxes = []
+        boxes = Boxes()
         with open(gt_file, 'r', encoding='utf-8') as f:
             for line in f:
                 parts = line.strip().split(',')
@@ -132,8 +131,7 @@ class LocalDataSource:
                     # Convert to Sign object
                     sign = SignResolver.resolve(sign_name, expected_type='SIGN')
                     
-                    # Create BoundingBox with x1, y1, x2, y2 format
-                    bbox = BoundingBox(
+                    bbox = Box(
                         x1=float(x),
                         y1=float(y),
                         x2=float(x + w),
@@ -205,20 +203,20 @@ class LocalTestDataSource:
         path = self.coco_dir / self.IMAGES_DIR / img_info['file_name']
         return cv2.imread(str(path))
 
-    def load_annotation(self, fragment_id: str) -> Optional[GroundTruths]:
+    def load_annotation(self, fragment_id: str) -> Optional[Boxes]:
         self._ensure_loaded()
         img_info = self._image_by_stem.get(fragment_id)
         if img_info is None:
             return None
 
-        boxes: GroundTruths = []
+        boxes = Boxes()
         for ann in self._annotations_by_image.get(img_info['id'], []):
             if ann.get('iscrowd', 0):
                 continue
             x, y, w, h = ann['bbox']
             sign_name = self._category_names[ann['category_id']]
             sign = SignResolver.resolve(sign_name, expected_type='SIGN')
-            boxes.append(BoundingBox(
+            boxes.append(Box(
                 x1=float(x),
                 y1=float(y),
                 x2=float(x + w),

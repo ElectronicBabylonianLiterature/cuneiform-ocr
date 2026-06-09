@@ -3,7 +3,7 @@ import json
 import os
 from dotenv import load_dotenv
 
-from sign_alignment import LocalDataSource, ModelConfig, TabletImageDetector, BoundingBox, TextVisualizer
+from sign_alignment import LocalDataSource, ModelConfig, TabletImageDetector, Box, TextVisualizer
 from sign_alignment.visualizer import ColorConfig
 from sign_alignment.pipeline import (
     CropContext, PipelineConfig, SampleState, Runner, VisOptions,
@@ -42,7 +42,7 @@ if __name__ == "__main__":
     for idx in range(min(SAMPLE_LIMIT, len(crop_runner._fragments))):
         context.state = SampleState()
         crop_runner.choose_sample(idx)
-        fid = context.fragment_id
+        fid = context.state.fragment_id
         print(f"\n{'='*60}\n{fid}")
 
         crop_runner.run_single_step(step_load_data)
@@ -54,16 +54,16 @@ if __name__ == "__main__":
         all_optimized_full = []
         for crop_idx in range(len(tablet_detector.get_cropped_images())):
             crop_runner.choose_crop(crop_idx)
-            if not s.sub_image.detections:
+            if not s.det_boxes:
                 continue
             crop_runner.run_all()
-            if not s.sub_tablet_detection.get_rows() or not s.matches or not s.sub_tablet_aligned:
+            if not s.det_rows or not len(s.det_rows) or not s.matches or not s.aligned_boxes:
                 continue
             crop_runner.run_single_step(step_results_comparison)
 
             ox, oy = s.crop_info['x'], s.crop_info['y']
-            for sb in s.sub_tablet_final.sign_boxes:
-                all_optimized_full.append(BoundingBox(
+            for sb in s.final_boxes:
+                all_optimized_full.append(Box(
                     x1=sb.x1 + ox, y1=sb.y1 + oy,
                     x2=sb.x2 + ox, y2=sb.y2 + oy,
                     score=sb.score, sign=sb.sign,

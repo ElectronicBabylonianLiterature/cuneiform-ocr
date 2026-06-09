@@ -1,8 +1,7 @@
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Union
-import copy
+from dataclasses import dataclass
+from typing import List, Optional
 
 from mmdet.apis import init_detector, inference_detector
 from mmdet.utils import register_all_modules
@@ -13,32 +12,23 @@ import numpy as np
 from data_processing.divide_photos import divide_tablet_photo
 
 from .sign import SignResolver
-from .bounding_box import BoundingBox, Detection
+from .box import Box, Boxes
+from .tablet import SubTablet
 
 @dataclass
-class ModelConfig():
+class ModelConfig:
     config_file: str
     checkpoint_file: str
     device: str = 'cuda:0'
-    
-@dataclass
-class SingleImage:
-    img: np.ndarray
-    detections: Detection = field(default_factory=list)
-    mask: np.ndarray = None  # Binary contour mask (H, W), 0/255
-    
-    def __len__(self):
-        return len(self.detections)
+
 
 class BaseDetector(ABC):
     def __init__(self, model_config: Optional[ModelConfig] = None, score_threshold: float = 0.5, model = None):
         self.score_threshold = score_threshold
         
         if model is not None:
-            # Use provided model directly
             self.model = model
         elif model_config is not None:
-            # Load model from config
             print("Initializing detector, loading model...")
             register_all_modules()
             model_config.device = self._select_device(model_config.device)
@@ -48,29 +38,20 @@ class BaseDetector(ABC):
             raise ValueError("Either model_config or model must be provided")
     
     @abstractmethod
-    def detect(self, img) -> Detection:
+    def detect(self, img) -> Boxes:
         pass
     
     def _select_device(self, device: str):
-        # detect environment, if cuda is available use it, otherwise use cpu
         if device == 'auto':
             device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         return device
 
     def unload_model(self) -> None:
-        """Release the detector model from GPU memory.
-
-        Moves the model to CPU then deletes it, followed by
-        ``torch.cuda.empty_cache()``.  Safe to call multiple times.
-        After unloading, ``detect()`` must not be called again.
-        """
+        """Release the detector model from GPU memory."""
         import gc
         if self.model is None:
             return
-        try:
-            self.model.cpu()
-        except Exception:
-            pass
+        self.model.cpu()
         del self.model
         self.model = None
         gc.collect()
@@ -78,17 +59,17 @@ class BaseDetector(ABC):
             torch.cuda.empty_cache()
         print("Detector model unloaded from GPU.")
 
-    def _filter_detections(self, labels, bboxes, scores) -> Detection:
+    def _filter_detections(self, labels, bboxes, scores) -> Boxes:
         mask = scores > self.score_threshold
         labels = labels[mask]
         bboxes = bboxes[mask]
         scores = scores[mask]
         
-        detections = []
+        detections = Boxes()
         for i in range(len(labels)):
             bbox = bboxes[i]
             sign = SignResolver.from_idx(labels[i])
-            detections.append(BoundingBox(
+            detections.append(Box(
                 x1=float(bbox[0]),
                 y1=float(bbox[1]),
                 x2=float(bbox[2]),
@@ -100,7 +81,7 @@ class BaseDetector(ABC):
         return detections
 
 class SingleImageDetector(BaseDetector):
-    def detect(self, img) -> Detection:
+    def detect(self, img) -> Boxes:
         result = inference_detector(self.model, img)
         OCR_result = result.pred_instances.cpu()
         
@@ -119,27 +100,25 @@ class TabletImageDetector(BaseDetector):
         self.keep_crops = keep_crops
         self.is_crop_itself = is_crop_itself
         self.cropped_images = []
-        self.crop_coordinates = []  # Store crop coordinates for GT transformation
+        self.crop_boxes = []
+        self.crop_coordinates = []
         
     
-    def detect(self, img) -> Detection:
+    def detect(self, img) -> Boxes:
         if self.keep_crops:
-            self.cropped_images = []  # reset cropped for each detection
+            self.cropped_images = []
+            self.crop_boxes = []
 
         if self.is_crop_itself:
-            # The image is already a subtablet crop — detect directly without splitting.
             h, w = img.shape[:2]
             self.crop_coordinates = [{'x': 0, 'y': 0, 'w': w, 'h': h}]
             single_detector = SingleImageDetector(model=self.model, score_threshold=self.score_threshold)
             detections = single_detector.detect(img)
             if self.keep_crops:
-                h, w = img.shape[:2]
                 mask = np.full((h, w), 255, dtype=np.uint8)
-                self.cropped_images.append(SingleImage(
-                    img=img,
-                    detections=copy.deepcopy(detections),
-                    mask=mask,
-                ))
+                subtablet = SubTablet(img=img, mask=mask, name="crop_0")
+                self.cropped_images.append(subtablet)
+                self.crop_boxes.append(detections.copy(subtablet=subtablet))
             return detections
 
         cropped_images, crop_coordinates, masks = divide_tablet_photo(
@@ -150,34 +129,25 @@ class TabletImageDetector(BaseDetector):
             return_masks=True,
         )
         
-        # Store crop coordinates
         self.crop_coordinates = crop_coordinates
         
-        # Create single image detector using the already-loaded model
         single_detector = SingleImageDetector(model=self.model, score_threshold=self.score_threshold)
         
-        all_detections = []
+        all_detections = Boxes()
         
-        # Process each cropped piece
         for idx, img_piece in enumerate(cropped_images):
-            # Use SingleImageDetector to detect signs in the cropped piece
             piece_detections = single_detector.detect(img_piece)
 
             if self.keep_crops:
-                # Deep copy to avoid modifying stored detections when transforming coordinates
-                self.cropped_images.append(SingleImage(
-                    img=img_piece,
-                    detections=copy.deepcopy(piece_detections),
-                    mask=masks[idx],
-                ))
+                subtablet = SubTablet(img=img_piece, mask=masks[idx], name=f"crop_{idx}")
+                self.cropped_images.append(subtablet)
+                self.crop_boxes.append(piece_detections.copy(subtablet=subtablet))
             
-            # Transform to original image coordinates
             piece_offset_x = crop_coordinates[idx]['x']
             piece_offset_y = crop_coordinates[idx]['y']
             
             for det in piece_detections:
-                # Transform BoundingBox coordinates
-                transformed_det = BoundingBox(
+                transformed_det = Box(
                     x1=det.x1 + piece_offset_x,
                     y1=det.y1 + piece_offset_y,
                     x2=det.x2 + piece_offset_x,
@@ -189,5 +159,8 @@ class TabletImageDetector(BaseDetector):
         
         return all_detections
     
-    def get_cropped_images(self) -> List[SingleImage]:
+    def get_cropped_images(self) -> List[SubTablet]:
         return self.cropped_images
+
+    def get_crop_boxes(self) -> List[Boxes]:
+        return self.crop_boxes

@@ -23,7 +23,7 @@ def detect_rows_dbscan(
     Distance is normalized by average sign size to handle different image scales.
     
     Args:
-        boxes: List of boxes (BoundingBox, SignBox, or objects with cx, cy attributes/center property)
+        boxes: List of boxes with cx/cy or x1/y1/x2/y2 attributes
         eps: Maximum distance threshold as multiple of average sign height (default 0.6)
              e.g., eps=0.6 means boxes within 0.6*avg_height are considered neighbors
         min_samples: Minimum number of samples in a neighborhood for a point to be core
@@ -48,7 +48,7 @@ def detect_rows_dbscan(
     
     for box in boxes:
         if hasattr(box, 'cx') and hasattr(box, 'cy'):
-            # SignBox or similar
+            # Box or similar
             centers.append([box.cx, box.cy])
             if hasattr(box, 'width') and hasattr(box, 'height'):
                 widths.append(box.width)
@@ -61,7 +61,7 @@ def detect_rows_dbscan(
                 widths.append(box.x2 - box.x1)
                 heights.append(box.y2 - box.y1)
         elif hasattr(box, 'x1') and hasattr(box, 'y1') and hasattr(box, 'x2') and hasattr(box, 'y2'):
-            # BoundingBox
+            # Corner-based box
             cx = (box.x1 + box.x2) / 2
             cy = (box.y1 + box.y2) / 2
             centers.append([cx, cy])
@@ -492,8 +492,8 @@ def match_signs_in_row_dp(
 
 
 def align_text_row_to_detection(
-    text_sign_boxes: List,
-    detection_sign_boxes: List,
+    text_boxes: List,
+    det_boxes: List,
     matches: List[Tuple[int, int]],
     avg_width: float,
     avg_height: float,
@@ -501,7 +501,7 @@ def align_text_row_to_detection(
     max_width_ratio: float = 4/3
 ) -> List:
     """
-    Align text sign boxes to detection sign boxes based on matches.
+    Align text boxes to detection boxes based on matches.
     
     Strategy:
     1. Filter matches to only same-label pairs (anchors)
@@ -510,8 +510,8 @@ def align_text_row_to_detection(
        or extrapolate from nearest anchor using avg_width spacing
     
     Args:
-        text_sign_boxes: List of text SignBox objects (source)
-        detection_sign_boxes: List of detection SignBox objects (target)
+        text_boxes: List of text Box objects (source)
+        det_boxes: List of detection Box objects (target)
         matches: List of (text_idx, det_idx) pairs from match_signs_in_row_dp
         avg_width: Average sign width
         avg_height: Average sign height
@@ -519,25 +519,25 @@ def align_text_row_to_detection(
         max_width_ratio: Maximum width as ratio of avg_width (default 4/3)
         
     Returns:
-        List of aligned SignBox objects with updated positions
+        List of aligned Box objects with updated positions
     """
-    from sign_alignment.tablet import SignBox
+    from sign_alignment.box import Box
     
-    if not detection_sign_boxes:
-        return text_sign_boxes
+    if not det_boxes:
+        return text_boxes
     
-    num_text = len(text_sign_boxes)
+    num_text = len(text_boxes)
     
     # === Step 1: Filter to same-label matches only (anchors) ===
     anchors = []  # list of (text_idx, det_idx) where labels match
     for text_idx, det_idx in matches:
-        if text_sign_boxes[text_idx].sign_name == detection_sign_boxes[det_idx].sign_name:
+        if text_boxes[text_idx].sign_name == det_boxes[det_idx].sign_name:
             anchors.append((text_idx, det_idx))
     
     # Build anchor lookup: text_idx → det_box
     anchor_map = {}  # text_idx → det_box
     for text_idx, det_idx in anchors:
-        anchor_map[text_idx] = detection_sign_boxes[det_idx]
+        anchor_map[text_idx] = det_boxes[det_idx]
     
     # Sorted anchor text indices for interpolation
     anchor_text_indices = sorted(anchor_map.keys())
@@ -552,8 +552,8 @@ def align_text_row_to_detection(
         intercept = anchor_map[anchor_text_indices[0]].cy
     else:
         # No anchors: fallback to all detection signs baseline
-        det_cx = np.array([box.cx for box in detection_sign_boxes])
-        det_cy = np.array([box.cy for box in detection_sign_boxes])
+        det_cx = np.array([box.cx for box in det_boxes])
+        det_cy = np.array([box.cy for box in det_boxes])
         if len(det_cx) >= 2:
             slope, intercept = np.polyfit(det_cx, det_cy, 1)
         else:
@@ -567,7 +567,7 @@ def align_text_row_to_detection(
     aligned_boxes = []
     
     for text_idx in range(num_text):
-        text_box = text_sign_boxes[text_idx]
+        text_box = text_boxes[text_idx]
         
         if text_idx in anchor_map:
             # --- Anchored: use detection box directly ---
@@ -609,7 +609,7 @@ def align_text_row_to_detection(
                 new_cy = baseline_y(new_cx)
             else:
                 # No anchors at all: use detection centroid + offset
-                det_centroid_x = np.mean([b.cx for b in detection_sign_boxes])
+                det_centroid_x = np.mean([b.cx for b in det_boxes])
                 text_centroid_idx = (num_text - 1) / 2.0
                 offset = (text_idx - text_centroid_idx) * avg_width
                 new_cx = det_centroid_x + offset
@@ -618,15 +618,13 @@ def align_text_row_to_detection(
             new_width = avg_width
             new_height = avg_height
         
-        aligned_box = SignBox(
+        aligned_box = Box(
             sign=text_box.sign,
             score=text_box.score,
             cx=new_cx,
             cy=new_cy,
             width=new_width,
             height=new_height,
-            row_idx=text_box.row_idx,
-            col_idx=text_idx
         )
         aligned_boxes.append(aligned_box)
     
@@ -650,8 +648,8 @@ def align_text_to_detection_rows(
     aligned sign boxes. Only text rows that have matching detection rows are processed.
     
     Args:
-        det_rows: Dictionary mapping detection row_idx -> List[SignBox]
-        text_rows: Dictionary mapping text row_idx -> List[SignBox]
+        det_rows: Dictionary mapping detection row_idx -> List[Box]
+        text_rows: Dictionary mapping text row_idx -> List[Box]
         text_to_det: Dictionary mapping text row_idx -> detection row_idx
         row_sign_matches: Dictionary mapping text row_idx -> List[(text_sign_idx, det_sign_idx)]
         avg_width: Average sign width
@@ -660,7 +658,7 @@ def align_text_to_detection_rows(
         max_width_ratio: Maximum width scaling ratio (default 4/3)
     
     Returns:
-        List of aligned SignBox objects for all matched rows
+        List of aligned Box objects for all matched rows
     """
     aligned_text_boxes = []
     
@@ -681,8 +679,8 @@ def align_text_to_detection_rows(
         
         # Align this row using baseline with slope
         aligned_row_boxes = align_text_row_to_detection(
-            text_sign_boxes=text_row_boxes,
-            detection_sign_boxes=det_row_boxes,
+            text_boxes=text_row_boxes,
+            det_boxes=det_row_boxes,
             matches=sign_matches,
             avg_width=avg_width,
             avg_height=avg_height,

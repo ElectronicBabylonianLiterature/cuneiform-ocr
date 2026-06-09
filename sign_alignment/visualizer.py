@@ -6,8 +6,7 @@ import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Optional, Callable
 
-from .bounding_box import BoundingBox, Detection
-from .tablet import SignBox
+from .box import Box, Boxes
 
 class ColorConfig(Enum):
     GT_COLOR = (0, 255, 0)    # Green for GT
@@ -23,16 +22,16 @@ class BboxVisualizer:
             color: Default box color in RGB format
         """
         self.default_color = color
-        self.color_func: Optional[Callable[[BoundingBox], tuple]] = None
+        self.color_func: Optional[Callable[[Box], tuple]] = None
         self.result = None  # Store last result for display
     
-    def draw_boxes(self, img: np.ndarray, boxes: Detection, show_labels: bool = True) -> np.ndarray:
+    def draw_boxes(self, img: np.ndarray, boxes: Boxes, show_labels: bool = True) -> np.ndarray:
         """
         Draw bounding boxes on image.
         
         Args:
             img: Input image in BGR format
-            boxes: List of BoundingBox objects
+            boxes: List of Box objects
             show_labels: Whether to show sign name labels
             
         Returns:
@@ -148,7 +147,7 @@ class BboxVisualizer:
     def draw_rows(
         self, 
         img: np.ndarray, 
-        boxes: List,
+        rows: List[List[Box]],
         show_labels: bool = True,
         show_row_numbers: bool = False,
         row_mapping: dict = None,
@@ -166,7 +165,7 @@ class BboxVisualizer:
         
         Args:
             img: Input image in BGR format (None for text-only visualization)
-            boxes: List of box objects with row_idx attribute (SignBox, BoundingBox with row_idx, etc.)
+            rows: Box rows, each inner list sorted left-to-right
             show_labels: Whether to show sign name labels
             show_row_numbers: Whether to annotate row numbers on the left margin
             row_mapping: Optional dict mapping row_idx to mapped row idx (for matched rows)
@@ -178,206 +177,75 @@ class BboxVisualizer:
         Returns:
             Image with boxes and row connections drawn
         """
-        # Define distinct colors for rows (HSV-based for better distinction)
-        def get_row_color(row_idx: int) -> tuple:
-            """Generate distinct color for row using HSV (returns RGB)."""
-            if row_idx == -1:
-                return (128, 128, 128)  # Gray for noise
-            hue = int((row_idx * 137.5) % 180)  # Golden angle for better distribution
-            sat = 255
-            val = 255
-            hsv_color = np.uint8([[[hue, sat, val]]])
-            bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
-            rgb_color = tuple(reversed(bgr_color))  # Convert BGR to RGB
-            return tuple(map(int, rgb_color))
-        
         def get_effective_row_idx(row_idx: int) -> int:
-            """Get effective row index for coloring (considering row_mapping)."""
             if row_mapping is None:
                 return row_idx
-            # If row_mapping exists but this row is not in it, mark as unmapped (-2)
             if row_idx not in row_mapping:
-                return -2  # Special code for unmapped rows
-            # Use the mapped detection row index
+                return -2
             return row_mapping[row_idx]
         
         def get_row_color_with_mapping(row_idx: int) -> tuple:
-            """Get color for row, considering row_mapping if provided."""
             effective_idx = get_effective_row_idx(row_idx)
             if effective_idx == -2:
-                return (128, 128, 128)  # Dark gray for unmapped rows
-            return get_row_color(effective_idx)
+                return (128, 128, 128)
+            return _get_row_color(effective_idx)
+
+        rows = [list(row) for row in rows]
+        boxes = [box for row in rows for box in row]
         
-        # Handle text-only visualization (no background image)
         if img is None:
             if not boxes:
                 return np.ones((100, 100, 3), dtype=np.uint8) * 255
             
-            # Create white canvas based on box extents
-            # Need to handle negative coordinates from centroid alignment
-            max_x = max(b.cx + b.width / 2 if hasattr(b, 'cx') else b.x2 for b in boxes)
-            max_y = max(b.cy + b.height / 2 if hasattr(b, 'cy') else b.y2 for b in boxes)
-            min_x = min(b.cx - b.width / 2 if hasattr(b, 'cx') else b.x1 for b in boxes)
-            min_y = min(b.cy - b.height / 2 if hasattr(b, 'cy') else b.y1 for b in boxes)
-            
+            max_x = max(b.x2 for b in boxes)
+            max_y = max(b.y2 for b in boxes)
+            min_x = min(b.x1 for b in boxes)
+            min_y = min(b.y1 for b in boxes)
             margin = 100
-            
-            # Calculate offset needed to shift negative coordinates into visible area
             offset_x = max(0, -min_x) + margin
             offset_y = max(0, -min_y) + margin
-            
             canvas_width = int(max_x - min_x + 2 * margin)
             canvas_height = int(max_y - min_y + 2 * margin)
-            
             img = np.ones((canvas_height, canvas_width, 3), dtype=np.uint8) * 255
-            
-            # Create shifted copies of boxes for visualization (don't modify originals)
-            boxes_shifted = []
-            for box in boxes:
-                if isinstance(box, SignBox):
-                    # Create new SignBox with adjusted center coordinates
-                    # x1, y1, x2, y2 will be automatically calculated from cx, cy, width, height
-                    box_shifted = SignBox(
-                        sign=box.sign,
-                        score=box.score,
-                        cx=box.cx + offset_x,
-                        cy=box.cy + offset_y,
-                        width=box.width,
-                        height=box.height,
-                        row_idx=box.row_idx,
-                        col_idx=box.col_idx
-                    )
-                else:
-                    # For other box types, create a copy and adjust if possible
-                    import copy
-                    box_shifted = copy.copy(box)
-                    if hasattr(box_shifted, 'cx'):
-                        box_shifted.cx = box.cx + offset_x
-                        box_shifted.cy = box.cy + offset_y
-                boxes_shifted.append(box_shifted)
-            
-            # Use shifted boxes for visualization
-            boxes = boxes_shifted
+            rows = [[box.translate(offset_x, offset_y) for box in row] for row in rows]
+            boxes = [box for row in rows for box in row]
+
+        row_by_box = {id(box): row_idx for row_idx, row in enumerate(rows) for box in row}
+        self.color_func = lambda box: get_row_color_with_mapping(row_by_box.get(id(box), -1))
         
-        # Set color function to color boxes by row
-        self.color_func = lambda box: get_row_color_with_mapping(getattr(box, 'row_idx', -1))
-        
-        # Convert boxes to Detection format (BoundingBox list) if needed
-        detection_boxes = []
-        for box in boxes:
-            if hasattr(box, 'to_bounding_box'):
-                # SignBox
-                detection_boxes.append(box.to_bounding_box())
-            else:
-                # Already BoundingBox
-                detection_boxes.append(box)
-            # Copy row_idx to the detection box
-            if hasattr(box, 'row_idx'):
-                detection_boxes[-1].row_idx = box.row_idx
-        
-        # Use draw_boxes to draw bounding boxes with labels
-        img_vis = self.draw_boxes(img, detection_boxes, show_labels=show_labels)
-        
-        # Reset color function
+        img_vis = self.draw_boxes(img, boxes, show_labels=show_labels)
         self.color_func = None
         
-        # Group boxes by row
-        rows = {}
-        for box in boxes:
-            row_idx = getattr(box, 'row_idx', -1)
-            if row_idx not in rows:
-                rows[row_idx] = []
-            rows[row_idx].append(box)
-        
-        # Draw row connections on top of the boxes
-        for row_idx in sorted(rows.keys()):
-            if row_idx == -1:
-                continue  # Skip noise
-            
-            row_boxes = rows[row_idx]
+        for row_idx, row_boxes in enumerate(rows):
             if len(row_boxes) < 2:
-                continue  # Need at least 2 boxes to draw line
-            
-            # Sort boxes by x-coordinate (left to right)
-            def get_cx(b):
-                if hasattr(b, 'cx'):
-                    return b.cx
-                elif hasattr(b, 'center'):
-                    return b.center[0]
-                else:
-                    return (b.x1 + b.x2) / 2
-            
-            sorted_boxes = sorted(row_boxes, key=get_cx)
-            
-            # Get row color in BGR for OpenCV
+                continue
+            sorted_boxes = sorted(row_boxes, key=lambda b: b.cx)
             row_color_rgb = get_row_color_with_mapping(row_idx)
             row_color_bgr = tuple(reversed(row_color_rgb))
-            
-            # Draw lines connecting centers
             for i in range(len(sorted_boxes) - 1):
                 box1 = sorted_boxes[i]
                 box2 = sorted_boxes[i + 1]
-                
-                # Get centers
-                def get_center(b):
-                    if hasattr(b, 'cx') and hasattr(b, 'cy'):
-                        return (int(b.cx), int(b.cy))
-                    elif hasattr(b, 'center'):
-                        return (int(b.center[0]), int(b.center[1]))
-                    else:
-                        return (int((b.x1 + b.x2) / 2), int((b.y1 + b.y2) / 2))
-                
-                cx1, cy1 = get_center(box1)
-                cx2, cy2 = get_center(box2)
-                
-                # Draw line
-                cv2.line(img_vis, (cx1, cy1), (cx2, cy2), row_color_bgr, line_thickness)
-            
-            # Draw center point markers for all boxes in row
+                cv2.line(
+                    img_vis,
+                    (int(box1.cx), int(box1.cy)),
+                    (int(box2.cx), int(box2.cy)),
+                    row_color_bgr,
+                    line_thickness,
+                )
             for box in sorted_boxes:
-                if hasattr(box, 'cx') and hasattr(box, 'cy'):
-                    cx, cy = int(box.cx), int(box.cy)
-                elif hasattr(box, 'center'):
-                    cx, cy = int(box.center[0]), int(box.center[1])
-                else:
-                    cx = int((box.x1 + box.x2) / 2)
-                    cy = int((box.y1 + box.y2) / 2)
-                
+                cx, cy = int(box.cx), int(box.cy)
                 cv2.circle(img_vis, (cx, cy), marker_size, row_color_bgr, -1)
-                cv2.circle(img_vis, (cx, cy), marker_size + 1, (255, 255, 255), 1)  # White border
+                cv2.circle(img_vis, (cx, cy), marker_size + 1, (255, 255, 255), 1)
         
-        # Add row number annotations if requested
         if show_row_numbers:
-            # Convert to PIL for Unicode support (arrow character)
             img_pil = Image.fromarray(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB))
             draw = ImageDraw.Draw(img_pil)
-            
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
-            except:
-                try:
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
-                except:
-                    font = ImageFont.load_default()
-            
-            for row_idx in sorted(rows.keys()):
-                if row_idx == -1:
-                    continue
-                
-                row_boxes = rows[row_idx]
+            font = _get_font(24)
+            for row_idx, row_boxes in enumerate(rows):
                 if not row_boxes:
                     continue
-                
-                # Compute average y position for this row
-                avg_y = np.mean([
-                    b.cy if hasattr(b, 'cy') else (b.y1 + b.y2) / 2 
-                    for b in row_boxes
-                ])
-                
-                # Get row color
+                avg_y = np.mean([b.cy for b in row_boxes])
                 row_color_rgb = get_row_color_with_mapping(row_idx)
-                
-                # Determine display text (1-indexed for display)
                 display_idx = row_idx + 1
                 if row_mapping is not None and row_idx in row_mapping:
                     mapped_row = row_mapping[row_idx]
@@ -385,12 +253,7 @@ class BboxVisualizer:
                     label_text = f"{row_label_prefix}{display_idx}→{mapped_label_prefix}{mapped_display}"
                 else:
                     label_text = f"{row_label_prefix}{display_idx}"
-                
-                # Draw text with PIL (supports Unicode arrow)
-                label_pos = (10, int(avg_y) - 12)  # Adjust y to center text vertically
-                draw.text(label_pos, label_text, font=font, fill=row_color_rgb)
-            
-            # Convert back to OpenCV format
+                draw.text((10, int(avg_y) - 12), label_text, font=font, fill=row_color_rgb)
             img_vis = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
         
         self.result = img_vis
@@ -399,7 +262,7 @@ class BboxVisualizer:
     def draw_text_mapping(
         self,
         img: Optional[np.ndarray],
-        sign_boxes: List,
+        rows: List[List[Box]],
         row_mapping: dict,
         sign_match_info: dict,
         mapped_label_prefix: str = "D",
@@ -415,7 +278,7 @@ class BboxVisualizer:
 
         Args:
             img: Background image in BGR (None → auto white canvas)
-            sign_boxes: List of SignBox from text subtablet
+            rows: Text rows, each inner list sorted left-to-right
             row_mapping: text_to_det dict {text_row_idx: det_row_idx}
             sign_match_info: dict {(row_idx, col_idx): {"status": "same"|"diff"|"unmatched",
                              "det_sign_name": str|None}}
@@ -426,9 +289,9 @@ class BboxVisualizer:
         Returns:
             Image with text mapping visualization drawn
         """
-        boxes = list(sign_boxes)
+        rows = [list(row) for row in rows]
+        boxes = [box for row in rows for box in row]
 
-        # Handle text-only canvas (no image)
         if img is None:
             if not boxes:
                 self.result = np.ones((100, 100, 3), dtype=np.uint8) * 255
@@ -443,37 +306,24 @@ class BboxVisualizer:
             canvas_w = int(max_x - min_x + 2 * margin)
             canvas_h = int(max_y - min_y + 2 * margin)
             img = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 255
-            new_boxes = []
-            for box in boxes:
-                new_boxes.append(SignBox(
-                    sign=box.sign, score=box.score,
-                    cx=box.cx + offset_x, cy=box.cy + offset_y,
-                    width=box.width, height=box.height,
-                    row_idx=box.row_idx, col_idx=box.col_idx
-                ))
-            boxes = new_boxes
+            rows = [[box.translate(offset_x, offset_y) for box in row] for row in rows]
+            boxes = [box for row in rows for box in row]
 
         img_vis = img.copy()
 
-        # Group boxes by row
-        rows = {}
-        for box in boxes:
-            rows.setdefault(box.row_idx, []).append(box)
-
         # --- Draw rectangles colored by match status ---
-        for box in boxes:
-            x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
-            key = (box.row_idx, box.col_idx)
-            info = sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
-            color_rgb = self._get_sign_color(box.row_idx, info["status"], row_mapping)
-            color_bgr = tuple(reversed(color_rgb))
-            cv2.rectangle(img_vis, (x1, y1), (x2, y2), color_bgr, 2)
+        for row_idx, row_boxes in enumerate(rows):
+            for col_idx, box in enumerate(row_boxes):
+                x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
+                key = (row_idx, col_idx)
+                info = sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
+                color_rgb = self._get_sign_color(row_idx, info["status"], row_mapping)
+                color_bgr = tuple(reversed(color_rgb))
+                cv2.rectangle(img_vis, (x1, y1), (x2, y2), color_bgr, 2)
 
         # --- Draw center lines and markers per row ---
-        for row_idx in sorted(rows.keys()):
-            if row_idx == -1:
-                continue
-            row_boxes = sorted(rows[row_idx], key=lambda b: b.cx)
+        for row_idx, row_boxes in enumerate(rows):
+            row_boxes = sorted(row_boxes, key=lambda b: b.cx)
             if row_idx in row_mapping:
                 line_color_rgb = _get_row_color(row_idx)
             else:
@@ -492,49 +342,45 @@ class BboxVisualizer:
         img_pil = Image.fromarray(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(img_pil)
         font = _get_font(24)
-        label_font = _get_font(10)
+        for row_idx, row_boxes in enumerate(rows):
+            for col_idx, box in enumerate(row_boxes):
+                x1, y1 = int(box.x1), int(box.y1)
+                x2, y2 = int(box.x2), int(box.y2)
+                key = (row_idx, col_idx)
+                info = sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
+                status = info["status"]
 
-        for box in boxes:
-            x1, y1 = int(box.x1), int(box.y1)
-            x2, y2 = int(box.x2), int(box.y2)
-            key = (box.row_idx, box.col_idx)
-            info = sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
-            status = info["status"]
+                box_height = y2 - y1
+                lbl_h = max(int(box_height / 6), 12)
+                fsize = max(int(lbl_h * 0.75), 10)
+                lbl_font = _get_font(fsize)
 
-            box_height = y2 - y1
-            lbl_h = max(int(box_height / 6), 12)
-            fsize = max(int(lbl_h * 0.75), 10)
-            lbl_font = _get_font(fsize)
+                label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
 
-            label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
+                bbox_text = draw.textbbox((0, 0), label, font=lbl_font)
+                tw = bbox_text[2] - bbox_text[0]
+                th = bbox_text[3] - bbox_text[1]
+                lx1, ly1 = x1 + 2, y1 + 2
+                lx2, ly2 = min(x1 + tw + 8, x2 - 2), y1 + lbl_h
+                draw.rectangle([lx1, ly1, lx2, ly2], fill=(0, 0, 0))
+                text_y = ly1 + (lbl_h - th) // 2
+                draw.text((lx1 + 4, text_y), label, font=lbl_font, fill=(255, 255, 255))
 
-            # Primary label (text sign name)
-            bbox_text = draw.textbbox((0, 0), label, font=lbl_font)
-            tw = bbox_text[2] - bbox_text[0]
-            th = bbox_text[3] - bbox_text[1]
-            lx1, ly1 = x1 + 2, y1 + 2
-            lx2, ly2 = min(x1 + tw + 8, x2 - 2), y1 + lbl_h
-            draw.rectangle([lx1, ly1, lx2, ly2], fill=(0, 0, 0))
-            text_y = ly1 + (lbl_h - th) // 2
-            draw.text((lx1 + 4, text_y), label, font=lbl_font, fill=(255, 255, 255))
-
-            # Supplementary label for diff-label matches
-            if status == "diff" and info.get("det_sign_name"):
-                det_label = info["det_sign_name"][:10]
-                bbox_det = draw.textbbox((0, 0), det_label, font=lbl_font)
-                dtw = bbox_det[2] - bbox_det[0]
-                dth = bbox_det[3] - bbox_det[1]
-                dlx1, dly1 = x1 + 2, ly2 + 1
-                dlx2, dly2 = min(x1 + dtw + 8, x2 - 2), ly2 + 1 + lbl_h
-                draw.rectangle([dlx1, dly1, dlx2, dly2], fill=(80, 80, 80))
-                det_text_y = dly1 + (lbl_h - dth) // 2
-                draw.text((dlx1 + 4, det_text_y), det_label, font=lbl_font, fill=(255, 255, 255))
+                if status == "diff" and info.get("det_sign_name"):
+                    det_label = info["det_sign_name"][:10]
+                    bbox_det = draw.textbbox((0, 0), det_label, font=lbl_font)
+                    dtw = bbox_det[2] - bbox_det[0]
+                    dth = bbox_det[3] - bbox_det[1]
+                    dlx1, dly1 = x1 + 2, ly2 + 1
+                    dlx2, dly2 = min(x1 + dtw + 8, x2 - 2), ly2 + 1 + lbl_h
+                    draw.rectangle([dlx1, dly1, dlx2, dly2], fill=(80, 80, 80))
+                    det_text_y = dly1 + (lbl_h - dth) // 2
+                    draw.text((dlx1 + 4, det_text_y), det_label, font=lbl_font, fill=(255, 255, 255))
 
         # --- Row annotations on left margin ---
-        for row_idx in sorted(rows.keys()):
-            if row_idx == -1:
+        for row_idx, row_boxes in enumerate(rows):
+            if not row_boxes:
                 continue
-            row_boxes = rows[row_idx]
             avg_y = np.mean([b.cy for b in row_boxes])
             display_idx = row_idx + 1
             if row_idx in row_mapping:
@@ -553,8 +399,8 @@ class BboxVisualizer:
     def draw_alignment_diagnostic(
         self,
         img: np.ndarray,
-        detection_sign_boxes: List,
-        aligned_text_boxes: List,
+        det_rows: List[List[Box]],
+        aligned_rows: List[List[Box]],
         det_sign_match_info: dict,
         text_sign_match_info: dict,
         det_to_text: dict,
@@ -571,8 +417,8 @@ class BboxVisualizer:
 
         Args:
             img: Background image in BGR format
-            detection_sign_boxes: List of SignBox from detection subtablet
-            aligned_text_boxes: List of SignBox from coarse-aligned subtablet (sub_tablet_optim)
+            det_rows: Detection rows, each inner list sorted left-to-right
+            aligned_rows: Coarse-aligned text rows, each inner list sorted left-to-right
             det_sign_match_info: {(det_row_idx, det_col_idx): {"status": "same"|"diff"|"unmatched",
                                   "text_sign_name": str|None}}
             text_sign_match_info: {(text_row_idx, text_col_idx): {"status": "same"|"diff"|"unmatched",
@@ -590,41 +436,33 @@ class BboxVisualizer:
         def _color_idx(det_row_idx: int) -> int:
             return det_to_text.get(det_row_idx, det_row_idx)
 
-        # Group by row
-        det_rows = {}
-        for box in detection_sign_boxes:
-            det_rows.setdefault(box.row_idx, []).append(box)
-        text_rows = {}
-        for box in aligned_text_boxes:
-            text_rows.setdefault(box.row_idx, []).append(box)
-
         # --- Draw detection boxes colored by match status ---
-        for box in detection_sign_boxes:
-            x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
-            key = (box.row_idx, box.col_idx)
-            info = det_sign_match_info.get(key, {"status": "unmatched", "text_sign_name": None})
-            color_rgb = self._get_det_sign_color(_color_idx(box.row_idx), info["status"])
-            color_bgr = tuple(reversed(color_rgb))
-            cv2.rectangle(img_vis, (x1, y1), (x2, y2), color_bgr, 2)
+        for row_idx, row_boxes in enumerate(det_rows):
+            for col_idx, box in enumerate(row_boxes):
+                x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
+                key = (row_idx, col_idx)
+                info = det_sign_match_info.get(key, {"status": "unmatched", "text_sign_name": None})
+                color_rgb = self._get_det_sign_color(_color_idx(row_idx), info["status"])
+                color_bgr = tuple(reversed(color_rgb))
+                cv2.rectangle(img_vis, (x1, y1), (x2, y2), color_bgr, 2)
 
         # --- Draw aligned text boxes (non-same) as dashed rectangles ---
-        for box in aligned_text_boxes:
-            key = (box.row_idx, box.col_idx)
-            info = text_sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
-            if info["status"] == "diff":
-                x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
-                color_rgb = _desaturate_color(_get_row_color(box.row_idx), 0.4)
-                color_bgr = tuple(reversed(color_rgb))
-                _draw_dashed_rect(img_vis, (x1, y1), (x2, y2), color_bgr, 2, 8)
-            elif info["status"] == "unmatched":
-                x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
-                _draw_dashed_rect(img_vis, (x1, y1), (x2, y2), (180, 180, 180), 2, 8)
+        for row_idx, row_boxes in enumerate(aligned_rows):
+            for col_idx, box in enumerate(row_boxes):
+                key = (row_idx, col_idx)
+                info = text_sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
+                if info["status"] == "diff":
+                    x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
+                    color_rgb = _desaturate_color(_get_row_color(row_idx), 0.4)
+                    color_bgr = tuple(reversed(color_rgb))
+                    _draw_dashed_rect(img_vis, (x1, y1), (x2, y2), color_bgr, 2, 8)
+                elif info["status"] == "unmatched":
+                    x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
+                    _draw_dashed_rect(img_vis, (x1, y1), (x2, y2), (180, 180, 180), 2, 8)
 
         # --- Detection center lines (solid) ---
-        for row_idx in sorted(det_rows.keys()):
-            if row_idx == -1:
-                continue
-            row_boxes = sorted(det_rows[row_idx], key=lambda b: b.cx)
+        for row_idx, row_boxes in enumerate(det_rows):
+            row_boxes = sorted(row_boxes, key=lambda b: b.cx)
             row_color_bgr = tuple(reversed(_get_row_color(_color_idx(row_idx))))
             for i in range(len(row_boxes) - 1):
                 c1 = (int(row_boxes[i].cx), int(row_boxes[i].cy))
@@ -636,12 +474,8 @@ class BboxVisualizer:
                 cv2.circle(img_vis, c, marker_size + 1, (255, 255, 255), 1)
 
         # --- Text center lines (dashed) per aligned row ---
-        # text_rows keys are text_row_idx; color uses text_row_idx directly
-        # (consistent with draw_rows which maps det→text for color)
-        for text_row_idx in sorted(text_rows.keys()):
-            if text_row_idx == -1:
-                continue
-            row_boxes = sorted(text_rows[text_row_idx], key=lambda b: b.cx)
+        for text_row_idx, row_boxes in enumerate(aligned_rows):
+            row_boxes = sorted(row_boxes, key=lambda b: b.cx)
             line_color_bgr = tuple(reversed(_desaturate_color(_get_row_color(text_row_idx), 0.5)))
             for i in range(len(row_boxes) - 1):
                 c1 = (int(row_boxes[i].cx), int(row_boxes[i].cy))
@@ -657,64 +491,61 @@ class BboxVisualizer:
         font = _get_font(24)
 
         # Detection box labels
-        for box in detection_sign_boxes:
-            x1, y1 = int(box.x1), int(box.y1)
-            x2, y2 = int(box.x2), int(box.y2)
-            key = (box.row_idx, box.col_idx)
-            info = det_sign_match_info.get(key, {"status": "unmatched", "text_sign_name": None})
-            status = info["status"]
+        for row_idx, row_boxes in enumerate(det_rows):
+            for col_idx, box in enumerate(row_boxes):
+                x1, y1 = int(box.x1), int(box.y1)
+                x2, y2 = int(box.x2), int(box.y2)
+                key = (row_idx, col_idx)
+                info = det_sign_match_info.get(key, {"status": "unmatched", "text_sign_name": None})
+                status = info["status"]
 
-            box_height = y2 - y1
-            lbl_h = max(int(box_height / 6), 12)
-            fsize = max(int(lbl_h * 0.75), 10)
-            lbl_font = _get_font(fsize)
+                box_height = y2 - y1
+                lbl_h = max(int(box_height / 6), 12)
+                fsize = max(int(lbl_h * 0.75), 10)
+                lbl_font = _get_font(fsize)
 
-            det_label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
+                det_label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
 
-            if status == "same":
-                # Detection label, black bg
-                _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(0, 0, 0))
-            elif status == "diff":
-                text_name = info.get("text_sign_name", "")
-                # Detection label on top (dark gray bg = detection result)
-                _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(80, 80, 80))
-                # Text label below (colored bg)
-                if text_name:
-                    color_rgb = self._get_det_sign_color(_color_idx(box.row_idx), "same")
-                    _draw_label(draw, text_name[:10], x1, y1 + lbl_h + 1, x2, lbl_h, lbl_font, bg=color_rgb)
-            else:
-                # Unmatched detection: gray bg
-                _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(128, 128, 128))
+                if status == "same":
+                    _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(0, 0, 0))
+                elif status == "diff":
+                    text_name = info.get("text_sign_name", "")
+                    _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(80, 80, 80))
+                    if text_name:
+                        color_rgb = self._get_det_sign_color(_color_idx(row_idx), "same")
+                        _draw_label(draw, text_name[:10], x1, y1 + lbl_h + 1, x2, lbl_h, lbl_font, bg=color_rgb)
+                else:
+                    _draw_label(draw, det_label, x1, y1, x2, lbl_h, lbl_font, bg=(128, 128, 128))
 
         # Diff-label and unmatched text box labels
-        for box in aligned_text_boxes:
-            key = (box.row_idx, box.col_idx)
-            info = text_sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
-            if info["status"] == "diff":
-                x1, y1 = int(box.x1), int(box.y1)
-                x2, y2 = int(box.x2), int(box.y2)
-                box_height = y2 - y1
-                lbl_h = max(int(box_height / 6), 12)
-                fsize = max(int(lbl_h * 0.75), 10)
-                lbl_font = _get_font(fsize)
-                label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
-                color_rgb = _desaturate_color(_get_row_color(box.row_idx), 0.4)
-                _draw_label(draw, label, x1, y1, x2, lbl_h, lbl_font, bg=color_rgb)
-            elif info["status"] == "unmatched":
-                x1, y1 = int(box.x1), int(box.y1)
-                x2, y2 = int(box.x2), int(box.y2)
-                box_height = y2 - y1
-                lbl_h = max(int(box_height / 6), 12)
-                fsize = max(int(lbl_h * 0.75), 10)
-                lbl_font = _get_font(fsize)
-                label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
-                _draw_label(draw, label, x1, y1, x2, lbl_h, lbl_font, bg=(160, 160, 160))
+        for row_idx, row_boxes in enumerate(aligned_rows):
+            for col_idx, box in enumerate(row_boxes):
+                key = (row_idx, col_idx)
+                info = text_sign_match_info.get(key, {"status": "unmatched", "det_sign_name": None})
+                if info["status"] == "diff":
+                    x1, y1 = int(box.x1), int(box.y1)
+                    x2, y2 = int(box.x2), int(box.y2)
+                    box_height = y2 - y1
+                    lbl_h = max(int(box_height / 6), 12)
+                    fsize = max(int(lbl_h * 0.75), 10)
+                    lbl_font = _get_font(fsize)
+                    label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
+                    color_rgb = _desaturate_color(_get_row_color(row_idx), 0.4)
+                    _draw_label(draw, label, x1, y1, x2, lbl_h, lbl_font, bg=color_rgb)
+                elif info["status"] == "unmatched":
+                    x1, y1 = int(box.x1), int(box.y1)
+                    x2, y2 = int(box.x2), int(box.y2)
+                    box_height = y2 - y1
+                    lbl_h = max(int(box_height / 6), 12)
+                    fsize = max(int(lbl_h * 0.75), 10)
+                    lbl_font = _get_font(fsize)
+                    label = box.sign_name[:10] if hasattr(box, 'sign_name') else str(box.sign.name[:10])
+                    _draw_label(draw, label, x1, y1, x2, lbl_h, lbl_font, bg=(160, 160, 160))
 
         # --- Row annotations ---
-        for row_idx in sorted(det_rows.keys()):
-            if row_idx == -1:
+        for row_idx, row_boxes in enumerate(det_rows):
+            if not row_boxes:
                 continue
-            row_boxes = det_rows[row_idx]
             avg_y = np.mean([b.cy for b in row_boxes])
             display_idx = row_idx + 1
             if row_idx in det_to_text:
@@ -838,15 +669,15 @@ def _draw_dashed_line(img: np.ndarray, pt1: tuple, pt2: tuple,
 
 
 def build_sign_match_info(row_sign_matches: dict, text_to_det: dict,
-                          det_rows_dict: dict, optim_sign_boxes: List):
+                          det_rows: List[List[Box]], aligned_rows: List[List[Box]]):
     """
     Build sign_match_info dicts for text and detection perspectives.
 
     Args:
         row_sign_matches: {text_row_idx: [(text_sign_idx, det_sign_idx), ...]}
         text_to_det: {text_row_idx: det_row_idx}
-        det_rows_dict: {det_row_idx: [SignBox, ...]} from sub_tablet_detection.get_rows_dict()
-        optim_sign_boxes: List of SignBox from sub_tablet_optim
+        det_rows: detection rows
+        aligned_rows: aligned text rows
 
     Returns:
         text_sign_match_info: {(text_row_idx, text_col_idx): {"status", "det_sign_name"}}
@@ -863,27 +694,31 @@ def build_sign_match_info(row_sign_matches: dict, text_to_det: dict,
             matched_det_keys.add((det_row_idx, d_idx))
 
     text_info = {}
-    for sb in optim_sign_boxes:
-        key = (sb.row_idx, sb.col_idx)
-        if key in match_pairs:
-            det_row_idx, det_sign_idx = match_pairs[key]
-            det_box = det_rows_dict[det_row_idx][det_sign_idx]
-            det_name = det_box.sign_name if hasattr(det_box, 'sign_name') else det_box.sign.name
-            text_name = sb.sign_name if hasattr(sb, 'sign_name') else sb.sign.name
-            if text_name == det_name:
-                text_info[key] = {"status": "same", "det_sign_name": det_name}
+    for row_idx, row_boxes in enumerate(aligned_rows):
+        for col_idx, sb in enumerate(row_boxes):
+            key = (row_idx, col_idx)
+            if key in match_pairs:
+                det_row_idx, det_sign_idx = match_pairs[key]
+                det_box = det_rows[det_row_idx][det_sign_idx]
+                det_name = det_box.sign_name if hasattr(det_box, 'sign_name') else det_box.sign.name
+                text_name = sb.sign_name if hasattr(sb, 'sign_name') else sb.sign.name
+                if text_name == det_name:
+                    text_info[key] = {"status": "same", "det_sign_name": det_name}
+                else:
+                    text_info[key] = {"status": "diff", "det_sign_name": det_name}
             else:
-                text_info[key] = {"status": "diff", "det_sign_name": det_name}
-        else:
-            text_info[key] = {"status": "unmatched", "det_sign_name": None}
+                text_info[key] = {"status": "unmatched", "det_sign_name": None}
 
     # Build reverse lookup: det_key → text_key for O(1) access
     det_to_text_key = {det_key: text_key for text_key, det_key in match_pairs.items()}
-    # Build text box lookup: (row_idx, col_idx) → SignBox
-    text_box_lookup = {(sb.row_idx, sb.col_idx): sb for sb in optim_sign_boxes}
+    text_box_lookup = {
+        (row_idx, col_idx): box
+        for row_idx, row in enumerate(aligned_rows)
+        for col_idx, box in enumerate(row)
+    }
 
     det_info = {}
-    for det_row_idx, det_row_boxes in det_rows_dict.items():
+    for det_row_idx, det_row_boxes in enumerate(det_rows):
         for d_idx, det_box in enumerate(det_row_boxes):
             dk = (det_row_idx, d_idx)
             det_name = det_box.sign_name if hasattr(det_box, 'sign_name') else det_box.sign.name

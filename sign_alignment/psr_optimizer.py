@@ -1,9 +1,9 @@
 """
 Point Set Registration (PSR) Optimizer for sign alignment.
 
-Replaces heatmap-based template matching with a GMM-based point set
-registration approach.  The source set S (text-derived signs, organized
-in rows) is optimized to match the target set X (detected signs).
+GMM-based point set registration for aligning text-derived boxes to
+detected boxes.  The source set S (text-derived signs, organized in rows)
+is optimized to match the target set X (detected signs).
 
 Data loss (GMM):
     E_data = -(1/N) ∑_n log p(x_n)
@@ -21,111 +21,15 @@ Structural losses preserve the row topology of S:
                 (piecewise quadratic + plateau)
 """
 
+from __future__ import annotations
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional
 
 from .sign import CLASSES_ABZ as DEFAULT_CLASSES_ABZ
-from .tablet import SignBox, SubTablet
-from .bounding_box import BoundingBox, Detection
-
-
-# ================================================================
-#  Utility functions
-# ================================================================
-
-def initialize_text_subtablet(
-    text_lines: List[List[str]],
-    target_detections: Detection,
-    avg_width: float,
-    avg_height: float,
-    margin: float = None,
-    img: np.ndarray = None,
-) -> SubTablet:
-    """
-    Create a text SubTablet whose centroid coincides with the detection
-    centroid – a simple, heatmap-free initialisation.
-
-    Steps
-    -----
-    1. Lay out text signs on a uniform grid (one row per text line).
-    2. Compute the centroid of the grid.
-    3. Compute the centroid of the target detections.
-    4. Translate the whole grid so the two centroids coincide.
-
-    Parameters
-    ----------
-    text_lines : list[list[str]]
-        Parsed text lines (each inner list contains sign names).
-    target_detections : Detection
-        Bounding boxes from the object detector.
-    avg_width, avg_height : float
-        Average sign dimensions used for grid spacing.
-    margin : float, optional
-        Grid margin (defaults to ``max(avg_width, avg_height)``).
-    img : np.ndarray, optional
-        Image to attach to the SubTablet (for visualisation).
-
-    Returns
-    -------
-    SubTablet
-        With ``sign_boxes`` placed at the centroid-adjusted positions.
-    """
-    return SubTablet.from_text_lines(
-        text_lines=text_lines,
-        avg_width=avg_width,
-        avg_height=avg_height,
-        margin=margin,
-        img=img,
-        target_detections=target_detections,
-        align_to_detection_centroid=True,
-        name="text_initialized",
-    )
-
-
-def filter_boxes_by_mask(
-    subtablet: SubTablet,
-    mask: np.ndarray,
-    threshold: float = 0.5,
-) -> SubTablet:
-    """
-    Remove sign boxes whose centres fall outside a binary mask.
-
-    Parameters
-    ----------
-    subtablet : SubTablet
-        Input subtablet.
-    mask : np.ndarray
-        Binary mask (H, W). Values ≥ threshold are considered "inside".
-    threshold : float
-        Threshold in [0, 1] if max(mask) ≤ 1, else in [0, 255].
-
-    Returns
-    -------
-    SubTablet
-        Copy with only the boxes whose centres are inside the mask.
-    """
-    mask_h, mask_w = mask.shape[:2]
-    thr_val = threshold * 255 if mask.max() > 1 else threshold
-
-    filtered: List[SignBox] = []
-    for sb in subtablet.sign_boxes:
-        px, py = int(round(sb.cx)), int(round(sb.cy))
-        if 0 <= px < mask_w and 0 <= py < mask_h and mask[py, px] >= thr_val:
-            filtered.append(sb.copy())
-
-    return SubTablet(
-        img=subtablet.img,
-        sign_boxes=filtered,
-        name=subtablet.name + "_masked",
-        scale_factor=subtablet.scale_factor,
-        avg_width=subtablet.avg_width,
-        avg_height=subtablet.avg_height,
-        margin=subtablet.margin,
-        origin_x=subtablet.origin_x,
-        origin_y=subtablet.origin_y,
-    )
+from .box import Box, Boxes
 
 
 # ================================================================
@@ -142,8 +46,8 @@ class PointSetRegistrationOptimizer:
 
     def __init__(
         self,
-        sub_tablet_text: SubTablet,
-        target_detections: Detection,
+        source_rows: List[List[Box]],
+        target_detections: Boxes = None,
         classes_abz: List[str] = None,
         sigma: float = None,
         w_noise: float = 0.1,
@@ -165,10 +69,9 @@ class PointSetRegistrationOptimizer:
         """
         Parameters
         ----------
-        sub_tablet_text : SubTablet
-            Text-derived sign boxes (source S). Must have ``row_idx``
-            and ``col_idx`` set on each ``SignBox``.
-        target_detections : Detection
+        source_rows : list[list[Box]]
+            Text-derived sign boxes grouped by row.
+        target_detections : Boxes
             Bounding boxes from the detector (target X).
         classes_abz : list[str]
             ABZ class name list (defaults to ``CLASSES_ABZ``).
@@ -222,7 +125,15 @@ class PointSetRegistrationOptimizer:
         self.rows_threshold_ratio_close = rows_threshold_ratio_close
         self.rows_plateau_far = rows_plateau_far
         self.rows_plateau_close = rows_plateau_close
-        self.sub_tablet_text = sub_tablet_text
+        if source_rows is None:
+            raise ValueError("PointSetRegistrationOptimizer requires source_rows")
+
+        self.rows = [list(row) for row in source_rows if row]
+        source_subtablet = next(
+            (box.subtablet for row in self.rows for box in row if box.subtablet is not None),
+            None,
+        )
+        self.source_boxes = Boxes((box for row in self.rows for box in row), subtablet=source_subtablet)
 
         # ---- Contour mask for boundary loss ------------------------------
         if contour_mask is not None and lambda_boundary > 0:
@@ -238,35 +149,34 @@ class PointSetRegistrationOptimizer:
             self.device = device
 
         # ---- Source point set S (text) -----------------------------------
-        self.rows = sub_tablet_text.get_rows()
         self.num_rows = len(self.rows)
         self.row_lengths = [len(r) for r in self.rows]
 
-        self.sign_boxes_flat: List[SignBox] = []
+        self.source_boxes_flat: List[Box] = []
         self.row_indices: List[int] = []
         self.col_indices: List[int] = []
         self.class_ids_source: List[int] = []
 
         for row_idx, row in enumerate(self.rows):
             for col_idx, sb in enumerate(row):
-                self.sign_boxes_flat.append(sb)
+                self.source_boxes_flat.append(sb)
                 self.row_indices.append(row_idx)
                 self.col_indices.append(col_idx)
                 cid = (self.classes_abz.index(sb.abz_name)
                        if sb.abz_name in self.classes_abz else -1)
                 self.class_ids_source.append(cid)
 
-        self.M = len(self.sign_boxes_flat)
+        self.M = len(self.source_boxes_flat)
 
         # ---- Target point set X (detections) -----------------------------
-        self.target_detections = target_detections
-        self.N = len(target_detections)
+        self.target_detections = Boxes(target_detections or [])
+        self.N = len(self.target_detections)
 
         target_pos = []
         target_sz = []
         self.class_ids_target: List[int] = []
 
-        for det in target_detections:
+        for det in self.target_detections:
             cx = (det.x1 + det.x2) / 2
             cy = (det.y1 + det.y2) / 2
             target_pos.append([cx, cy])
@@ -289,13 +199,13 @@ class PointSetRegistrationOptimizer:
 
         # ---- Optimisation parameters [cx, cy, w, h] ---------------------
         init = [[sb.cx, sb.cy, sb.width, sb.height]
-                for sb in self.sign_boxes_flat]
+                for sb in self.source_boxes_flat]
         self.params = torch.tensor(init, dtype=torch.float32,
                                    device=self.device, requires_grad=True)
         self.initial_params = self.params.clone().detach()
 
         # ---- Sigma -------------------------------------------------------
-        avg_size = (sub_tablet_text.avg_width + sub_tablet_text.avg_height) / 2
+        avg_size = self.source_boxes.avg_size
         self.sigma = float(sigma) if sigma is not None else float(avg_size)
 
         # ---- Confusion matrix (C×C) -------------------------------------
@@ -578,7 +488,7 @@ class PointSetRegistrationOptimizer:
         Penalise the first sign of each row when its bbox extends
         outside the tablet contour mask.
 
-        For each row, take the first sign (leftmost, col_idx == 0).
+        For each row, take the first sign (leftmost in the row list).
         Compute the intersection area between its bbox and the contour
         mask.  The loss is based on  ``1 − IoR`` (Intersection-over-
         Region, where Region = bbox area), so a box fully inside the
@@ -701,7 +611,7 @@ class PointSetRegistrationOptimizer:
         sigma_final: float = None,
         verbose: bool = True,
         log_every: int = 10,
-    ) -> SubTablet:
+    ) -> Boxes:
         """
         Run gradient-descent optimisation.
 
@@ -720,7 +630,7 @@ class PointSetRegistrationOptimizer:
 
         Returns
         -------
-        SubTablet
+        Boxes
             Optimised sign positions.
         """
         opt = torch.optim.Adam([self.params], lr=lr)
@@ -795,36 +705,24 @@ class PointSetRegistrationOptimizer:
                     line += f"  σ={self.sigma:.1f}"
                 print(line)
 
-        return self.get_optimized_subtablet()
+        return self.get_optimized_boxes()
 
     # ------------------------------------------------------------------
     #  Results
     # ------------------------------------------------------------------
 
-    def get_optimized_subtablet(self) -> SubTablet:
-        """Build a new SubTablet from the current optimised parameters."""
+    def get_optimized_boxes(self) -> Boxes:
+        """Build the current optimised boxes."""
         p = self.params.detach().cpu().numpy()
 
-        boxes = []
-        for i, sb in enumerate(self.sign_boxes_flat):
-            boxes.append(SignBox(
+        boxes = Boxes(subtablet=self.source_boxes.subtablet)
+        for i, sb in enumerate(self.source_boxes_flat):
+            boxes.append(Box(
                 sign=sb.sign, score=sb.score,
                 cx=float(p[i, 0]), cy=float(p[i, 1]),
                 width=float(p[i, 2]), height=float(p[i, 3]),
-                row_idx=sb.row_idx, col_idx=sb.col_idx,
             ))
-
-        return SubTablet(
-            img=self.sub_tablet_text.img,
-            sign_boxes=boxes,
-            name="optimized",
-            scale_factor=self.sub_tablet_text.scale_factor,
-            avg_width=self.sub_tablet_text.avg_width,
-            avg_height=self.sub_tablet_text.avg_height,
-            margin=self.sub_tablet_text.margin,
-            origin_x=self.sub_tablet_text.origin_x,
-            origin_y=self.sub_tablet_text.origin_y,
-        )
+        return boxes
 
     def get_param_changes(self) -> np.ndarray:
         """Return (current − initial) parameter array  (M, 4)."""

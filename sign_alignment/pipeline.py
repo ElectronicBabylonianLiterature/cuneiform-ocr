@@ -1,4 +1,3 @@
-from collections import Counter
 from dataclasses import dataclass, field
 import os
 from typing import Callable, Optional
@@ -7,8 +6,10 @@ import cv2
 import numpy as np
 import torch
 
-from sign_alignment.detector import ModelConfig, SingleImage, TabletImageDetector
-from sign_alignment.data_source import EBLAPISource, LocalDataSource, GroundTruths, SignAPIResolver, SignTextParser
+from sign_alignment.detector import ModelConfig, TabletImageDetector
+from sign_alignment.data_source import EBLAPISource, LocalDataSource, SignAPIResolver, SignTextParser
+from sign_alignment.box import Boxes, boxes_in_crop
+from sign_alignment.tablet import SubTablet
 from sign_alignment.visualizer import (
     BboxVisualizer,
     ColorConfig,
@@ -16,13 +17,12 @@ from sign_alignment.visualizer import (
     TextVisualizer,
     build_sign_match_info,
 )
-from sign_alignment.heatmap import compute_avg_dimensions, transform_gt_to_cropped_region
-from sign_alignment.tablet import SubTablet
 from sign_alignment.psr_optimizer import PointSetRegistrationOptimizer
 from sign_alignment.dift_model import DiftConfig, load_dift_model, make_dift_wrapper
 from data_processing.line_process import (
-    align_text_to_detection_rows,
+    align_text_row_to_detection,
     create_row_mapping,
+    detect_rows_dbscan,
     match_rows_dp,
     match_signs_in_row_dp,
 )
@@ -84,43 +84,115 @@ class PipelineTools:
 
 
 # ---------------------------------------------------------------------------
+# Row structure
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BoxRows:
+    """Lightweight row topology for a box collection.
+
+    rows stores box indices, not boxes themselves. Row ids are the list indices;
+    columns are positions within each row.
+    """
+
+    boxes: Boxes
+    rows: list[list[int]]
+    noise: list[int] = field(default_factory=list)
+
+    @classmethod
+    def from_text_lines(cls, boxes: Boxes, text_lines: list[list[str]]) -> "BoxRows":
+        rows = []
+        offset = 0
+        for line in text_lines:
+            row = list(range(offset, offset + len(line)))
+            rows.append(row)
+            offset += len(line)
+        return cls(boxes=boxes, rows=rows)
+
+    @classmethod
+    def detect(
+        cls,
+        boxes: Boxes,
+        eps: float = 0.6,
+        min_samples: int = 1,
+        lambda_weight: float = 0.05,
+        avg_width: Optional[float] = None,
+        avg_height: Optional[float] = None,
+    ) -> "BoxRows":
+        labels, _ = detect_rows_dbscan(
+            boxes=boxes,
+            eps=eps,
+            min_samples=min_samples,
+            lambda_weight=lambda_weight,
+            avg_width=boxes.avg_width if avg_width is None else avg_width,
+            avg_height=boxes.avg_height if avg_height is None else avg_height,
+        )
+        grouped: dict[int, list[int]] = {}
+        noise = []
+        for idx, label in enumerate(labels):
+            if label == -1:
+                noise.append(idx)
+            else:
+                grouped.setdefault(label, []).append(idx)
+        rows = [sorted(grouped[k], key=lambda i: boxes[i].cx) for k in sorted(grouped)]
+        return cls(boxes=boxes, rows=rows, noise=sorted(noise, key=lambda i: boxes[i].cx))
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def row_boxes(self, row_idx: int) -> list:
+        return [self.boxes[i] for i in self.rows[row_idx]]
+
+    def as_dict(self) -> dict[int, list]:
+        return {idx: self.row_boxes(idx) for idx in range(len(self.rows))}
+
+    def as_lists(self) -> list[list]:
+        return [self.row_boxes(idx) for idx in range(len(self.rows))]
+
+    def sign_sequences(self) -> list[list[str]]:
+        return [[box.sign_name for box in row] for row in self.as_lists()]
+
+    def counts(self) -> list[int]:
+        return [len(row) for row in self.rows]
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
 @dataclass
 class SampleState:
-    """All intermediate results for a single fragment, including SubTablets."""
+    """All intermediate results for a single fragment."""
 
     fragments: list = None # all available fragments (populated at Runner init)
     fragment_id: str = None
 
     # full-image data
     img: np.ndarray = None
-    gt_boxes: Optional[GroundTruths] = None
+    gt_boxes: Optional[Boxes] = None
 
     # Text lines parsed from API
     text_lines: Optional[list] = None
     text_lines_unfiltered: Optional[list] = None
 
     # Full-image detections
-    detections: Optional[list] = None
+    detections: Optional[Boxes] = None
 
-    # chosen sub-image (one crop of the tablet)
-    sub_image: Optional[SingleImage] = None
+    # chosen crop of the tablet
+    subtablet: Optional[SubTablet] = None
+    det_boxes: Optional[Boxes] = None
     crop_info: Optional[dict] = None
-    gt_boxes_img: Optional[list] = None         # GT boxes in sub-image coords
+    gt_boxes_img: Optional[Boxes] = None         # GT boxes in crop coords
 
-    # sign-size statistics
-    avg_width: float = None
-    avg_height: float = None
-
-    # SubTablets (unified intermediate representations)
-    sub_tablet_detection: Optional[SubTablet] = None   # detected signs in sub_image
-    sub_tablet_text: Optional[SubTablet] = None        # text signs on virtual grid
-    sub_tablet_aligned: Optional[SubTablet] = None     # coarse-aligned (formerly optim)
-    sub_tablet_final: Optional[SubTablet] = None       # after PSR optimization
+    # Box collections in the selected crop coordinate frame
+    text_boxes: Optional[Boxes] = None
+    aligned_boxes: Optional[Boxes] = None
+    final_boxes: Optional[Boxes] = None
 
     # row matching
+    det_rows: Optional[BoxRows] = None
+    text_rows: Optional[BoxRows] = None
+    aligned_rows: Optional[BoxRows] = None
     det_row_sequences: Optional[list] = None
     text_row_sequences: Optional[list] = None
     matches: Optional[list] = None
@@ -143,7 +215,7 @@ class SampleState:
     canonical_cache: Optional["CanonicalFeatureCache"] = None
     canonical_meta: Optional[dict] = None
     dift_affine_probe_iteration: Optional[int] = None
-    dift_affine_probe_subtablet: Optional[SubTablet] = None
+    dift_affine_probe_boxes: Optional[Boxes] = None
     dift_affine_probe_results: Optional[list] = None
     dift_affine_probe_error: Optional[str] = None
     canonical_overlay_iteration: Optional[int] = None
@@ -171,29 +243,6 @@ class CropContext:
     def __post_init__(self):
         if self.state is None:
             self.state = SampleState()
-
-    @property
-    def tablet_detector(self): return self.config.tablet_detector
-    @property
-    def local_source(self): return self.config.local_source
-    @property
-    def api_source(self): return self.config.api_source
-    @property
-    def color_config(self): return self.config.color_config
-    @property
-    def output_dir(self): return self.config.output_dir
-    @property
-    def fragment_id(self): return self.state.fragment_id
-    @fragment_id.setter
-    def fragment_id(self, v): self.state.fragment_id = v
-    @property
-    def img(self): return self.state.img
-    @img.setter
-    def img(self, v): self.state.img = v
-    @property
-    def gt_boxes(self): return self.state.gt_boxes
-    @gt_boxes.setter
-    def gt_boxes(self, v): self.state.gt_boxes = v
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +277,10 @@ class Step:
 # ---------------------------------------------------------------------------
 
 def _out(context: CropContext, suffix: str) -> str:
-    return os.path.join(context.output_dir, f"{context.task_type}_{context.fragment_id}_{suffix}")
+    return os.path.join(
+        context.config.output_dir,
+        f"{context.task_type}_{context.state.fragment_id}_{suffix}",
+    )
 
 
 def _dift_alignment_config(config: PipelineConfig) -> DiftAlignmentConfig:
@@ -255,8 +307,8 @@ def _dift_diagnostic_error(s: SampleState) -> Optional[str]:
         return "PSR optimizer is not available"
     if s.canonical_cache is None:
         return "canonical feature cache is not available"
-    if s.sub_image is None or s.sub_image.img is None:
-        return "sub-image is not available"
+    if s.subtablet is None or s.subtablet.img is None:
+        return "subtablet image is not available"
     return None
 
 
@@ -270,12 +322,12 @@ class StepLoadData(Step):
     def run(self, context: CropContext):
         s = context.state
 
-        s.img = context.local_source.load_image(context.fragment_id)
-        s.gt_boxes = context.local_source.load_annotation(context.fragment_id)
+        s.img = context.config.local_source.load_image(s.fragment_id)
+        s.gt_boxes = context.config.local_source.load_annotation(s.fragment_id)
 
-        fragment_data = context.api_source.get_fragment_data(context.fragment_id)
+        fragment_data = context.config.api_source.get_fragment_data(s.fragment_id)
         if fragment_data is None:
-            raise ValueError(f"No fragment data found for sample {context.fragment_id}")
+            raise ValueError(f"No fragment data found for sample {s.fragment_id}")
 
         text_data = fragment_data.get("text", {})
         s.text_lines = SignTextParser.parse_text_lines(
@@ -296,16 +348,16 @@ class StepLoadData(Step):
         if vis.save:
             TextVisualizer.save_text(
                 s.text_lines, path=_out(context, "text_filtered.txt"),
-                fragment_id=context.fragment_id)
+                fragment_id=s.fragment_id)
             TextVisualizer.save_text(
                 s.text_lines_unfiltered, path=_out(context, "text.txt"),
-                fragment_id=context.fragment_id)
-            gt_vis = BboxVisualizer(context.color_config.GT_COLOR.value)
+                fragment_id=s.fragment_id)
+            gt_vis = BboxVisualizer(context.config.color_config.GT_COLOR.value)
             gt_vis.draw_boxes(s.img.copy(), s.gt_boxes)
             gt_vis.save(_out(context, "gt.jpg"))
 
         if vis.display:
-            gt_vis = BboxVisualizer(context.color_config.GT_COLOR.value)
+            gt_vis = BboxVisualizer(context.config.color_config.GT_COLOR.value)
             gt_vis.draw_boxes(s.img.copy(), s.gt_boxes)
             gt_vis.display_result(vis_opt="draw")
 
@@ -319,8 +371,8 @@ class StepDetectSigns(Step):
 
     def run(self, context: CropContext):
         s = context.state
-        s.detections = context.tablet_detector.detect(s.img)
-        cropped = context.tablet_detector.get_cropped_images()
+        s.detections = context.config.tablet_detector.detect(s.img)
+        cropped = context.config.tablet_detector.get_cropped_images()
         img_idx = context.config.img_idx
         if not cropped:
             raise RuntimeError("detector produced no cropped images")
@@ -328,17 +380,18 @@ class StepDetectSigns(Step):
             raise IndexError(
                 f"crop index {img_idx} is out of range after detection; "
                 f"available crop indices are 0..{len(cropped) - 1}"
-            )
-        s.sub_image = cropped[img_idx]
-        s.crop_info = context.tablet_detector.crop_coordinates[img_idx]
+        )
+        s.subtablet = cropped[img_idx]
+        s.det_boxes = context.config.tablet_detector.get_crop_boxes()[img_idx]
+        s.crop_info = context.config.tablet_detector.crop_coordinates[img_idx]
 
     def visualize(self, context: CropContext, vis: VisOptions):
         s = context.state
-        color = context.color_config.DET_COLOR.value
+        color = context.config.color_config.DET_COLOR.value
 
         if vis.info:
             print(f"Total detections (full image): {len(s.detections)}")
-            print(f"Sub-image detections: {len(s.sub_image.detections)}")
+            print(f"Sub-image detections: {len(s.det_boxes)}")
             ci = s.crop_info
             print(f"Crop info (img_idx={context.config.img_idx}): "
                   f"x={ci['x']}, y={ci['y']}, w={ci['w']}, h={ci['h']}")
@@ -349,12 +402,12 @@ class StepDetectSigns(Step):
             full_vis.save(_out(context, "det.jpg"))
 
             img_vis = BboxVisualizer(color=color)
-            img_vis.draw_boxes(s.sub_image.img.copy(), s.sub_image.detections)
+            img_vis.draw_boxes(s.subtablet.img.copy(), s.det_boxes)
             img_vis.save(_out(context, "sub_image.jpg"))
 
         if vis.display:
             img_vis = BboxVisualizer(color=color)
-            img_vis.draw_boxes(s.sub_image.img.copy(), s.sub_image.detections)
+            img_vis.draw_boxes(s.subtablet.img.copy(), s.det_boxes)
             img_vis.display_result(vis_opt="draw")
 
 
@@ -367,7 +420,7 @@ class StepTransformGtToImg(Step):
 
     def run(self, context: CropContext):
         s = context.state
-        s.gt_boxes_img = transform_gt_to_cropped_region(s.gt_boxes, s.crop_info)
+        s.gt_boxes_img = boxes_in_crop(s.gt_boxes, s.crop_info, subtablet=s.subtablet)
 
     def visualize(self, context: CropContext, vis: VisOptions):
         s = context.state
@@ -380,13 +433,13 @@ class StepTransformGtToImg(Step):
             return
 
         if vis.save:
-            v = BboxVisualizer(color=context.color_config.GT_COLOR.value)
-            v.draw_boxes(s.sub_image.img.copy(), s.gt_boxes_img)
+            v = BboxVisualizer(color=context.config.color_config.GT_COLOR.value)
+            v.draw_boxes(s.subtablet.img.copy(), s.gt_boxes_img)
             v.save(_out(context, "sub_image_gt.jpg"))
 
         if vis.display:
-            v = BboxVisualizer(color=context.color_config.GT_COLOR.value)
-            v.draw_boxes(s.sub_image.img.copy(), s.gt_boxes_img)
+            v = BboxVisualizer(color=context.config.color_config.GT_COLOR.value)
+            v.draw_boxes(s.subtablet.img.copy(), s.gt_boxes_img)
             v.display_result(vis_opt="draw")
 
 
@@ -397,49 +450,40 @@ class StepTransformGtToImg(Step):
 class StepComputeStatistics(Step):
     name = "Compute Detection Statistics"
 
-    def run(self, context: CropContext):
-        s = context.state
-        s.avg_width, s.avg_height = compute_avg_dimensions(s.detections)
-
     def visualize(self, context: CropContext, vis: VisOptions):
         s = context.state
         if vis.info:
             print(f"Full image shape: {s.img.shape}")
-            print(f"Sub-image shape:  {s.sub_image.img.shape}")
-            print(f"Average detected sign  width: {s.avg_width:.2f}")
-            print(f"Average detected sign height: {s.avg_height:.2f}")
+            print(f"Sub-image shape:  {s.subtablet.img.shape}")
+            print(f"Average detected sign  width: {s.detections.avg_width:.2f}")
+            print(f"Average detected sign height: {s.detections.avg_height:.2f}")
 
 
 # ---------------------------------------------------------------------------
-# Step: Create SubTablets
+# Step: Create box sets
 # ---------------------------------------------------------------------------
 
-class StepCreateSubTablets(Step):
-    name = "Create Sub-tablets"
+class StepCreateBoxSets(Step):
+    name = "Create Box Sets"
 
     def run(self, context: CropContext):
         s = context.state
-        s.sub_tablet_detection = SubTablet.from_detections(
-            img=s.sub_image.img,
-            detections=s.sub_image.detections,
-            name="detection",
-            avg_width=s.avg_width,
-            avg_height=s.avg_height,
-        )
-        s.sub_tablet_text = SubTablet.from_text_lines(
+        s.text_boxes = Boxes.from_text_lines(
             text_lines=s.text_lines,
-            avg_width=s.avg_width,
-            avg_height=s.avg_height,
-            img=s.sub_image.img,
-            target_detections=s.sub_image.detections,
+            avg_width=s.detections.avg_width,
+            avg_height=s.detections.avg_height,
+            target_boxes=s.det_boxes,
             align_to_detection_centroid=True,
-            name="text",
+            subtablet=s.subtablet,
         )
+        s.text_rows = BoxRows.from_text_lines(s.text_boxes, s.text_lines)
 
     def visualize(self, context: CropContext, vis: VisOptions):
         if vis.info:
-            print(context.state.sub_tablet_detection.info)
-            print(context.state.sub_tablet_text.info)
+            s = context.state
+            print(s.subtablet.info)
+            print(s.text_boxes.info("text", s.subtablet.img))
+            print(f"Text rows: {len(s.text_rows)}, signs: {len(s.text_boxes)}")
 
 
 # ---------------------------------------------------------------------------
@@ -450,29 +494,30 @@ class StepDetectRows(Step):
     name = "Detect Rows (DBSCAN)"
 
     def run(self, context: CropContext):
-        context.state.sub_tablet_detection.detect_rows(
-            eps=0.4, min_samples=1, lambda_weight=0.007)
+        s = context.state
+        s.det_rows = BoxRows.detect(
+            s.det_boxes,
+            eps=0.4, min_samples=1, lambda_weight=0.007,
+            avg_width=s.detections.avg_width,
+            avg_height=s.detections.avg_height,
+        )
 
     def visualize(self, context: CropContext, vis: VisOptions):
         s = context.state
-        det = s.sub_tablet_detection
-
         if vis.info:
-            avg_size = (det.avg_width + det.avg_height) / 2
-            num_rows = len(det.get_rows())
+            avg_size = s.detections.avg_size
+            num_rows = len(s.det_rows)
             print(f"=== Row Detection Results ===")
-            print(f"Average sign size: {avg_size:.2f} px, detected {num_rows} rows, {len(det)} signs")
-            row_counts = Counter(sb.row_idx for sb in det.sign_boxes)
-            for row_idx in sorted(row_counts):
-                label = "Noise" if row_idx == -1 else f"Row {row_idx}"
-                print(f"  {label}: {row_counts[row_idx]} boxes")
+            print(f"Average sign size: {avg_size:.2f} px, detected {num_rows} rows, {len(s.det_boxes)} signs")
+            for row_idx, count in enumerate(s.det_rows.counts()):
+                print(f"  Row {row_idx}: {count} boxes")
+            if s.det_rows.noise:
+                print(f"  Noise: {len(s.det_rows.noise)} boxes")
 
-            print(f"\n=== Text SubTablet Row Info ===")
-            print(f"Rows: {len(s.sub_tablet_text.get_rows())}, signs: {len(s.sub_tablet_text)}")
-            row_counts_text = Counter(sb.row_idx for sb in s.sub_tablet_text.sign_boxes)
-            for row_idx in sorted(row_counts_text):
-                if row_idx >= 0:
-                    print(f"  Row {row_idx}: {row_counts_text[row_idx]} signs")
+            print(f"\n=== Text Box Row Info ===")
+            print(f"Rows: {len(s.text_rows)}, signs: {len(s.text_boxes)}")
+            for row_idx, count in enumerate(s.text_rows.counts()):
+                print(f"  Row {row_idx}: {count} signs")
 
 
 # ---------------------------------------------------------------------------
@@ -484,8 +529,8 @@ class StepMatchRows(Step):
 
     def run(self, context: CropContext):
         s = context.state
-        det_row_sequences = s.sub_tablet_detection.get_row_sign_sequences()
-        text_row_sequences = s.sub_tablet_text.get_row_sign_sequences()
+        det_row_sequences = s.det_rows.sign_sequences()
+        text_row_sequences = s.text_rows.sign_sequences()
 
         matches, _ = match_rows_dp(
             detection_rows=det_row_sequences,
@@ -533,8 +578,8 @@ class StepVisualizeDetectionRows(Step):
         s = context.state
         det_row_vis = BboxVisualizer(color=(255, 0, 0))
         det_row_vis.draw_rows(
-            s.sub_tablet_detection.img.copy(),
-            s.sub_tablet_detection.sign_boxes,
+            s.subtablet.img.copy(),
+            s.det_rows.as_lists(),
             show_labels=True,
             show_row_numbers=True,
             row_mapping=s.det_to_text,
@@ -602,35 +647,46 @@ class StepAlignTextRows(Step):
 
     def run(self, context: CropContext):
         s = context.state
-        aligned_text_boxes = align_text_to_detection_rows(
-            det_rows=s.sub_tablet_detection.get_rows_dict(),
-            text_rows=s.sub_tablet_text.get_rows_dict(),
-            text_to_det=s.text_to_det,
-            row_sign_matches=s.row_sign_matches,
-            avg_width=s.avg_width,
-            avg_height=s.avg_height,
-            min_width_ratio=2 / 3,
-            max_width_ratio=4 / 3,
-        )
-        s.sub_tablet_aligned = SubTablet(
-            sign_boxes=aligned_text_boxes,
-            img=s.sub_tablet_detection.img,
-            name="aligned",
-            avg_width=s.avg_width,
-            avg_height=s.avg_height,
-        )
+        det_rows = s.det_rows.as_dict()
+        text_rows = s.text_rows.as_dict()
+        aligned_boxes = Boxes(subtablet=s.subtablet)
+        aligned_row_indices = [[] for _ in range(len(s.text_rows))]
+
+        for text_row_idx in sorted(s.row_sign_matches):
+            if text_row_idx not in s.text_to_det:
+                continue
+            det_row_idx = s.text_to_det[text_row_idx]
+            text_row_boxes = text_rows.get(text_row_idx, [])
+            det_row_boxes = det_rows.get(det_row_idx, [])
+            if not text_row_boxes or not det_row_boxes:
+                continue
+
+            row_boxes = align_text_row_to_detection(
+                text_boxes=text_row_boxes,
+                det_boxes=det_row_boxes,
+                matches=s.row_sign_matches[text_row_idx],
+                avg_width=s.detections.avg_width,
+                avg_height=s.detections.avg_height,
+                min_width_ratio=2 / 3,
+                max_width_ratio=4 / 3,
+            )
+            for box in row_boxes:
+                aligned_row_indices[text_row_idx].append(len(aligned_boxes))
+                aligned_boxes.append(box)
+
+        s.aligned_boxes = aligned_boxes
+        s.aligned_rows = BoxRows(s.aligned_boxes, aligned_row_indices)
 
     def visualize(self, context: CropContext, vis: VisOptions):
         s = context.state
         if not vis.info:
             return
         print(f"=== Row Alignment Summary ===")
-        print(f"Total aligned sign boxes: {len(s.sub_tablet_aligned)}")
+        print(f"Total aligned sign boxes: {len(s.aligned_boxes)}")
         print(f"Matched text rows aligned: {len(s.row_sign_matches)}")
-        row_counts = Counter(sb.row_idx for sb in s.sub_tablet_aligned.sign_boxes)
-        for row_idx in sorted(row_counts):
-            if row_idx >= 0:
-                print(f"  Row {row_idx}: {row_counts[row_idx]} signs")
+        for row_idx, count in enumerate(s.aligned_rows.counts()):
+            if count:
+                print(f"  Row {row_idx}: {count} signs")
 
 
 # ---------------------------------------------------------------------------
@@ -645,8 +701,8 @@ class StepBuildSignMatchInfo(Step):
         text_sign_match_info, det_sign_match_info = build_sign_match_info(
             row_sign_matches=s.row_sign_matches,
             text_to_det=s.text_to_det,
-            det_rows_dict=s.sub_tablet_detection.get_rows_dict(),
-            optim_sign_boxes=s.sub_tablet_aligned.sign_boxes,
+            det_rows=s.det_rows.as_lists(),
+            aligned_rows=s.aligned_rows.as_lists(),
         )
         s.text_sign_match_info = text_sign_match_info
         s.det_sign_match_info = det_sign_match_info
@@ -668,7 +724,7 @@ class StepBuildSignMatchInfo(Step):
         text_row_vis = BboxVisualizer()
         text_row_vis.draw_text_mapping(
             img=None,
-            sign_boxes=s.sub_tablet_text.sign_boxes,
+            rows=s.text_rows.as_lists(),
             row_mapping=s.text_to_det,
             sign_match_info=s.text_sign_match_info,
             mapped_label_prefix="D",
@@ -678,9 +734,9 @@ class StepBuildSignMatchInfo(Step):
 
         diag_vis = BboxVisualizer()
         diag_vis.draw_alignment_diagnostic(
-            img=s.sub_tablet_detection.img.copy(),
-            detection_sign_boxes=s.sub_tablet_detection.sign_boxes,
-            aligned_text_boxes=s.sub_tablet_aligned.sign_boxes,
+            img=s.subtablet.img.copy(),
+            det_rows=s.det_rows.as_lists(),
+            aligned_rows=s.aligned_rows.as_lists(),
             det_sign_match_info=s.det_sign_match_info,
             text_sign_match_info=s.text_sign_match_info,
             det_to_text=s.det_to_text,
@@ -722,7 +778,7 @@ class StepOffsetAnalysis(Step):
         if not vis.info:
             return
         s = context.state
-        det_rows = s.sub_tablet_detection.get_rows_dict()
+        det_rows = s.det_rows.as_dict()
 
         match_pairs = {}
         for text_row_idx, sign_matches in s.row_sign_matches.items():
@@ -731,9 +787,11 @@ class StepOffsetAnalysis(Step):
                 match_pairs[(text_row_idx, t_idx)] = (det_row_idx, d_idx)
 
         offsets = {"cx": [], "cy": [], "w": [], "h": []}
-        for sb in s.sub_tablet_aligned.sign_boxes:
-            key = (sb.row_idx, sb.col_idx)
-            if key in match_pairs:
+        for text_row_idx, row in enumerate(s.aligned_rows.as_lists()):
+            for text_col_idx, sb in enumerate(row):
+                key = (text_row_idx, text_col_idx)
+                if key not in match_pairs:
+                    continue
                 det_row_idx, det_sign_idx = match_pairs[key]
                 det_box = det_rows[det_row_idx][det_sign_idx]
                 offsets["cx"].append(sb.cx - det_box.cx)
@@ -760,7 +818,7 @@ class StepUnloadDetector(Step):
     description = "Releases the sign detector from GPU so DIFT and PSR have more VRAM."
 
     def run(self, context: CropContext):
-        context.tablet_detector.unload_model()
+        context.config.tablet_detector.unload_model()
 
 
 # ---------------------------------------------------------------------------
@@ -775,12 +833,12 @@ class StepCreatePsrOptimizer(Step):
         p = context.config.psr_params or {}
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        target_detections = list(s.sub_image.detections)
+        target_detections = s.det_boxes
 
         s.optimizer = PointSetRegistrationOptimizer(
-            sub_tablet_text=s.sub_tablet_aligned,
+            source_rows=s.aligned_rows.as_lists(),
             target_detections=target_detections,
-            sigma=s.avg_width * p.get('sigma_factor', 1.5),
+            sigma=s.detections.avg_width * p.get('sigma_factor', 1.5),
             w_noise=p.get('w_noise', 0.1),
             lambda_data=p.get('lambda_data', 2.0),
             lambda_anchor=p.get('lambda_anchor', 0.01),
@@ -792,7 +850,7 @@ class StepCreatePsrOptimizer(Step):
             rows_threshold_ratio_close=p.get('rows_threshold_ratio_close', 2 / 3.0),
             rows_plateau_far=p.get('rows_plateau_far', 0.5),
             rows_plateau_close=p.get('rows_plateau_close', 1.0),
-            contour_mask=s.sub_image.mask,
+            contour_mask=s.subtablet.mask,
             device=device,
         )
 
@@ -854,10 +912,10 @@ class StepRunPsrOptimization(Step):
         p = context.config.psr_params or {}
         num_iterations = self._num_iterations(context)
         if num_iterations <= 0:
-            s.sub_tablet_final = s.optimizer.get_optimized_subtablet()
+            s.final_boxes = s.optimizer.get_optimized_boxes()
             return
 
-        s.sub_tablet_final = s.optimizer.optimize(
+        s.final_boxes = s.optimizer.optimize(
             num_iterations=num_iterations,
             lr=p.get('lr', 1.0),
             sigma_anneal=p.get('sigma_anneal', True),
@@ -869,7 +927,7 @@ class StepRunPsrOptimization(Step):
     def visualize(self, context: CropContext, vis: VisOptions):
         s = context.state
         if vis.info:
-            print(f"=== Optimization Complete: {len(s.sub_tablet_final)} signs ===")
+            print(f"=== Optimization Complete: {len(s.final_boxes)} signs ===")
 
 
 # ---------------------------------------------------------------------------
@@ -896,10 +954,10 @@ class StepVisualizeCanonicalSignsAtPsrBoxes(Step):
 
         cfg = _dift_alignment_config(context.config)
         try:
-            current_subtablet = s.optimizer.get_optimized_subtablet()
+            current_boxes = s.optimizer.get_optimized_boxes()
             overlay, stats = render_canonical_sign_overlay(
-                image=s.sub_image.img,
-                subtablet=current_subtablet,
+                image=s.subtablet.img,
+                boxes=current_boxes,
                 cache=s.canonical_cache,
                 max_boxes=cfg.canonical_overlay_max_boxes,
                 draw_boxes=False,
@@ -959,7 +1017,7 @@ class StepDiftAffineProbe(Step):
         cfg = _dift_alignment_config(context.config)
 
         s.dift_affine_probe_iteration = None
-        s.dift_affine_probe_subtablet = None
+        s.dift_affine_probe_boxes = None
         s.dift_affine_probe_results = None
         s.dift_affine_probe_error = None
 
@@ -968,10 +1026,10 @@ class StepDiftAffineProbe(Step):
             return
 
         try:
-            probe_subtablet = s.optimizer.get_optimized_subtablet()
+            probe_boxes = s.optimizer.get_optimized_boxes()
             results = build_dift_affine_probe(
-                image=s.sub_image.img,
-                subtablet=probe_subtablet,
+                image=s.subtablet.img,
+                boxes=probe_boxes,
                 cache=s.canonical_cache,
                 padding_ratio=cfg.affine_probe_padding_ratio,
                 max_boxes=cfg.affine_probe_max_boxes,
@@ -980,7 +1038,7 @@ class StepDiftAffineProbe(Step):
                 ransac_threshold=cfg.affine_probe_ransac_threshold,
             )
             s.dift_affine_probe_iteration = len(s.optimizer.loss_history)
-            s.dift_affine_probe_subtablet = probe_subtablet
+            s.dift_affine_probe_boxes = probe_boxes
             s.dift_affine_probe_results = results
         except Exception as exc:
             s.dift_affine_probe_error = f"{type(exc).__name__}: {exc}"
@@ -997,13 +1055,13 @@ class StepDiftAffineProbe(Step):
 
         if not (vis.display or vis.save):
             return
-        if s.dift_affine_probe_results is None or s.dift_affine_probe_subtablet is None:
+        if s.dift_affine_probe_results is None or s.dift_affine_probe_boxes is None:
             return
 
         cfg = _dift_alignment_config(context.config)
         overlay, grid = render_dift_affine_probe(
-            image=s.sub_image.img,
-            subtablet=s.dift_affine_probe_subtablet,
+            image=s.subtablet.img,
+            boxes=s.dift_affine_probe_boxes,
             results=s.dift_affine_probe_results,
             iteration=s.dift_affine_probe_iteration,
             thumb=cfg.affine_probe_thumb,
@@ -1042,31 +1100,31 @@ class StepResultsComparison(Step):
 
     def visualize(self, context: CropContext, vis: VisOptions):
         s = context.state
-        img = s.sub_image.img
+        img = s.subtablet.img
 
         before_vis = BboxVisualizer(color=(0, 255, 255))
-        before_vis.draw_boxes(img.copy(), s.sub_tablet_aligned.to_detection_list())
+        before_vis.draw_boxes(img.copy(), s.aligned_boxes)
 
         after_vis = BboxVisualizer(color=(255, 255, 0))
-        after_vis.draw_boxes(img.copy(), s.sub_tablet_final.to_detection_list())
+        after_vis.draw_boxes(img.copy(), s.final_boxes)
 
         det_base = BboxVisualizer(color=(255, 0, 0))
-        det_base.draw_boxes(img.copy(), s.sub_tablet_detection.to_detection_list())
+        det_base.draw_boxes(img.copy(), s.det_boxes)
         det_final_ov = BboxVisualizer(color=(255, 255, 0))
-        det_final_ov.draw_boxes(det_base.result, s.sub_tablet_final.to_detection_list())
+        det_final_ov.draw_boxes(det_base.result, s.final_boxes)
 
         gt_base = BboxVisualizer(color=(0, 255, 0))
         gt_base.draw_boxes(img.copy(), s.gt_boxes_img or [])
         gt_final_ov = BboxVisualizer(color=(255, 255, 0))
-        gt_final_ov.draw_boxes(gt_base.result, s.sub_tablet_final.to_detection_list())
+        gt_final_ov.draw_boxes(gt_base.result, s.final_boxes)
 
         comp = CompositeVisualizer()
         comp.compose(
             images=[before_vis.result, after_vis.result, det_final_ov.result, gt_final_ov.result],
             layout=(2, 2),
             titles=[
-                f"Before PSR: Coarse Aligned ({len(s.sub_tablet_aligned)} signs)",
-                f"After PSR: Final Optimized ({len(s.sub_tablet_final)} signs)",
+                f"Before PSR: Coarse Aligned ({len(s.aligned_boxes)} signs)",
+                f"After PSR: Final Optimized ({len(s.final_boxes)} signs)",
                 "Overlay: Detection (red) + Final (yellow)",
                 "Overlay: GT (green) + Final (yellow)",
             ],
@@ -1102,11 +1160,11 @@ class StepParamChanges(Step):
             arr = param_changes[:, i]
             print(f"  Delta {label}: mean={arr.mean():.2f}, std={arr.std():.2f}, |max|={np.abs(arr).max():.2f}")
 
-        n = min(5, len(s.sub_tablet_aligned.sign_boxes))
+        n = min(5, len(s.aligned_boxes))
         print(f"\n=== First {n} Signs: Coarse -> Final ===")
         for i in range(n):
-            before = s.sub_tablet_aligned.sign_boxes[i]
-            after = s.sub_tablet_final.sign_boxes[i]
+            before = s.aligned_boxes[i]
+            after = s.final_boxes[i]
             print(f"  {i+1}. {before.sign_name}:")
             print(f"      Coarse: cx={before.cx:.1f}, cy={before.cy:.1f}, "
                   f"w={before.width:.1f}, h={before.height:.1f}")
@@ -1136,7 +1194,7 @@ class StepSetupCanonicalSigns(Step):
         s.canonical_cache = None
         s.canonical_meta = None
 
-        fragment_data = context.api_source.get_fragment_data(context.fragment_id)
+        fragment_data = context.config.api_source.get_fragment_data(s.fragment_id)
         period = fragment_data["script"]["period"]
 
         dift_cfg = context.config.dift
@@ -1222,7 +1280,7 @@ class StepSetupCanonicalSigns(Step):
 
         cfg = _dift_alignment_config(context.config)
         rows, missing, total = collect_detected_canonical_feature_rows(
-            s.sub_tablet_detection,
+            s.det_boxes,
             s.canonical_cache,
             max_signs=cfg.feature_viz_max_signs,
         )
@@ -1251,7 +1309,7 @@ step_load_data = StepLoadData()
 step_detect_signs = StepDetectSigns()
 step_transform_gt_to_img = StepTransformGtToImg()
 step_compute_statistics = StepComputeStatistics()
-step_create_subtablets = StepCreateSubTablets()
+step_create_box_sets = StepCreateBoxSets()
 step_detect_rows = StepDetectRows()
 step_match_rows = StepMatchRows()
 step_visualize_detection_rows = StepVisualizeDetectionRows()
@@ -1283,7 +1341,7 @@ DEBUG_STEPS = [
     step_detect_signs,
     step_transform_gt_to_img,
     step_compute_statistics,
-    step_create_subtablets,
+    step_create_box_sets,
     step_detect_rows,
     step_match_rows,
     step_visualize_detection_rows,
@@ -1306,7 +1364,7 @@ DEBUG_STEPS_WITH_DIFT = [
     step_detect_signs,
     step_transform_gt_to_img,
     step_compute_statistics,
-    step_create_subtablets,
+    step_create_box_sets,
     step_detect_rows,
     step_match_rows,
     step_visualize_detection_rows,
@@ -1331,7 +1389,7 @@ DEBUG_STEPS_WITH_DIFT = [
 # must still be handled by the caller between choose_crop() and run_all().
 PIPELINE_STEPS_PER_CROP = [
     step_transform_gt_to_img,
-    step_create_subtablets,
+    step_create_box_sets,
     step_detect_rows,
     step_match_rows,
     step_match_signs_in_rows,
@@ -1349,13 +1407,13 @@ class Runner:
         self.steps = steps
         self.vis = vis or VisOptions()
 
-        fragments = context.local_source.get_available_fragments()
+        fragments = context.config.local_source.get_available_fragments()
         self._fragments = fragments
         context.state.fragments = fragments
         print(f"Found {len(fragments)} fragments with both image and annotation")
 
         if self.vis.save:
-            os.makedirs(context.output_dir, exist_ok=True)
+            os.makedirs(context.config.output_dir, exist_ok=True)
 
     def run_single_step(self, step: Step):
         if self.vis.info:
@@ -1383,7 +1441,7 @@ class Runner:
 
     def choose_crop(self, crop_idx: int):
         self.context.config.img_idx = crop_idx
-        cropped = self.context.tablet_detector.get_cropped_images()
+        cropped = self.context.config.tablet_detector.get_cropped_images()
         if not cropped or self.context.state.detections is None:
             return
         if crop_idx < 0 or crop_idx >= len(cropped):
@@ -1391,5 +1449,6 @@ class Runner:
                 f"crop index {crop_idx} is out of range; "
                 f"available crop indices are 0..{len(cropped) - 1}"
             )
-        self.context.state.sub_image = cropped[crop_idx]
-        self.context.state.crop_info = self.context.tablet_detector.crop_coordinates[crop_idx]
+        self.context.state.subtablet = cropped[crop_idx]
+        self.context.state.det_boxes = self.context.config.tablet_detector.get_crop_boxes()[crop_idx]
+        self.context.state.crop_info = self.context.config.tablet_detector.crop_coordinates[crop_idx]

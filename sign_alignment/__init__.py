@@ -23,15 +23,10 @@ from .sign import (
     CLASSES_ABZ,
 )
 
-from .bounding_box import (
-    BoundingBox,
-    Detection,
-    GroundTruths,
-)
+from .box import Box, Boxes, boxes_in_crop
 
 from .detector import (
     ModelConfig,
-    SingleImage,
     BaseDetector,
     SingleImageDetector,
     TabletImageDetector,
@@ -48,11 +43,6 @@ from .visualizer import (
     build_sign_match_info,
 )
 
-from .heatmap import (
-    compute_avg_dimensions,
-    transform_gt_to_cropped_region,
-)
-
 from data_processing.line_process import (
     detect_rows_dbscan,
     compute_row_similarity,
@@ -63,15 +53,10 @@ from data_processing.line_process import (
     align_text_to_detection_rows,
 )
 
-from .tablet import (
-    SignBox,
-    SubTablet,
-)
+from .tablet import SubTablet
 
 from .psr_optimizer import (
     PointSetRegistrationOptimizer,
-    initialize_text_subtablet,
-    filter_boxes_by_mask,
 )
 
 from .hyperparam import (
@@ -96,14 +81,13 @@ __all__ = [
     'CLASSES_NAME',
     'CLASSES_ABZ',
     
-    # Bounding boxes
-    'BoundingBox',
-    'Detection',
-    'GroundTruths',
+    # Boxes
+    'Box',
+    'Boxes',
+    'boxes_in_crop',
     
     # Detection
     'ModelConfig',
-    'SingleImage',
     'BaseDetector',
     'SingleImageDetector',
     'TabletImageDetector',
@@ -115,10 +99,6 @@ __all__ = [
     'CompositeVisualizer',
     'build_sign_match_info',
     
-    # Geometry utilities
-    'compute_avg_dimensions',
-    'transform_gt_to_cropped_region',
-    
     # Line/row processing
     'detect_rows_dbscan',
     'compute_row_similarity',
@@ -128,14 +108,11 @@ __all__ = [
     'align_text_row_to_detection',
     'align_text_to_detection_rows',
     
-    # Tablet data structures
-    'SignBox',
+    # Tablet crop
     'SubTablet',
     
     # PSR Optimization
     'PointSetRegistrationOptimizer',
-    'initialize_text_subtablet',
-    'filter_boxes_by_mask',
 
     # Hyperparameter search
     'hyperparameter_search',

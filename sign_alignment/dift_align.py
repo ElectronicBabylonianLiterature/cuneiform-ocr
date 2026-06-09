@@ -27,7 +27,7 @@ import torch
 from PIL import Image
 
 from .sign import Sign, SignResolver
-from .tablet import SignBox, SubTablet
+from .box import Box, Boxes
 
 
 # ===========================================================================
@@ -484,7 +484,7 @@ class DiscoveryConfig(DiftAlignmentConfig):
 @dataclass
 class DiftAffineProbeResult:
     sign_name: str
-    sign_box: SignBox
+    sign_box: Box
     crop_img: np.ndarray
     crop_offset: Tuple[int, int]
     padded_bbox: Tuple[int, int, int, int]
@@ -498,7 +498,7 @@ class DiftAffineProbeResult:
 
 
 def _probe_result(
-    sb: SignBox,
+    sb: Box,
     crop_img: np.ndarray,
     crop_offset: Tuple[int, int],
     padded_bbox: Tuple[int, int, int, int],
@@ -560,15 +560,15 @@ def render_canonical_feature_grid(
 
 
 def collect_detected_canonical_feature_rows(
-    sub_tablet_detection: Optional[SubTablet],
+    boxes: Optional[Boxes],
     cache: Optional[CanonicalFeatureCache],
     max_signs: int = 12,
 ) -> Tuple[List[Tuple[str, CanonicalFeatureRecord]], List[str], int]:
-    if sub_tablet_detection is None or cache is None:
+    if boxes is None or cache is None:
         return [], [], 0
 
     detected_names = list(dict.fromkeys(
-        sb.sign_name for sb in sub_tablet_detection.sign_boxes
+        sb.sign_name for sb in boxes
     ))
     rows: List[Tuple[str, CanonicalFeatureRecord]] = []
     missing: List[str] = []
@@ -585,7 +585,7 @@ def collect_detected_canonical_feature_rows(
 
 def render_canonical_sign_overlay(
     image: np.ndarray,
-    subtablet: SubTablet,
+    boxes: Boxes,
     cache: CanonicalFeatureCache,
     max_boxes: Optional[int] = None,
     draw_boxes: bool = True,
@@ -600,10 +600,9 @@ def render_canonical_sign_overlay(
         "skipped": 0,
         "missing_names": [],
     }
-    if image is None or subtablet is None or cache is None:
+    if image is None or boxes is None or cache is None:
         return overlay, stats
 
-    boxes = subtablet.sign_boxes
     if max_boxes is not None:
         boxes = boxes[:max_boxes]
 
@@ -635,7 +634,7 @@ def render_canonical_sign_overlay(
 
 def build_dift_affine_probe(
     image: np.ndarray,
-    subtablet: SubTablet,
+    boxes: Boxes,
     cache: CanonicalFeatureCache,
     padding_ratio: float = 0.2,
     max_boxes: Optional[int] = None,
@@ -644,11 +643,10 @@ def build_dift_affine_probe(
     ransac_threshold: Optional[float] = None,
 ) -> List[DiftAffineProbeResult]:
     """Estimate canonical-to-crop affine transforms for current sign boxes."""
-    if image is None or subtablet is None or cache is None:
+    if image is None or boxes is None or cache is None:
         return []
 
     results: List[DiftAffineProbeResult] = []
-    boxes = subtablet.sign_boxes
     if max_boxes is not None:
         boxes = boxes[:max_boxes]
 
@@ -685,21 +683,11 @@ def build_dift_affine_probe(
 
 def crop_sign_box(
     image: np.ndarray,
-    sb: SignBox,
+    sb: Box,
     padding_ratio: float,
 ) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int, int, int]]:
-    h, w = image.shape[:2]
-    pad_x = sb.width * padding_ratio
-    pad_y = sb.height * padding_ratio
-    x1 = int(max(0, np.floor(sb.x1 - pad_x)))
-    y1 = int(max(0, np.floor(sb.y1 - pad_y)))
-    x2 = int(min(w, np.ceil(sb.x2 + pad_x)))
-    y2 = int(min(h, np.ceil(sb.y2 + pad_y)))
-    if x2 <= x1:
-        x2 = min(w, x1 + 1)
-    if y2 <= y1:
-        y2 = min(h, y1 + 1)
-    return image[y1:y2, x1:x2].copy(), (x1, y1), (x1, y1, x2, y2)
+    x1, y1, x2, y2 = sb.crop_bounds(image.shape, padding_ratio)
+    return sb.crop_image(image, padding_ratio), (x1, y1), (x1, y1, x2, y2)
 
 
 def estimate_dift_affine(
@@ -754,14 +742,14 @@ _CENTER_LINK_COLOR = (235, 235, 235)
 
 def render_dift_affine_probe(
     image: np.ndarray,
-    subtablet: SubTablet,
+    boxes: Boxes,
     results: List[DiftAffineProbeResult],
     iteration: Optional[int],
     thumb: int = 128,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Return (overlay image, per-box grid image) for affine diagnostics."""
     overlay = _to_bgr(image).copy()
-    for sb in subtablet.sign_boxes:
+    for sb in boxes:
         _draw_sign_box(overlay, sb, _OPTIMIZED_BBOX_COLOR,
                        draw_label=True, thickness=2)
     for res in results:
@@ -921,7 +909,7 @@ def _affine_with_offset(
 
 def _draw_local_bbox(
     img: np.ndarray,
-    sb: SignBox,
+    sb: Box,
     offset: Tuple[int, int],
     color: Tuple[int, int, int] = _OPTIMIZED_BBOX_COLOR,
 ) -> np.ndarray:
@@ -932,7 +920,7 @@ def _draw_local_bbox(
 
 def _draw_local_bbox_inplace(
     out: np.ndarray,
-    sb: SignBox,
+    sb: Box,
     offset: Tuple[int, int],
     color: Tuple[int, int, int],
 ) -> None:
@@ -944,7 +932,7 @@ def _draw_local_bbox_inplace(
 
 def _draw_sign_box(
     out: np.ndarray,
-    sb: SignBox,
+    sb: Box,
     color: Tuple[int, int, int],
     draw_label: bool = True,
     thickness: int = 1,
@@ -960,7 +948,7 @@ def _draw_sign_box(
 def _paste_canonical_into_box(
     out: np.ndarray,
     canonical_img: np.ndarray,
-    sb: SignBox,
+    sb: Box,
 ) -> bool:
     img_h, img_w = out.shape[:2]
     x1 = int(np.floor(sb.x1))

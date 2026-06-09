@@ -25,7 +25,7 @@ from sign_alignment import (
     LocalTestDataSource,
     SubtabletEBLAPISource,
     ModelConfig, TabletImageDetector,
-    BoundingBox, Detection, GroundTruths,
+    Box, Boxes,
     hyperparameter_search,
 )
 from sign_alignment.visualizer import ColorConfig
@@ -90,8 +90,8 @@ DEFAULT_PREDICTION_MODE = PredictionMode.PSR
 
 # ============ IoU & Metrics ============
 
-def compute_iou(box_a: BoundingBox, box_b: BoundingBox) -> float:
-    """Compute IoU between two BoundingBox objects."""
+def compute_iou(box_a: Box, box_b: Box) -> float:
+    """Compute IoU between two Box objects."""
     x1 = max(box_a.x1, box_b.x1)
     y1 = max(box_a.y1, box_b.y1)
     x2 = min(box_a.x2, box_b.x2)
@@ -107,7 +107,7 @@ def compute_iou(box_a: BoundingBox, box_b: BoundingBox) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def compute_iou_matrix(preds: Detection, gts: GroundTruths) -> np.ndarray:
+def compute_iou_matrix(preds: Boxes, gts: Boxes) -> np.ndarray:
     """Compute IoU matrix of shape (len(preds), len(gts))."""
     n_pred = len(preds)
     n_gt = len(gts)
@@ -119,8 +119,8 @@ def compute_iou_matrix(preds: Detection, gts: GroundTruths) -> np.ndarray:
 
 
 def match_predictions_to_gt(
-    preds: Detection,
-    gts: GroundTruths,
+    preds: Boxes,
+    gts: Boxes,
     iou_threshold: float = 0.5,
     class_agnostic: bool = False,
 ) -> Dict:
@@ -129,8 +129,8 @@ def match_predictions_to_gt(
     Each GT box is matched to at most one prediction (greedy, highest IoU first).
 
     Args:
-        preds: Predicted BoundingBox list
-        gts: Ground truth BoundingBox list
+        preds: Predicted Box list
+        gts: Ground truth Box list
         iou_threshold: IoU threshold for a match
         class_agnostic: If False, pred and GT must share the same sign name
 
@@ -194,8 +194,8 @@ def compute_precision_recall(tp: int, fp: int, fn: int) -> Tuple[float, float]:
 
 
 def _compute_coco_class_ap(
-    preds_sorted: List[Tuple[str, 'BoundingBox']],
-    gts_by_image: Dict[str, List['BoundingBox']],
+    preds_sorted: List[Tuple[str, 'Box']],
+    gts_by_image: Dict[str, List['Box']],
     total_gt: int,
     iou_threshold: float,
 ) -> Tuple[float, int, int, int, List[float]]:
@@ -397,8 +397,8 @@ def _get_eval_font(size: int):
 def visualize_evaluation_fragment(
     img: np.ndarray,
     fragment_id: str,
-    preds: Detection,
-    gts: GroundTruths,
+    preds: Boxes,
+    gts: Boxes,
     iou_threshold: float = 0.5,
     class_agnostic: bool = True,
     output_dir: str = EVAL_OUTPUT_DIR,
@@ -524,20 +524,20 @@ def visualize_evaluation_fragment(
 # ============ Prediction & Evaluation Runner ============
 
 def _nms_predictions(
-    preds: List[BoundingBox],
+    preds: List[Box],
     iou_threshold: float = 0.5,
-) -> List[BoundingBox]:
+) -> List[Box]:
     """
     Per-class non-maximum suppression.
 
     Suppresses duplicate predictions (e.g. from overlapping crops) that share
     the same class and have IoU >= iou_threshold. Keeps the higher-score box.
     """
-    by_class: Dict[str, List[BoundingBox]] = defaultdict(list)
+    by_class: Dict[str, List[Box]] = defaultdict(list)
     for p in preds:
         by_class[p.sign.name].append(p)
 
-    kept: List[BoundingBox] = []
+    kept: List[Box] = []
     for boxes in by_class.values():
         boxes = sorted(boxes, key=lambda b: -b.score)
         suppressed = [False] * len(boxes)
@@ -559,7 +559,7 @@ def _load_and_detect_fragment(runner: Runner, context: CropContext, fid: str) ->
     skipped (missing data, empty GT/detections, etc.).
     """
     context.state = SampleState()
-    context.fragment_id = fid
+    context.state.fragment_id = fid
 
     runner.run_single_step(step_load_data)
 
@@ -570,7 +570,7 @@ def _load_and_detect_fragment(runner: Runner, context: CropContext, fid: str) ->
     # Filter out abnormally large GT boxes (e.g. sub-tablet region annotations)
     areas = [b.width * b.height for b in s.gt_boxes]
     mean_area = np.mean(areas)
-    s.gt_boxes = [b for b, a in zip(s.gt_boxes, areas) if a <= mean_area * 5]
+    s.gt_boxes = Boxes(b for b, a in zip(s.gt_boxes, areas) if a <= mean_area * 5)
     if not s.gt_boxes:
         return False
 
@@ -588,7 +588,7 @@ def _predict_detection_crops(
     fid: str,
     visualize: bool = False,
     output_dir: str = EVAL_OUTPUT_DIR,
-) -> List[BoundingBox]:
+) -> List[Box]:
     """
     Collect raw detection model outputs across all crops, offset to full image coordinates.
 
@@ -596,14 +596,14 @@ def _predict_detection_crops(
     Optionally saves a per-fragment evaluation visualization.
     """
     s = context.state
-    raw_preds: List[BoundingBox] = []
-    for crop_idx in range(len(context.tablet_detector.get_cropped_images())):
+    raw_preds: List[Box] = []
+    for crop_idx in range(len(context.config.tablet_detector.get_cropped_images())):
         runner.choose_crop(crop_idx)
-        if not s.sub_image.detections:
+        if not s.det_boxes:
             continue
         ox, oy = s.crop_info['x'], s.crop_info['y']
-        for det in s.sub_image.detections:
-            raw_preds.append(BoundingBox(
+        for det in s.det_boxes:
+            raw_preds.append(Box(
                 x1=det.x1 + ox, y1=det.y1 + oy,
                 x2=det.x2 + ox, y2=det.y2 + oy,
                 score=det.score, sign=det.sign,
@@ -632,7 +632,7 @@ def _predict_psr_crops(
     fid: str,
     visualize: bool = False,
     output_dir: str = EVAL_OUTPUT_DIR,
-) -> List[BoundingBox]:
+) -> List[Box]:
     """
     Run the full PSR alignment pipeline across all crops and return optimized boxes
     offset to full image coordinates.
@@ -641,18 +641,18 @@ def _predict_psr_crops(
     Optionally saves a per-fragment evaluation visualization.
     """
     s = context.state
-    preds: List[BoundingBox] = []
-    for crop_idx in range(len(context.tablet_detector.get_cropped_images())):
+    preds: List[Box] = []
+    for crop_idx in range(len(context.config.tablet_detector.get_cropped_images())):
         runner.choose_crop(crop_idx)
-        if not s.sub_image.detections:
+        if not s.det_boxes:
             continue
         runner.run_all()
-        if not s.sub_tablet_detection.get_rows() or not s.matches or not s.sub_tablet_aligned:
+        if not s.det_rows or not len(s.det_rows) or not s.matches or not s.aligned_boxes:
             continue
 
         ox, oy = s.crop_info['x'], s.crop_info['y']
-        for sb in s.sub_tablet_final.sign_boxes:
-            preds.append(BoundingBox(
+        for sb in s.final_boxes:
+            preds.append(Box(
                 x1=sb.x1 + ox, y1=sb.y1 + oy,
                 x2=sb.x2 + ox, y2=sb.y2 + oy,
                 score=sb.score, sign=sb.sign,
@@ -696,7 +696,7 @@ def run_predictions(
 
     Returns:
         Tuple of (all_results, skipped) where all_results is a list of dicts with
-        keys 'fragment_id', 'preds' (List[BoundingBox]), 'gts' (List[BoundingBox]).
+        keys 'fragment_id', 'preds' (List[Box]), 'gts' (List[Box]).
     """
     context.config.psr_params = psr_params  # None = step defaults
     vis = VisOptions(info=False, display=False, save=False)
