@@ -3,7 +3,7 @@ import json
 import os
 from dotenv import load_dotenv
 
-from sign_alignment import LocalDataSource, ModelConfig, TabletImageDetector, Box, TextVisualizer
+from sign_alignment import LocalDataSource, ModelConfig, TabletImageDetector, TextVisualizer
 from sign_alignment.visualizer import ColorConfig
 from sign_alignment.pipeline import (
     CropContext, PipelineConfig, SampleState, Runner, VisOptions,
@@ -52,7 +52,7 @@ if __name__ == "__main__":
 
         s = context.state
         all_optimized_full = []
-        for crop_idx in range(len(tablet_detector.get_cropped_images())):
+        for crop_idx in range(len(tablet_detector.get_crop_tablets())):
             crop_runner.choose_crop(crop_idx)
             if not s.det_boxes:
                 continue
@@ -61,13 +61,8 @@ if __name__ == "__main__":
                 continue
             crop_runner.run_single_step(step_results_comparison)
 
-            ox, oy = s.crop_info['x'], s.crop_info['y']
             for sb in s.final_boxes:
-                all_optimized_full.append(Box(
-                    x1=sb.x1 + ox, y1=sb.y1 + oy,
-                    x2=sb.x2 + ox, y2=sb.y2 + oy,
-                    score=sb.score, sign=sb.sign,
-                ))
+                all_optimized_full.append(sb.to_tablet(s.tablet))
 
         TextVisualizer.save_text(
             s.text_lines,

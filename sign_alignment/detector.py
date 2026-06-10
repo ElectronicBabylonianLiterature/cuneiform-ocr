@@ -13,7 +13,7 @@ from data_processing.divide_photos import divide_tablet_photo
 
 from .sign import SignResolver
 from .box import Box, Boxes
-from .tablet import SubTablet
+from .tablet import SubTablet, Tablet
 
 @dataclass
 class ModelConfig:
@@ -38,7 +38,7 @@ class BaseDetector(ABC):
             raise ValueError("Either model_config or model must be provided")
     
     @abstractmethod
-    def detect(self, img) -> Boxes:
+    def detect(self, tablet: Tablet) -> Boxes:
         pass
     
     def _select_device(self, device: str):
@@ -59,13 +59,13 @@ class BaseDetector(ABC):
             torch.cuda.empty_cache()
         print("Detector model unloaded from GPU.")
 
-    def _filter_detections(self, labels, bboxes, scores) -> Boxes:
+    def _filter_detections(self, labels, bboxes, scores, tablet: Tablet) -> Boxes:
         mask = scores > self.score_threshold
         labels = labels[mask]
         bboxes = bboxes[mask]
         scores = scores[mask]
         
-        detections = Boxes()
+        detections = Boxes(tablet=tablet)
         for i in range(len(labels)):
             bbox = bboxes[i]
             sign = SignResolver.from_idx(labels[i])
@@ -75,21 +75,22 @@ class BaseDetector(ABC):
                 x2=float(bbox[2]),
                 y2=float(bbox[3]),
                 score=float(scores[i]),
-                sign=sign
+                sign=sign,
+                tablet=tablet,
             ))
         
         return detections
 
 class SingleImageDetector(BaseDetector):
-    def detect(self, img) -> Boxes:
-        result = inference_detector(self.model, img)
+    def detect(self, tablet: Tablet) -> Boxes:
+        result = inference_detector(self.model, tablet.img)
         OCR_result = result.pred_instances.cpu()
         
         labels = OCR_result['labels'].numpy()
         bboxes = OCR_result['bboxes'].numpy()
         scores = OCR_result['scores'].numpy()
         
-        return self._filter_detections(labels, bboxes, scores)
+        return self._filter_detections(labels, bboxes, scores, tablet)
     
 class TabletImageDetector(BaseDetector):
     def __init__(self, model_config: ModelConfig, score_threshold: float = 0.5, 
@@ -99,30 +100,36 @@ class TabletImageDetector(BaseDetector):
         self.logging_crop = logging_crop
         self.keep_crops = keep_crops
         self.is_crop_itself = is_crop_itself
-        self.cropped_images = []
+        self.crop_tablets = []
         self.crop_boxes = []
         self.crop_coordinates = []
         
     
-    def detect(self, img) -> Boxes:
+    def detect(self, tablet: Tablet) -> Boxes:
         if self.keep_crops:
-            self.cropped_images = []
+            self.crop_tablets = []
             self.crop_boxes = []
 
         if self.is_crop_itself:
-            h, w = img.shape[:2]
+            h, w = tablet.shape
             self.crop_coordinates = [{'x': 0, 'y': 0, 'w': w, 'h': h}]
             single_detector = SingleImageDetector(model=self.model, score_threshold=self.score_threshold)
-            detections = single_detector.detect(img)
+            detections = single_detector.detect(tablet)
             if self.keep_crops:
-                mask = np.full((h, w), 255, dtype=np.uint8)
-                subtablet = SubTablet(img=img, mask=mask, name="crop_0")
-                self.cropped_images.append(subtablet)
-                self.crop_boxes.append(detections.copy(subtablet=subtablet))
+                crop_tablet = SubTablet(
+                    img=tablet.img,
+                    parent=tablet,
+                    offset_in_parent=(0.0, 0.0),
+                    mask=np.full((h, w), 255, dtype=np.uint8),
+                    name="crop_0",
+                )
+                crop_detections = detections.to_tablet(crop_tablet)
+                self.crop_tablets.append(crop_tablet)
+                self.crop_boxes.append(crop_detections)
             return detections
 
         cropped_images, crop_coordinates, masks = divide_tablet_photo(
-            img, 
+            tablet.img,
             visualize=self.visualize_crop, 
             logging=self.logging_crop, 
             return_coordinates=True,
@@ -133,34 +140,31 @@ class TabletImageDetector(BaseDetector):
         
         single_detector = SingleImageDetector(model=self.model, score_threshold=self.score_threshold)
         
-        all_detections = Boxes()
+        all_detections = Boxes(tablet=tablet)
         
         for idx, img_piece in enumerate(cropped_images):
-            piece_detections = single_detector.detect(img_piece)
-
-            if self.keep_crops:
-                subtablet = SubTablet(img=img_piece, mask=masks[idx], name=f"crop_{idx}")
-                self.cropped_images.append(subtablet)
-                self.crop_boxes.append(piece_detections.copy(subtablet=subtablet))
-            
             piece_offset_x = crop_coordinates[idx]['x']
             piece_offset_y = crop_coordinates[idx]['y']
+            crop_tablet = SubTablet(
+                img=img_piece,
+                parent=tablet,
+                offset_in_parent=(piece_offset_x, piece_offset_y),
+                name=f"crop_{idx}",
+                mask=masks[idx],
+            )
+            piece_detections = single_detector.detect(crop_tablet)
+
+            if self.keep_crops:
+                self.crop_tablets.append(crop_tablet)
+                self.crop_boxes.append(piece_detections)
             
             for det in piece_detections:
-                transformed_det = Box(
-                    x1=det.x1 + piece_offset_x,
-                    y1=det.y1 + piece_offset_y,
-                    x2=det.x2 + piece_offset_x,
-                    y2=det.y2 + piece_offset_y,
-                    score=det.score,
-                    sign=det.sign
-                )
-                all_detections.append(transformed_det)
+                all_detections.append(det.to_tablet(tablet))
         
         return all_detections
     
-    def get_cropped_images(self) -> List[SubTablet]:
-        return self.cropped_images
+    def get_crop_tablets(self) -> List[SubTablet]:
+        return self.crop_tablets
 
     def get_crop_boxes(self) -> List[Boxes]:
         return self.crop_boxes

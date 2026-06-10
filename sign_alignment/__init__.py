@@ -6,14 +6,14 @@ between images and text transcriptions.
 """
 
 from .data_source import (
+    CanonicalSignSource,
+    EBLMongoCanonicalSource,
     LocalDataSource,
     LocalTestDataSource,
     EBLAPISource,
     SubtabletEBLAPISource,
     SignTextParser,
     SignAPIResolver,
-    create_local_source,
-    create_api_source,
 )
 
 from .sign import (
@@ -53,7 +53,7 @@ from data_processing.line_process import (
     align_text_to_detection_rows,
 )
 
-from .tablet import SubTablet
+from .tablet import SubTablet, Tablet
 
 from .psr_optimizer import (
     PointSetRegistrationOptimizer,
@@ -66,14 +66,14 @@ from .hyperparam import (
 
 __all__ = [
     # Data sources
+    'CanonicalSignSource',
+    'EBLMongoCanonicalSource',
     'LocalDataSource',
     'LocalTestDataSource',
     'EBLAPISource',
     'SubtabletEBLAPISource',
     'SignTextParser',
     'SignAPIResolver',
-    'create_local_source',
-    'create_api_source',
     
     # Sign utilities
     'Sign',
@@ -108,7 +108,8 @@ __all__ = [
     'align_text_row_to_detection',
     'align_text_to_detection_rows',
     
-    # Tablet crop
+    # Tablet image frames
+    'Tablet',
     'SubTablet',
     
     # PSR Optimization

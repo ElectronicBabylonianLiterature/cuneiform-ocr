@@ -1,24 +1,9 @@
-"""DIFT utilities for canonical sign features and alignment diagnostics.
-
-The active pipeline uses DIFT only for diagnostics:
-
-    1. Pre-compute DIFT features for the canonical sign inventory.
-    2. Optionally visualize canonical feature maps for detected signs.
-    3. At selected pipeline points, crop the current PSR boxes from the tablet
-       image and estimate a ProtoSnap-style affine transform from the matching
-       canonical sign to each crop.  These transforms are visualized only; they
-       do not change the optimization state or loss.
-"""
+"""DIFT feature cache and alignment diagnostics."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-import base64
 from dataclasses import dataclass
-import hashlib
-import io
 from pathlib import Path
-import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import cv2
@@ -28,250 +13,11 @@ from PIL import Image
 
 from .sign import Sign, SignResolver
 from .box import Box, Boxes
+from .data_source import CanonicalSignSource
 
-
-# ===========================================================================
-# Canonical sign source — where the canonical image comes from.
-# ===========================================================================
-
-class CanonicalSignSource(ABC):
-    """Registry of canonical images per Sign + a stable id for caching."""
-
-    @abstractmethod
-    def is_ready(self) -> bool: ...
-
-    @abstractmethod
-    def get_image(self, sign: Sign) -> Optional[np.ndarray]:
-        """Canonical image (grayscale uint8) for `sign`, already preprocessed."""
-
-    @abstractmethod
-    def get_id(self, sign: Sign) -> Optional[str]:
-        """Stable cache key for this sign (returns None if not served)."""
-
-    @abstractmethod
-    def list_sign_names(self) -> List[str]:
-        """Names of every sign this source can serve.
-
-        Used for eager full-inventory precomputation. Empty list = no signs.
-        """
-
-    def cache_namespace(self) -> str:
-        return type(self).__name__
-
-    def cache_file_stem(self, sign: Sign) -> Optional[str]:
-        sid = self.get_id(sign)
-        return _safe_cache_part(sid) if sid else None
-
-    def describe(self) -> str:
-        return type(self).__name__
-
-
-def _safe_cache_part(value: Optional[str]) -> str:
-    if not value:
-        return "none"
-    text = str(value)
-    readable = re.sub(r"[^\w.@+-]+", "_", text, flags=re.UNICODE).strip("_")
-    readable = readable[:80] or "value"
-    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
-    return f"{readable}_{digest}"
-
-
-def _decode_base64_image(image: str) -> np.ndarray:
-    if not image:
-        raise ValueError("empty image payload")
-    if image.startswith("data:image/"):
-        image = image.split(",", 1)[1]
-    raw = base64.b64decode(image)
-    pil = Image.open(io.BytesIO(raw)).convert("L")
-    return np.asarray(pil)
-
-
-class EBLMongoCanonicalSource(CanonicalSignSource):
-    """Canonical sign source backed by eBL's MongoDB annotations.
-
-    The source mirrors the /signs/{name}/images API path:
-    annotations -> fragments -> cropped_sign_images.  It keeps only images
-    for the requested fragment period and PCA form, normally canonical1.
-    """
-
-    def __init__(
-        self,
-        mongodb_uri: str,
-        period: Optional[str],
-        db_name: str = "ebl",
-        form: str = "canonical1",
-        require_centroid: bool = True,
-    ):
-        self.mongodb_uri = mongodb_uri
-        self.period = period
-        self.db_name = db_name
-        self.form = form
-        self.require_centroid = require_centroid
-        self._items_by_sign: Dict[str, Dict[str, Any]] = {}
-        self._images_by_sign: Dict[str, np.ndarray] = {}
-        self._ready = False
-        self._load()
-
-    def is_ready(self) -> bool:
-        return self._ready
-
-    def get_image(self, sign: Sign) -> Optional[np.ndarray]:
-        return self._images_by_sign.get(sign.name)
-
-    def get_id(self, sign: Sign) -> Optional[str]:
-        if sign.name not in self._items_by_sign:
-            return None
-        return f"ebl/{self.period or 'period-missing'}/{self.form}/{sign.name}"
-
-    def list_sign_names(self) -> List[str]:
-        return sorted(self._items_by_sign)
-
-    def cache_namespace(self) -> str:
-        return f"ebl-mongo:{self.period or 'period-missing'}:{self.form}"
-
-    def cache_file_stem(self, sign: Sign) -> Optional[str]:
-        if sign.name not in self._items_by_sign:
-            return None
-        return "__".join(
-            _safe_cache_part(part)
-            for part in (sign.name, self.period or "period-missing", self.form)
-        )
-
-    def describe(self) -> str:
-        return (
-            f"eBL Mongo source period={self.period!r}, form={self.form!r}, "
-            f"canonical_images={len(self._items_by_sign)}"
-        )
-
-    def _load(self) -> None:
-        if not self.mongodb_uri or self.mongodb_uri == "YOUR_MONGODB_URI":
-            raise ValueError("MONGODB_URI is not configured")
-
-        from pymongo import MongoClient
-
-        client = MongoClient(self.mongodb_uri)
-        try:
-            docs = list(
-                client[self.db_name]["annotations"].aggregate(
-                    self._pipeline(), allowDiskUse=True
-                )
-            )
-        finally:
-            client.close()
-
-        for item in docs:
-            sign_name = item.get("signName")
-            if not sign_name:
-                raise ValueError(f"annotation without signName: {item}")
-            img = _decode_base64_image(item.get("image", ""))
-            if sign_name not in self._items_by_sign:
-                self._items_by_sign[sign_name] = item
-                self._images_by_sign[sign_name] = img
-
-        self._ready = bool(self._items_by_sign)
-        if not self._ready:
-            period_msg = f" for period {self.period!r}" if self.period else ""
-            raise RuntimeError(f"no {self.form!r} canonical images found{period_msg}")
-
-    def _pipeline(self) -> List[Dict[str, Any]]:
-        annotation_conditions: List[Dict[str, Any]] = [
-            {"$eq": ["$$annotation.data.type", "HasSign"]},
-            {"$eq": ["$$annotation.pcaClustering.form", self.form]},
-            {
-                "$ne": [
-                    {"$ifNull": ["$$annotation.croppedSign.imageId", None]},
-                    None,
-                ]
-            },
-        ]
-        if self.require_centroid:
-            annotation_conditions.append(
-                {"$eq": ["$$annotation.pcaClustering.isCentroid", True]}
-            )
-
-        pipeline: List[Dict[str, Any]] = [
-            {
-                "$match": {
-                    "annotations.pcaClustering.form": self.form,
-                    "annotations.croppedSign.imageId": {"$exists": True},
-                }
-            },
-            {
-                "$lookup": {
-                    "from": "fragments",
-                    "localField": "fragmentNumber",
-                    "foreignField": "_id",
-                    "as": "fragment",
-                }
-            },
-            {"$unwind": "$fragment"},
-        ]
-        if self.period:
-            pipeline.append({"$match": {"fragment.script.period": self.period}})
-
-        pipeline.extend(
-            [
-                {
-                    "$project": {
-                        "fragmentNumber": 1,
-                        "annotations": {
-                            "$filter": {
-                                "input": "$annotations",
-                                "as": "annotation",
-                                "cond": {"$and": annotation_conditions},
-                            }
-                        },
-                        "date": "$fragment.date",
-                        "period": "$fragment.script.period",
-                        "script": "$fragment.script",
-                        "provenance": "$fragment.archaeology.site",
-                    }
-                },
-                {"$unwind": "$annotations"},
-                {
-                    "$lookup": {
-                        "from": "cropped_sign_images",
-                        "localField": "annotations.croppedSign.imageId",
-                        "foreignField": "_id",
-                        "as": "imageDoc",
-                    }
-                },
-                {"$unwind": "$imageDoc"},
-                {
-                    "$project": {
-                        "_id": 0,
-                        "fragmentNumber": 1,
-                        "signName": "$annotations.data.signName",
-                        "image": "$imageDoc.image",
-                        "script": 1,
-                        "period": 1,
-                        "label": "$annotations.croppedSign.label",
-                        "date": 1,
-                        "provenance": 1,
-                        "annotationId": "$annotations.data.id",
-                        "pcaClustering": "$annotations.pcaClustering",
-                    }
-                },
-                {
-                    "$sort": {
-                        "signName": 1,
-                        "pcaClustering.isMain": -1,
-                        "pcaClustering.clusterSize": -1,
-                        "pcaClustering.clusterRank": 1,
-                    }
-                },
-            ]
-        )
-        return pipeline
-
-
-# ===========================================================================
-# DIFT feature cache + eager full-inventory precompute
-# ===========================================================================
 
 @dataclass
 class CanonicalFeatureRecord:
-    """One canonical sign's DIFT features + source image."""
     feature_map: torch.Tensor          # (C, 64, 64), L2-normalized on C
     img: np.ndarray                    # original canonical image (uint8 gray)
     img_size: Tuple[int, int]          # (H, W) of canonical image
@@ -280,13 +26,6 @@ class CanonicalFeatureRecord:
 
 
 class CanonicalFeatureCache:
-    """DIFT feature cache for canonical signs.
-
-    Features are stored on CPU in fp16 and copied to the active device only
-    during scoring. This keeps the full canonical inventory searchable without
-    keeping every feature map resident on GPU.
-    """
-
     def __init__(self, source: CanonicalSignSource, wrapper, img_size: int = 512,
                  store_device: str = "cpu", store_dtype: torch.dtype = torch.float16,
                  disk_dir: Optional[str] = None):
@@ -304,8 +43,6 @@ class CanonicalFeatureCache:
     def __len__(self) -> int:
         return len(self._cache)
 
-    # ---- single-sign lookup (back-compat / on-demand) -----------------
-
     def get(self, sign: Sign) -> Optional[CanonicalFeatureRecord]:
         sid = self.source.get_id(sign)
         if not sid:
@@ -320,8 +57,6 @@ class CanonicalFeatureCache:
             self._save_to_disk(sign, rec)
         return self._remember(sid, rec)
 
-    # ---- eager full-inventory precompute -------------------------------
-
     def precompute_all(self, verbose: bool = True,
                        limit: Optional[int] = None,
                        progress_every: int = 50) -> Dict[str, int]:
@@ -332,7 +67,7 @@ class CanonicalFeatureCache:
     def precompute(self, sign_names: Iterable[str], verbose: bool = True,
                    limit: Optional[int] = None,
                    progress_every: int = 50) -> Dict[str, int]:
-        names = list(dict.fromkeys(sign_names))  # de-dup, preserve order
+        names = list(dict.fromkeys(sign_names))
         if limit is not None:
             names = names[:limit]
 
@@ -431,10 +166,8 @@ class CanonicalFeatureCache:
             raise KeyError(f"{sign.name} has no canonical image")
         with torch.no_grad():
             fm = self.wrapper.featurize(Image.fromarray(_to_rgb(img)))
-        # Move to CPU + fp16 so all 900 features fit in RAM, not VRAM.
         fm_cpu = fm.detach().to(device=self.store_device, dtype=self.store_dtype,
                                 non_blocking=False)
-        # Free GPU memory eagerly between featurizations.
         del fm
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -453,18 +186,8 @@ class CanonicalFeatureCache:
         return len(self._cache) > 0
 
 
-# ===========================================================================
-# DIFT alignment diagnostics
-# ===========================================================================
-
 @dataclass
 class DiftAlignmentConfig:
-    """Configuration for canonical DIFT diagnostics.
-
-    In the default DIFT debug pipeline, `affine_probe_iteration` controls how
-    many PSR optimizer updates run before the standalone affine-probe step.
-    """
-
     precompute_limit: Optional[int] = None
     feature_viz_max_signs: int = 12
     affine_probe_iteration: Optional[int] = 10
@@ -475,10 +198,6 @@ class DiftAlignmentConfig:
     affine_probe_ransac_threshold: Optional[float] = None
     affine_probe_thumb: int = 128
     canonical_overlay_max_boxes: Optional[int] = None
-
-
-class DiscoveryConfig(DiftAlignmentConfig):
-    """Backward-compatible alias for older notebooks/configs."""
 
 
 @dataclass
@@ -633,7 +352,6 @@ def render_canonical_sign_overlay(
 
 
 def build_dift_affine_probe(
-    image: np.ndarray,
     boxes: Boxes,
     cache: CanonicalFeatureCache,
     padding_ratio: float = 0.2,
@@ -643,7 +361,7 @@ def build_dift_affine_probe(
     ransac_threshold: Optional[float] = None,
 ) -> List[DiftAffineProbeResult]:
     """Estimate canonical-to-crop affine transforms for current sign boxes."""
-    if image is None or boxes is None or cache is None:
+    if boxes is None or cache is None:
         return []
 
     results: List[DiftAffineProbeResult] = []
@@ -651,7 +369,7 @@ def build_dift_affine_probe(
         boxes = boxes[:max_boxes]
 
     for sb in boxes:
-        crop, offset, padded_bbox = crop_sign_box(image, sb, padding_ratio)
+        crop, offset, padded_bbox = crop_sign_box(sb, padding_ratio)
         rec = cache.get(sb.sign)
         if rec is None:
             results.append(_probe_result(sb, crop, offset, padded_bbox, message="missing canonical"))
@@ -682,12 +400,12 @@ def build_dift_affine_probe(
 
 
 def crop_sign_box(
-    image: np.ndarray,
     sb: Box,
     padding_ratio: float,
 ) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int, int, int]]:
-    x1, y1, x2, y2 = sb.crop_bounds(image.shape, padding_ratio)
-    return sb.crop_image(image, padding_ratio), (x1, y1), (x1, y1, x2, y2)
+    crop = sb.crop_image(padding_ratio)
+    x1, y1, x2, y2 = sb.crop_bounds(padding_ratio)
+    return crop, (x1, y1), (x1, y1, x2, y2)
 
 
 def estimate_dift_affine(

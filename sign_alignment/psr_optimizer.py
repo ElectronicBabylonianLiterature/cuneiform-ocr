@@ -129,11 +129,10 @@ class PointSetRegistrationOptimizer:
             raise ValueError("PointSetRegistrationOptimizer requires source_rows")
 
         self.rows = [list(row) for row in source_rows if row]
-        source_subtablet = next(
-            (box.subtablet for row in self.rows for box in row if box.subtablet is not None),
-            None,
-        )
-        self.source_boxes = Boxes((box for row in self.rows for box in row), subtablet=source_subtablet)
+        if not self.rows:
+            raise ValueError("PointSetRegistrationOptimizer requires non-empty source_rows")
+        self.source_tablet = self.rows[0][0].tablet
+        self.source_boxes = Boxes((box for row in self.rows for box in row), tablet=self.source_tablet)
 
         # ---- Contour mask for boundary loss ------------------------------
         if contour_mask is not None and lambda_boundary > 0:
@@ -169,7 +168,7 @@ class PointSetRegistrationOptimizer:
         self.M = len(self.source_boxes_flat)
 
         # ---- Target point set X (detections) -----------------------------
-        self.target_detections = Boxes(target_detections or [])
+        self.target_detections = target_detections or Boxes(tablet=self.source_tablet)
         self.N = len(self.target_detections)
 
         target_pos = []
@@ -715,12 +714,13 @@ class PointSetRegistrationOptimizer:
         """Build the current optimised boxes."""
         p = self.params.detach().cpu().numpy()
 
-        boxes = Boxes(subtablet=self.source_boxes.subtablet)
+        boxes = Boxes(tablet=self.source_boxes.tablet)
         for i, sb in enumerate(self.source_boxes_flat):
-            boxes.append(Box(
+            boxes.append(Box.from_center(
                 sign=sb.sign, score=sb.score,
                 cx=float(p[i, 0]), cy=float(p[i, 1]),
                 width=float(p[i, 2]), height=float(p[i, 3]),
+                tablet=self.source_boxes.tablet,
             ))
         return boxes
 

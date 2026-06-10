@@ -1,28 +1,238 @@
-
+import base64
+import hashlib
+import io
 import json
 import os
 import re
-from typing import List, Optional, Tuple
 from pathlib import Path
-import cv2
-import requests
-from .sign import SignResolver
+from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
+import numpy as np
+import requests
+from PIL import Image
+
+from .sign import Sign, SignResolver
 from .box import Box, Boxes
+from .tablet import Tablet
+
+
+def _safe_cache_part(value: Optional[str]) -> str:
+    if not value:
+        return "none"
+    text = str(value)
+    readable = re.sub(r"[^\w.@+-]+", "_", text, flags=re.UNICODE).strip("_")
+    readable = readable[:80] or "value"
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+    return f"{readable}_{digest}"
+
+
+def _decode_base64_gray(image: str) -> np.ndarray:
+    if not image:
+        raise ValueError("empty image payload")
+    if image.startswith("data:image/"):
+        image = image.split(",", 1)[1]
+    raw = base64.b64decode(image)
+    return np.asarray(Image.open(io.BytesIO(raw)).convert("L"))
+
+
+class CanonicalSignSource:
+    def is_ready(self) -> bool:
+        return bool(self.list_sign_names())
+
+    def get_image(self, sign: Sign) -> Optional[np.ndarray]:
+        raise NotImplementedError
+
+    def get_id(self, sign: Sign) -> Optional[str]:
+        raise NotImplementedError
+
+    def list_sign_names(self) -> List[str]:
+        raise NotImplementedError
+
+    def cache_namespace(self) -> str:
+        return type(self).__name__
+
+    def cache_file_stem(self, sign: Sign) -> Optional[str]:
+        sid = self.get_id(sign)
+        return _safe_cache_part(sid) if sid else None
+
+    def describe(self) -> str:
+        return type(self).__name__
+
+
+class EBLMongoCanonicalSource(CanonicalSignSource):
+    def __init__(
+        self,
+        mongodb_uri: Optional[str],
+        period: Optional[str],
+        db_name: str = "ebl",
+        form: str = "canonical1",
+        require_centroid: bool = True,
+    ):
+        self.mongodb_uri = mongodb_uri
+        self.period = period
+        self.db_name = db_name
+        self.form = form
+        self.require_centroid = require_centroid
+        self._images_by_sign: Dict[str, np.ndarray] = {}
+        self._load()
+
+    def get_image(self, sign: Sign) -> Optional[np.ndarray]:
+        return self._images_by_sign.get(sign.name)
+
+    def get_id(self, sign: Sign) -> Optional[str]:
+        if sign.name not in self._images_by_sign:
+            return None
+        return f"ebl/{self.period or 'period-missing'}/{self.form}/{sign.name}"
+
+    def list_sign_names(self) -> List[str]:
+        return sorted(self._images_by_sign)
+
+    def cache_namespace(self) -> str:
+        return f"ebl-mongo:{self.period or 'period-missing'}:{self.form}"
+
+    def cache_file_stem(self, sign: Sign) -> Optional[str]:
+        if sign.name not in self._images_by_sign:
+            return None
+        return "__".join(
+            _safe_cache_part(part)
+            for part in (sign.name, self.period or "period-missing", self.form)
+        )
+
+    def describe(self) -> str:
+        return (
+            f"eBL Mongo source period={self.period!r}, form={self.form!r}, "
+            f"canonical_images={len(self._images_by_sign)}"
+        )
+
+    def _load(self) -> None:
+        if not self.mongodb_uri or self.mongodb_uri == "YOUR_MONGODB_URI":
+            raise ValueError("MONGODB_URI is not configured")
+
+        from pymongo import MongoClient
+
+        client = MongoClient(self.mongodb_uri)
+        try:
+            docs = client[self.db_name]["annotations"].aggregate(
+                self._pipeline(), allowDiskUse=True
+            )
+            for item in docs:
+                sign_name = item.get("signName")
+                if not sign_name:
+                    raise ValueError(f"annotation without signName: {item}")
+                if sign_name not in self._images_by_sign:
+                    self._images_by_sign[sign_name] = _decode_base64_gray(
+                        item.get("image", "")
+                    )
+        finally:
+            client.close()
+
+        if not self._images_by_sign:
+            period_msg = f" for period {self.period!r}" if self.period else ""
+            raise RuntimeError(f"no {self.form!r} canonical images found{period_msg}")
+
+    def _pipeline(self) -> List[Dict[str, Any]]:
+        annotation_conditions: List[Dict[str, Any]] = [
+            {"$eq": ["$$annotation.data.type", "HasSign"]},
+            {"$eq": ["$$annotation.pcaClustering.form", self.form]},
+            {
+                "$ne": [
+                    {"$ifNull": ["$$annotation.croppedSign.imageId", None]},
+                    None,
+                ]
+            },
+        ]
+        if self.require_centroid:
+            annotation_conditions.append(
+                {"$eq": ["$$annotation.pcaClustering.isCentroid", True]}
+            )
+
+        pipeline: List[Dict[str, Any]] = [
+            {
+                "$match": {
+                    "annotations.pcaClustering.form": self.form,
+                    "annotations.croppedSign.imageId": {"$exists": True},
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "fragments",
+                    "localField": "fragmentNumber",
+                    "foreignField": "_id",
+                    "as": "fragment",
+                }
+            },
+            {"$unwind": "$fragment"},
+        ]
+        if self.period:
+            pipeline.append({"$match": {"fragment.script.period": self.period}})
+
+        pipeline.extend(
+            [
+                {
+                    "$project": {
+                        "fragmentNumber": 1,
+                        "annotations": {
+                            "$filter": {
+                                "input": "$annotations",
+                                "as": "annotation",
+                                "cond": {"$and": annotation_conditions},
+                            }
+                        },
+                        "date": "$fragment.date",
+                        "period": "$fragment.script.period",
+                        "script": "$fragment.script",
+                        "provenance": "$fragment.archaeology.site",
+                    }
+                },
+                {"$unwind": "$annotations"},
+                {
+                    "$lookup": {
+                        "from": "cropped_sign_images",
+                        "localField": "annotations.croppedSign.imageId",
+                        "foreignField": "_id",
+                        "as": "imageDoc",
+                    }
+                },
+                {"$unwind": "$imageDoc"},
+                {
+                    "$project": {
+                        "_id": 0,
+                        "fragmentNumber": 1,
+                        "signName": "$annotations.data.signName",
+                        "image": "$imageDoc.image",
+                        "script": 1,
+                        "period": 1,
+                        "label": "$annotations.croppedSign.label",
+                        "date": 1,
+                        "provenance": 1,
+                        "annotationId": "$annotations.data.id",
+                        "pcaClustering": "$annotations.pcaClustering",
+                    }
+                },
+                {
+                    "$sort": {
+                        "signName": 1,
+                        "pcaClustering.isMain": -1,
+                        "pcaClustering.clusterSize": -1,
+                        "pcaClustering.clusterRank": 1,
+                    }
+                },
+            ]
+        )
+        return pipeline
 
 
 class SignAPIResolver:
-    """Resolves cuneiform reading values to sign names via the EBL signs API, with file-based caching."""
-    
     SIGNS_API_URL = "https://www.ebl.lmu.de/api/signs"
-    
+
     def __init__(self, cache_file: str = None):
         if cache_file is None:
             cache_file = os.path.join(os.path.dirname(__file__), '.sign_api_cache.json')
         self._cache_file = cache_file
-        self._cache = {}  # {"value|subIndex": sign_name_or_null}
+        self._cache = {}
         self._load_cache()
-    
+
     def _load_cache(self):
         if os.path.exists(self._cache_file):
             try:
@@ -30,32 +240,24 @@ class SignAPIResolver:
                     self._cache = json.load(f)
             except (json.JSONDecodeError, IOError):
                 self._cache = {}
-    
+
     def _save_cache(self):
         with open(self._cache_file, 'w', encoding='utf-8') as f:
             json.dump(self._cache, f, indent=2, ensure_ascii=False)
-    
+
     def _cache_key(self, value: str, sub_index: int) -> str:
         return f"{value}|{sub_index}"
-    
+
     def resolve(self, value: str, sub_index: int) -> Optional[str]:
-        """Resolve a reading value + sub_index to a sign name.
-        
-        For Reading tokens: pass name (lowercase) and subIndex.
-        For Logogram tokens: pass name lowercased and subIndex.
-        
-        Returns:
-            Sign name string like "IB", "GA", "TUR" or None if not found.
-        """
         key = self._cache_key(value.lower(), sub_index)
         if key in self._cache:
             return self._cache[key]
-        
+
         result = self._query_api(value.lower(), sub_index)
         self._cache[key] = result
         self._save_cache()
         return result
-    
+
     def _query_api(self, value: str, sub_index: int) -> Optional[str]:
         try:
             resp = requests.get(
@@ -72,28 +274,27 @@ class SignAPIResolver:
         return None
 
 
-class LocalDataSource:    
+class LocalDataSource:
     def __init__(self, annotations_dir: str):
         self.annotations_dir = Path(annotations_dir)
         self.imgs_path = self.annotations_dir / "imgs"
         self.annotations_path = self.annotations_dir / "annotations"
-        
+
         if not self.imgs_path.exists():
             raise ValueError(f"Images directory not found: {self.imgs_path}")
         if not self.annotations_path.exists():
             raise ValueError(f"Annotations directory not found: {self.annotations_path}")
-    
+
     def get_available_fragments(self) -> List[str]:
         fragments = []
         for img_file in os.listdir(self.imgs_path):
             if img_file.endswith(('.jpg', '.jpeg', '.png')):
                 fragment_id = os.path.splitext(img_file)[0]
-                # Check if annotation exists
                 gt_file = self.annotations_path / f"gt_{fragment_id}.txt"
                 if gt_file.exists():
                     fragments.append(fragment_id)
         return fragments
-    
+
     def load_image(self, fragment_id: str) -> Optional[cv2.Mat]:
         possible_names = [
             f"{fragment_id}.jpg",
@@ -105,73 +306,46 @@ class LocalDataSource:
             if filepath.exists():
                 return cv2.imread(str(filepath))
         return None
-    
-    def load_annotation(self, fragment_id: str) -> Optional[Boxes]:
-        """
-        Load ground truth annotations for a fragment.
-        
-        Args:
-            fragment_id: Fragment identifier
-            
-        Returns:
-            List of Box objects or None if not found
-        """
+
+    def load_annotation(self, fragment_id: str, tablet: Tablet) -> Optional[Boxes]:
         gt_file = self.annotations_path / f"gt_{fragment_id}.txt"
         if not gt_file.exists():
             return None
-        
-        boxes = Boxes()
+
+        boxes = Boxes(tablet=tablet)
         with open(gt_file, 'r', encoding='utf-8') as f:
             for line in f:
                 parts = line.strip().split(',')
                 if len(parts) >= 5:
-                    x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+                    x, y, w, h = (
+                        int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+                    )
                     sign_name = parts[4]
-                    
-                    # Convert to Sign object
                     sign = SignResolver.resolve(sign_name, expected_type='SIGN')
-                    
                     bbox = Box(
                         x1=float(x),
                         y1=float(y),
                         x2=float(x + w),
                         y2=float(y + h),
-                        score=1.0,  # Ground truth has full confidence
-                        sign=sign
+                        score=1.0,
+                        sign=sign,
+                        tablet=tablet,
                     )
                     boxes.append(bbox)
-        
+
         return boxes if boxes else None
 
 
 class LocalTestDataSource:
-    """
-    Data source backed by a COCO-format dataset (val2017 split).
-
-    Directory layout expected::
-
-        coco_dir/
-            val2017/              # subtablet images
-            annotations/
-                instances_val2017.json
-
-    Each image file is treated as an independent fragment.  The ``fragment_id``
-    is the filename without the file-type suffix (e.g. ``NBC.1712-0``).
-    Subtablet images belonging to the same physical tablet are *not* merged.
-
-    Use :class:`SubtabletEBLAPISource` as the API source when the EBL API
-    must be queried with the bare fragment ID (without the ``-N`` suffix).
-    """
-
     ANNOTATION_FILE = "annotations/instances_val2017.json"
     IMAGES_DIR = "val2017"
 
     def __init__(self, coco_dir: str):
         self.coco_dir = Path(coco_dir)
         self._data: Optional[dict] = None
-        self._image_by_stem: dict = {}         # stem (no ext) -> image info dict
-        self._annotations_by_image: dict = {}  # image_id -> [annotation, ...]
-        self._category_names: dict = {}        # category_id -> sign_name
+        self._image_by_stem: dict = {}
+        self._annotations_by_image: dict = {}
+        self._category_names: dict = {}
 
     def _ensure_loaded(self):
         if self._data is not None:
@@ -203,13 +377,13 @@ class LocalTestDataSource:
         path = self.coco_dir / self.IMAGES_DIR / img_info['file_name']
         return cv2.imread(str(path))
 
-    def load_annotation(self, fragment_id: str) -> Optional[Boxes]:
+    def load_annotation(self, fragment_id: str, tablet: Tablet) -> Optional[Boxes]:
         self._ensure_loaded()
         img_info = self._image_by_stem.get(fragment_id)
         if img_info is None:
             return None
 
-        boxes = Boxes()
+        boxes = Boxes(tablet=tablet)
         for ann in self._annotations_by_image.get(img_info['id'], []):
             if ann.get('iscrowd', 0):
                 continue
@@ -223,6 +397,7 @@ class LocalTestDataSource:
                 y2=float(y + h),
                 score=1.0,
                 sign=sign,
+                tablet=tablet,
             ))
         return boxes if boxes else None
 
@@ -233,7 +408,7 @@ class EBLAPISource:
     def __init__(self, timeout: int = 60, retries: int = 3):
         self.timeout = timeout
         self.retries = retries
-        self._fragment_cache = {}  # in-memory cache: fragment_id -> data
+        self._fragment_cache = {}
 
     def get_fragment_data(self, fragment_id: str) -> Optional[dict]:
         if fragment_id in self._fragment_cache:
@@ -251,184 +426,49 @@ class EBLAPISource:
                 last_err = f"HTTP {response.status_code}"
             except requests.RequestException as e:
                 last_err = str(e)
-        print(f"API request failed for fragment {fragment_id} after {self.retries+1} attempts: {last_err}")
-        return None
-    
-    def get_signs(self, fragment_id: str) -> Optional[str]:
-        """
-        Get the pre-processed 'signs' field from fragment API.
-        This field already has broken signs filtered out.
-        
-        Args:
-            fragment_id: Fragment identifier
-            
-        Returns:
-            Signs text string or None
-        """
-        data = self.get_fragment_data(fragment_id)
-        if data:
-            return data.get('signs', None)
-        return None
-    
-    def get_text_data(self, fragment_id: str) -> Optional[dict]:
-        """
-        Get the full 'text' field from fragment API.
-        This field contains structured line and token data with broken sign markers.
-        
-        Args:
-            fragment_id: Fragment identifier
-            
-        Returns:
-            Text data dictionary or None
-        """
-        data = self.get_fragment_data(fragment_id)
-        if data:
-            return data.get('text', None)
-        return None
-    
-    def get_signs_filtered(self, fragment_id: str, filter_broken: bool = True,
-                           sign_resolver: 'SignAPIResolver' = None) -> Optional[List[List[str]]]:
-        """
-        Get signs from text.lines field with broken sign filtering.
-        This provides more control over filtering compared to the pre-processed 'signs' field.
-        
-        Args:
-            fragment_id: Fragment identifier
-            filter_broken: If True, filter out completely broken away signs
-            
-        Returns:
-            List of lines with sign names, or None if fragment not found
-        """
-        text_data = self.get_text_data(fragment_id)
-        if text_data:
-            return SignTextParser.parse_text_lines(text_data, filter_broken, sign_resolver=sign_resolver)
+        print(
+            f"API request failed for fragment {fragment_id} "
+            f"after {self.retries + 1} attempts: {last_err}"
+        )
         return None
 
 
 class SubtabletEBLAPISource(EBLAPISource):
-    """
-    EBL API source that strips trailing subtablet suffixes (``-0``, ``-1``, …)
-    from fragment IDs before querying the API.
-
-    Use this together with :class:`LocalTestDataSource` so that the text
-    transcription for a full tablet fragment is retrieved correctly even when
-    the ``fragment_id`` refers to one subtablet image (e.g. ``NBC.1712-0``).
-    """
-
     def get_fragment_data(self, fragment_id: str) -> Optional[dict]:
         api_id = re.sub(r'-\d+$', '', fragment_id)
         return super().get_fragment_data(api_id)
 
 
-class SignTextParser:    
-    @staticmethod
-    def parse_api_signs(signs_text: str) -> List[List[str]]:
-        if not signs_text:
-            return []
-        
-        lines = []
-        for line_text in signs_text.strip().split('\n'):
-            line_signs = []
-            for token in line_text.split():
-                # Handle alternatives like ABZ579/ABZ129/ABZ312
-                if '/' in token:
-                    token = token.split('/')[0]  # take first alternative
-                
-                # Convert ABZ to sign name
-                sign = SignResolver.resolve(token, expected_type='ABZ')
-                line_signs.append(sign.name)
-            
-            if line_signs:
-                lines.append(line_signs)
-        return lines
-    
-    @staticmethod
-    def parse_api_signs_with_abz(signs_text: str) -> List[List[Tuple[str, str]]]:
-        if not signs_text:
-            return []
-        
-        lines = []
-        for line_text in signs_text.strip().split('\n'):
-            line_signs = []
-            for token in line_text.split():
-                # Handle alternatives like ABZ579/ABZ129/ABZ312
-                if '/' in token:
-                    token = token.split('/')[0]  # take first alternative
-                
-                # Convert ABZ to sign name
-                sign = SignResolver.resolve(token, expected_type='ABZ')
-                line_signs.append((sign.abz, sign.name))
-            
-            if line_signs:
-                lines.append(line_signs)
-        return lines
-    
+class SignTextParser:
+    CONTAINER_TYPES = {
+        'Word',
+        'AkkadianWord',
+        'GreekWord',
+        'LoneDeterminative',
+        'Determinative',
+    }
+
     @staticmethod
     def _is_broken_away(token: dict) -> bool:
-        """
-        Check if a token is completely broken away.
-        Based on ebl-frontend logic: effectiveEnclosure includes BROKEN_AWAY.
-        
-        Args:
-            token: Token dictionary from API
-            
-        Returns:
-            True if token is completely broken away
-        """
-        enclosure_type = token.get('enclosureType', [])
-        return 'BROKEN_AWAY' in enclosure_type
-    
+        return 'BROKEN_AWAY' in token.get('enclosureType', [])
+
     @staticmethod
-    def _is_partially_broken(token: dict) -> bool:
-        """
-        Check if a token has partial (not complete) BROKEN_AWAY enclosure.
-        This checks if token has parts with different enclosure states.
-        
-        Args:
-            token: Token dictionary from API
-            
-        Returns:
-            True if partially broken
-        """
-        # For named signs with parts, check if parts have mixed enclosure
-        if 'nameParts' in token:
-            enclosure_types = [part.get('enclosureType', []) for part in token['nameParts']]
-            has_broken = any('BROKEN_AWAY' in et for et in enclosure_types)
-            all_broken = all('BROKEN_AWAY' in et for et in enclosure_types)
-            return has_broken and not all_broken
-        return False
-    
-    @staticmethod
-    def _extract_signs_from_token(token: dict, filter_broken: bool = True) -> List[Tuple[str, int]]:
-        """
-        Extract (reading_name, sub_index) tuples from a token, recursively handling nested parts.
-        
-        Container types (Word, Determinative, etc.) are always recursed into regardless
-        of their enclosureType, because they may contain a mix of broken and non-broken parts.
-        Only leaf sign-producing types (Reading, Logogram, etc.) are checked for broken status.
-        
-        Args:
-            token: Token dictionary from API
-            filter_broken: If True, skip tokens that are broken away
-            
-        Returns:
-            List of (name, sub_index) tuples. sub_index=0 for CompoundGrapheme/UnclearSign.
-        """
+    def _extract_signs_from_token(
+        token: dict,
+        filter_broken: bool = True,
+    ) -> List[Tuple[str, int]]:
         signs = []
         token_type = token.get('type', '')
-        
-        # Container types - always recurse into parts (don't check broken at container level,
-        # since a Word can span across broken brackets e.g. "DUMU-er-ṣe-tim]-ke₄")
-        if token_type in ['Word', 'AkkadianWord', 'GreekWord', 'LoneDeterminative', 'Determinative']:
+
+        # Containers can mix broken and preserved child signs.
+        if token_type in SignTextParser.CONTAINER_TYPES:
             for part in token.get('parts', []):
                 signs.extend(SignTextParser._extract_signs_from_token(part, filter_broken))
             return signs
-        
-        # For sign-producing types, check broken status
+
         if filter_broken and SignTextParser._is_broken_away(token):
             return signs
-        
-        # Handle named signs (Reading, Logogram, Number)
+
         if token_type in ['Reading', 'Logogram', 'Number']:
             name = token.get('name', '')
             sub_index = token.get('subIndex', 1)
@@ -436,160 +476,90 @@ class SignTextParser:
                 sub_index = 1
             if name:
                 signs.append((name, sub_index))
-        
-        # Handle CompoundGrapheme
         elif token_type == 'CompoundGrapheme':
             if filter_broken and 'BROKEN_AWAY' in token.get('enclosureType', []):
                 return signs
             clean = token.get('cleanValue', '')
             if clean:
-                signs.append((clean, 0))  # sub_index=0 signals direct sign name
-        
-        # Handle Grapheme
+                signs.append((clean, 0))
         elif token_type == 'Grapheme':
             name = token.get('name', '')
             if name:
                 signs.append((name, 0))
-        
-        # Handle UnclearSign
         elif token_type == 'UnclearSign':
             signs.append(('X', 0))
-        
-        # Handle Variant - process first variant
         elif token_type in ['Variant', 'Variant2']:
             for variant_token in token.get('tokens', []):
-                signs.extend(SignTextParser._extract_signs_from_token(variant_token, filter_broken))
-                break  # take first variant only
-        
-        # Handle Divider
+                signs.extend(
+                    SignTextParser._extract_signs_from_token(variant_token, filter_broken)
+                )
+                break
         elif token_type == 'Divider':
             divider = token.get('divider', '')
             if divider:
                 signs.append((divider, 0))
-        
-        # Recursively handle other tokens with parts
         elif 'parts' in token:
             for part in token['parts']:
                 signs.extend(SignTextParser._extract_signs_from_token(part, filter_broken))
-        
+
         return signs
-    
+
     @staticmethod
-    def _resolve_sign_token(name: str, sub_index: int, sign_resolver: 'SignAPIResolver' = None) -> Optional[str]:
-        """Resolve a (name, sub_index) tuple to a sign name."""
+    def _resolve_sign_token(
+        name: str,
+        sub_index: int,
+        sign_resolver: 'SignAPIResolver' = None,
+    ) -> Optional[str]:
         if name == 'X':
             return 'UnclearSign'
-        
-        # sub_index=0 means direct sign name (CompoundGrapheme, Grapheme, Divider)
+
         if sub_index == 0:
             return name
-        
-        # Use signs API resolver if available
+
         if sign_resolver is not None:
-            # For Logograms (uppercase names like DUMU), also query lowercase
             resolved = sign_resolver.resolve(name, sub_index)
             if resolved:
                 return resolved
-        
-        # Fallback: try local SignResolver with uppercase name
+
         try:
             sign = SignResolver.resolve(name.upper(), expected_type='SIGN')
             if sign.name != 'UnclearSign':
                 return sign.name
         except Exception:
             pass
-        
+
         return name.upper()
 
     @staticmethod
-    def parse_text_lines(text_data: dict, filter_broken: bool = True,
-                         sign_resolver: 'SignAPIResolver' = None) -> List[List[str]]:
-        """
-        Parse text.lines field from fragment API, extracting sign names and filtering broken signs.
-        Uses SignAPIResolver to properly resolve reading values to sign names.
-        
-        Args:
-            text_data: The 'text' field from fragment API response
-            filter_broken: If True, filter out completely broken away signs
-            sign_resolver: SignAPIResolver instance for reading→sign name resolution.
-                           If None, falls back to local SignResolver (less accurate).
-            
-        Returns:
-            List of lines, each containing list of sign names
-        """
+    def parse_text_lines(
+        text_data: dict,
+        filter_broken: bool = True,
+        sign_resolver: 'SignAPIResolver' = None,
+    ) -> List[List[str]]:
         if not text_data or 'lines' not in text_data:
             return []
-        
+
         result_lines = []
-        
+
         for line in text_data['lines']:
             if line.get('type', '') != 'TextLine':
                 continue
             if 'content' not in line:
                 continue
-            
+
             line_signs = []
             for token in line['content']:
-                sign_tuples = SignTextParser._extract_signs_from_token(token, filter_broken)
+                sign_tuples = SignTextParser._extract_signs_from_token(
+                    token, filter_broken
+                )
                 for name, sub_index in sign_tuples:
-                    resolved = SignTextParser._resolve_sign_token(name, sub_index, sign_resolver)
+                    resolved = SignTextParser._resolve_sign_token(
+                        name, sub_index, sign_resolver
+                    )
                     if resolved:
                         line_signs.append(resolved)
-            
+
             if line_signs:
                 result_lines.append(line_signs)
-        
+
         return result_lines
-    
-    @staticmethod
-    def parse_text_lines_with_abz(text_data: dict, filter_broken: bool = True,
-                                  sign_resolver: 'SignAPIResolver' = None) -> List[List[Tuple[str, str]]]:
-        """
-        Parse text.lines field from fragment API, extracting both ABZ codes and sign names.
-        
-        Args:
-            text_data: The 'text' field from fragment API response
-            filter_broken: If True, filter out completely broken away signs
-            sign_resolver: SignAPIResolver instance for reading→sign name resolution.
-            
-        Returns:
-            List of lines, each containing list of (abz, sign_name) tuples
-        """
-        if not text_data or 'lines' not in text_data:
-            return []
-        
-        result_lines = []
-        
-        for line in text_data['lines']:
-            if line.get('type', '') != 'TextLine':
-                continue
-            if 'content' not in line:
-                continue
-            
-            line_signs = []
-            for token in line['content']:
-                sign_tuples = SignTextParser._extract_signs_from_token(token, filter_broken)
-                for name, sub_index in sign_tuples:
-                    resolved = SignTextParser._resolve_sign_token(name, sub_index, sign_resolver)
-                    if resolved:
-                        # Try to get ABZ code from local resolver
-                        try:
-                            sign = SignResolver.resolve(resolved, expected_type='SIGN')
-                            line_signs.append((sign.abz, sign.name))
-                        except Exception:
-                            line_signs.append(('', resolved))
-            
-            if line_signs:
-                result_lines.append(line_signs)
-        
-        return result_lines
-
-
-# ============ Convenience Functions ============
-
-def create_local_source(annotations_dir: str) -> LocalDataSource:
-    return LocalDataSource(annotations_dir)
-
-
-def create_api_source(timeout: int = 10) -> EBLAPISource:
-    return EBLAPISource(timeout)

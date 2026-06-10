@@ -564,13 +564,14 @@ def _load_and_detect_fragment(runner: Runner, context: CropContext, fid: str) ->
     runner.run_single_step(step_load_data)
 
     s = context.state
-    if s.img is None or not s.text_lines or not s.gt_boxes:
+    if s.tablet is None or not s.text_lines or not s.gt_boxes:
         return False
 
     # Filter out abnormally large GT boxes (e.g. sub-tablet region annotations)
     areas = [b.width * b.height for b in s.gt_boxes]
     mean_area = np.mean(areas)
-    s.gt_boxes = Boxes(b for b, a in zip(s.gt_boxes, areas) if a <= mean_area * 5)
+    s.gt_boxes = Boxes((b for b, a in zip(s.gt_boxes, areas) if a <= mean_area * 5),
+                       tablet=s.gt_boxes.tablet)
     if not s.gt_boxes:
         return False
 
@@ -597,25 +598,20 @@ def _predict_detection_crops(
     """
     s = context.state
     raw_preds: List[Box] = []
-    for crop_idx in range(len(context.config.tablet_detector.get_cropped_images())):
+    for crop_idx in range(len(context.config.tablet_detector.get_crop_tablets())):
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
-        ox, oy = s.crop_info['x'], s.crop_info['y']
         for det in s.det_boxes:
-            raw_preds.append(Box(
-                x1=det.x1 + ox, y1=det.y1 + oy,
-                x2=det.x2 + ox, y2=det.y2 + oy,
-                score=det.score, sign=det.sign,
-            ))
+            raw_preds.append(det.to_tablet(s.tablet))
 
     # Suppress cross-crop duplicates: the same sign detected in overlapping crops
     # appears multiple times after offsetting; all but the highest-score one are FP.
     preds = _nms_predictions(raw_preds, iou_threshold=0.5)
 
-    if visualize and s.img is not None:
+    if visualize and s.tablet is not None:
         visualize_evaluation_fragment(
-            img=s.img,
+            img=s.tablet.img,
             fragment_id=fid,
             preds=preds,
             gts=s.gt_boxes,
@@ -642,7 +638,7 @@ def _predict_psr_crops(
     """
     s = context.state
     preds: List[Box] = []
-    for crop_idx in range(len(context.config.tablet_detector.get_cropped_images())):
+    for crop_idx in range(len(context.config.tablet_detector.get_crop_tablets())):
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
@@ -650,17 +646,12 @@ def _predict_psr_crops(
         if not s.det_rows or not len(s.det_rows) or not s.matches or not s.aligned_boxes:
             continue
 
-        ox, oy = s.crop_info['x'], s.crop_info['y']
         for sb in s.final_boxes:
-            preds.append(Box(
-                x1=sb.x1 + ox, y1=sb.y1 + oy,
-                x2=sb.x2 + ox, y2=sb.y2 + oy,
-                score=sb.score, sign=sb.sign,
-            ))
+            preds.append(sb.to_tablet(s.tablet))
 
-    if visualize and s.img is not None:
+    if visualize and s.tablet is not None:
         visualize_evaluation_fragment(
-            img=s.img,
+            img=s.tablet.img,
             fragment_id=fid,
             preds=preds,
             gts=s.gt_boxes,

@@ -618,13 +618,14 @@ def align_text_row_to_detection(
             new_width = avg_width
             new_height = avg_height
         
-        aligned_box = Box(
+        aligned_box = Box.from_center(
             sign=text_box.sign,
             score=text_box.score,
             cx=new_cx,
             cy=new_cy,
             width=new_width,
             height=new_height,
+            tablet=text_box.tablet,
         )
         aligned_boxes.append(aligned_box)
     

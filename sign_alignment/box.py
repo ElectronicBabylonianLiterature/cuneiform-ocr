@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Iterable, Optional
 
 import numpy as np
 
 from .sign import Sign, SignResolver
+from .tablet import SubTablet, Tablet
 
 
 @dataclass(init=False)
@@ -22,43 +23,48 @@ class Box:
     y2: float
     score: float
     sign: Sign
-    subtablet: Optional[Any]
+    tablet: Tablet
 
     def __init__(
         self,
-        x1: Optional[float] = None,
-        y1: Optional[float] = None,
-        x2: Optional[float] = None,
-        y2: Optional[float] = None,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        sign: Sign,
+        tablet: Tablet,
         score: float = 1.0,
-        sign: Optional[Sign] = None,
-        *,
-        cx: Optional[float] = None,
-        cy: Optional[float] = None,
-        width: Optional[float] = None,
-        height: Optional[float] = None,
-        subtablet: Optional[Any] = None,
     ):
-        if sign is None:
-            raise ValueError("Box requires a Sign")
-
-        has_corners = None not in (x1, y1, x2, y2)
-        has_center = None not in (cx, cy, width, height)
-        if has_center and not has_corners:
-            x1 = float(cx) - float(width) / 2
-            y1 = float(cy) - float(height) / 2
-            x2 = float(cx) + float(width) / 2
-            y2 = float(cy) + float(height) / 2
-        elif not has_corners:
-            raise ValueError("Box requires either x1/y1/x2/y2 or cx/cy/width/height")
-
         self.x1 = float(x1)
         self.y1 = float(y1)
         self.x2 = float(x2)
         self.y2 = float(y2)
         self.score = float(score)
         self.sign = sign
-        self.subtablet = subtablet
+        self.tablet = tablet
+
+    @classmethod
+    def from_center(
+        cls,
+        cx: float,
+        cy: float,
+        width: float,
+        height: float,
+        sign: Sign,
+        tablet: Tablet,
+        score: float = 1.0,
+    ) -> "Box":
+        half_w = float(width) / 2
+        half_h = float(height) / 2
+        return cls(
+            x1=float(cx) - half_w,
+            y1=float(cy) - half_h,
+            x2=float(cx) + half_w,
+            y2=float(cy) + half_h,
+            sign=sign,
+            tablet=tablet,
+            score=score,
+        )
 
     @property
     def width(self) -> float:
@@ -122,12 +128,12 @@ class Box:
     def abz_name(self) -> str:
         return self.sign.abz
 
-    def copy(self, subtablet: Optional[Any] = None) -> "Box":
+    def copy(self) -> "Box":
         return Box(
             x1=self.x1, y1=self.y1, x2=self.x2, y2=self.y2,
             score=self.score,
             sign=self.sign,
-            subtablet=self.subtablet if subtablet is None else subtablet,
+            tablet=self.tablet,
         )
 
     def translate(self, dx: float, dy: float) -> "Box":
@@ -138,12 +144,23 @@ class Box:
         box.y2 += dy
         return box
 
+    def to_tablet(self, tablet: Tablet) -> "Box":
+        root_x1, root_y1 = self.tablet.to_root(self.x1, self.y1)
+        root_x2, root_y2 = self.tablet.to_root(self.x2, self.y2)
+        x1, y1 = tablet.from_root(root_x1, root_y1)
+        x2, y2 = tablet.from_root(root_x2, root_y2)
+        return Box(
+            x1=x1, y1=y1, x2=x2, y2=y2,
+            sign=self.sign,
+            tablet=tablet,
+            score=self.score,
+        )
+
     def crop_bounds(
         self,
-        image_shape: tuple[int, int] | tuple[int, int, int],
         padding_ratio: float = 0.0,
     ) -> tuple[int, int, int, int]:
-        h, w = image_shape[:2]
+        h, w = self.tablet.shape
         pad_x = self.width * padding_ratio
         pad_y = self.height * padding_ratio
         x1 = int(max(0, np.floor(self.x1 - pad_x)))
@@ -156,44 +173,34 @@ class Box:
             y2 = min(h, y1 + 1)
         return x1, y1, x2, y2
 
-    def crop_image(
-        self,
-        image: Optional[np.ndarray] = None,
-        padding_ratio: float = 0.0,
-    ) -> np.ndarray:
-        if image is None:
-            if self.subtablet is None or self.subtablet.img is None:
-                raise ValueError("Box has no subtablet image")
-            image = self.subtablet.img
-        x1, y1, x2, y2 = self.crop_bounds(image.shape, padding_ratio)
+    def crop_image(self, padding_ratio: float = 0.0) -> np.ndarray:
+        image = self.tablet.img
+        x1, y1, x2, y2 = self.crop_bounds(padding_ratio)
         return image[y1:y2, x1:x2].copy()
 
 
 class Boxes(list):
     """List of Box objects with local size statistics."""
 
-    def __init__(self, boxes: Optional[Iterable[Box]] = None, subtablet: Optional[Any] = None):
-        if subtablet is None and isinstance(boxes, Boxes):
-            subtablet = boxes.subtablet
-        self.subtablet = subtablet
+    def __init__(self, boxes: Iterable[Box] = (), *, tablet: Tablet):
+        self.tablet = tablet
         super().__init__()
-        self.extend(boxes or [])
-
-    def _attach(self, box: Box) -> Box:
-        if self.subtablet is not None:
-            box.subtablet = self.subtablet
-        return box
+        self.extend(boxes)
 
     def append(self, box: Box) -> None:
-        super().append(self._attach(box))
+        if box.tablet is not self.tablet:
+            raise ValueError("Box belongs to a different tablet")
+        super().append(box)
 
     def extend(self, boxes: Iterable[Box]) -> None:
         for box in boxes:
             self.append(box)
 
-    def copy(self, subtablet: Optional[Any] = None) -> "Boxes":
-        target = self.subtablet if subtablet is None else subtablet
-        return Boxes((box.copy(subtablet=target) for box in self), subtablet=target)
+    def copy(self) -> "Boxes":
+        return Boxes((box.copy() for box in self), tablet=self.tablet)
+
+    def to_tablet(self, tablet: Tablet) -> "Boxes":
+        return Boxes((box.to_tablet(tablet) for box in self), tablet=tablet)
 
     @classmethod
     def from_text_lines(
@@ -201,23 +208,23 @@ class Boxes(list):
         text_lines: list[list[str]],
         avg_width: float,
         avg_height: float,
+        tablet: Tablet,
         margin: Optional[float] = None,
         target_boxes: Optional[Iterable[Box]] = None,
         align_to_detection_centroid: bool = False,
-        subtablet: Optional[Any] = None,
     ) -> "Boxes":
         margin = max(avg_width, avg_height) if margin is None else margin
-        boxes = cls(subtablet=subtablet)
+        boxes = cls(tablet=tablet)
         for row_idx, line in enumerate(text_lines):
             for col_idx, sign_name in enumerate(line):
                 sign = SignResolver.resolve(sign_name, expected_type="SIGN")
-                boxes.append(Box(
+                boxes.append(Box.from_center(
                     cx=margin + col_idx * avg_width + avg_width / 2,
                     cy=margin + row_idx * avg_height + avg_height / 2,
                     width=avg_width,
                     height=avg_height,
                     sign=sign,
-                    subtablet=subtablet,
+                    tablet=tablet,
                 ))
 
         target_boxes = list(target_boxes or [])
@@ -241,41 +248,43 @@ class Boxes(list):
     def avg_size(self) -> float:
         return (self.avg_width + self.avg_height) / 2
 
-    def info(self, name: str = "boxes", image: Optional[np.ndarray] = None) -> str:
-        img_shape = image.shape if image is not None else None
+    def info(self, name: str = "boxes") -> str:
         return (
             f"Boxes '{name}':\n"
             f"  {len(self)} signs,\n"
-            f"  image shape: {img_shape}"
+            f"  image shape: {self.tablet.img.shape}"
             f"\n  avg_width: {self.avg_width:.2f}, avg_height: {self.avg_height:.2f}"
         )
 
 
-def boxes_in_crop(boxes: Iterable[Box], crop_info: dict, subtablet: Optional[Any] = None) -> Boxes:
-    crop_x = crop_info["x"]
-    crop_y = crop_info["y"]
-    crop_w = crop_info["w"]
-    crop_h = crop_info["h"]
+def boxes_in_crop(boxes: Iterable[Box], crop_tablet: SubTablet) -> Boxes:
+    crop_x, crop_y = crop_tablet.offset_in_root
+    crop_h, crop_w = crop_tablet.shape
 
-    transformed = Boxes(subtablet=subtablet)
+    transformed = Boxes(tablet=crop_tablet)
     for box in boxes or []:
-        if not (crop_x <= box.cx < crop_x + crop_w and crop_y <= box.cy < crop_y + crop_h):
+        root_cx, root_cy = box.tablet.to_root(box.cx, box.cy)
+        if not (crop_x <= root_cx < crop_x + crop_w and crop_y <= root_cy < crop_y + crop_h):
             continue
 
-        x1 = max(box.x1, crop_x)
-        y1 = max(box.y1, crop_y)
-        x2 = min(box.x2, crop_x + crop_w)
-        y2 = min(box.y2, crop_y + crop_h)
+        root_x1, root_y1 = box.tablet.to_root(box.x1, box.y1)
+        root_x2, root_y2 = box.tablet.to_root(box.x2, box.y2)
+        x1 = max(root_x1, crop_x)
+        y1 = max(root_y1, crop_y)
+        x2 = min(root_x2, crop_x + crop_w)
+        y2 = min(root_y2, crop_y + crop_h)
         if x1 >= x2 or y1 >= y2:
             continue
 
+        crop_x1, crop_y1 = crop_tablet.from_root(x1, y1)
+        crop_x2, crop_y2 = crop_tablet.from_root(x2, y2)
         transformed.append(Box(
-            x1=x1 - crop_x,
-            y1=y1 - crop_y,
-            x2=x2 - crop_x,
-            y2=y2 - crop_y,
+            x1=crop_x1,
+            y1=crop_y1,
+            x2=crop_x2,
+            y2=crop_y2,
             score=box.score,
             sign=box.sign,
-            subtablet=subtablet,
+            tablet=crop_tablet,
         ))
     return transformed
