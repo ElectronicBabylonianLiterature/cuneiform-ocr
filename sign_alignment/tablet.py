@@ -16,18 +16,6 @@ class Tablet:
         return self.img.shape[:2]
 
     @property
-    def offset_in_root(self) -> tuple[float, float]:
-        return 0.0, 0.0
-
-    def to_root(self, x: float, y: float) -> tuple[float, float]:
-        offset_x, offset_y = self.offset_in_root
-        return x + offset_x, y + offset_y
-
-    def from_root(self, x: float, y: float) -> tuple[float, float]:
-        offset_x, offset_y = self.offset_in_root
-        return x - offset_x, y - offset_y
-
-    @property
     def info(self) -> str:
         return f"Tablet '{self.name}': image shape={self.img.shape}"
 
@@ -40,9 +28,19 @@ class SubTablet(Tablet):
 
     @property
     def offset_in_root(self) -> tuple[float, float]:
-        parent_x, parent_y = self.parent.offset_in_root
         offset_x, offset_y = self.offset_in_parent
-        return parent_x + offset_x, parent_y + offset_y
+        if isinstance(self.parent, SubTablet):
+            parent_x, parent_y = self.parent.offset_in_root
+            return parent_x + offset_x, parent_y + offset_y
+        return offset_x, offset_y
+
+    def to_root(self, x: float, y: float) -> tuple[float, float]:
+        offset_x, offset_y = self.offset_in_root
+        return x + offset_x, y + offset_y
+
+    def from_root(self, x: float, y: float) -> tuple[float, float]:
+        offset_x, offset_y = self.offset_in_root
+        return x - offset_x, y - offset_y
 
     @property
     def info(self) -> str:

@@ -30,11 +30,30 @@ from sign_alignment import (
 )
 from sign_alignment.visualizer import ColorConfig
 from sign_alignment.pipeline import (
-    CropContext, PipelineConfig, SampleState, Runner, VisOptions,
-    step_load_data,
-    step_detect_signs,
-    step_compute_statistics,
-    PIPELINE_STEPS_PER_CROP,
+    CropContext, PipelineConfig, Runner, SampleState, Step, VisOptions,
+    align_text_rows,
+    build_sign_match_info,
+    create_box_sets,
+    create_psr_optimizer,
+    detect_rows,
+    detect_signs,
+    load_data,
+    match_rows,
+    match_signs_in_rows,
+    optimize_psr,
+    transform_gt_to_crop,
+    vis_aligned_rows,
+    vis_box_sets,
+    vis_crop_ground_truth,
+    vis_detected_rows_info,
+    vis_detection_statistics,
+    vis_detections,
+    vis_loaded_data,
+    vis_optimization,
+    vis_psr_optimizer,
+    vis_row_matches,
+    vis_sign_match_info,
+    vis_sign_matches,
 )
 
 load_dotenv()
@@ -561,7 +580,7 @@ def _load_and_detect_fragment(runner: Runner, context: CropContext, fid: str) ->
     context.state = SampleState()
     context.state.fragment_id = fid
 
-    runner.run_single_step(step_load_data)
+    runner.run([Step("Load data", load_data, vis_loaded_data)])
 
     s = context.state
     if s.tablet is None or not s.text_lines or not s.gt_boxes:
@@ -575,8 +594,10 @@ def _load_and_detect_fragment(runner: Runner, context: CropContext, fid: str) ->
     if not s.gt_boxes:
         return False
 
-    runner.run_single_step(step_detect_signs)
-    runner.run_single_step(step_compute_statistics)
+    runner.run([
+        Step("Detect signs", detect_signs, vis_detections),
+        Step("Detection statistics", lambda _: None, vis_detection_statistics),
+    ])
     if not s.detections:
         return False
 
@@ -642,7 +663,17 @@ def _predict_psr_crops(
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
-        runner.run_all()
+        runner.run([
+            Step("Transform GT to crop", transform_gt_to_crop, vis_crop_ground_truth),
+            Step("Create box sets", create_box_sets, vis_box_sets),
+            Step("Detect rows", detect_rows, vis_detected_rows_info),
+            Step("Match rows", match_rows, vis_row_matches),
+            Step("Match signs", match_signs_in_rows, vis_sign_matches),
+            Step("Align text rows", align_text_rows, vis_aligned_rows),
+            Step("Build sign match info", build_sign_match_info, vis_sign_match_info),
+            Step("Create PSR optimizer", create_psr_optimizer, vis_psr_optimizer),
+            Step("Optimize PSR", optimize_psr, vis_optimization),
+        ])
         if not s.det_rows or not len(s.det_rows) or not s.matches or not s.aligned_boxes:
             continue
 
@@ -691,7 +722,7 @@ def run_predictions(
     """
     context.config.psr_params = psr_params  # None = step defaults
     vis = VisOptions(info=False, display=False, save=False)
-    runner = Runner(context, steps=PIPELINE_STEPS_PER_CROP, vis=vis)
+    runner = Runner(context, vis=vis)
     all_results = []
     skipped = 0
 

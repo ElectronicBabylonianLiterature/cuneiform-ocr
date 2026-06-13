@@ -145,10 +145,20 @@ class Box:
         return box
 
     def to_tablet(self, tablet: Tablet) -> "Box":
-        root_x1, root_y1 = self.tablet.to_root(self.x1, self.y1)
-        root_x2, root_y2 = self.tablet.to_root(self.x2, self.y2)
-        x1, y1 = tablet.from_root(root_x1, root_y1)
-        x2, y2 = tablet.from_root(root_x2, root_y2)
+        if self.tablet is tablet:
+            return self.copy()
+
+        if isinstance(self.tablet, SubTablet):
+            x1, y1 = self.tablet.to_root(self.x1, self.y1)
+            x2, y2 = self.tablet.to_root(self.x2, self.y2)
+        else:
+            x1, y1 = self.x1, self.y1
+            x2, y2 = self.x2, self.y2
+
+        if isinstance(tablet, SubTablet):
+            x1, y1 = tablet.from_root(x1, y1)
+            x2, y2 = tablet.from_root(x2, y2)
+
         return Box(
             x1=x1, y1=y1, x2=x2, y2=y2,
             sign=self.sign,
@@ -258,31 +268,26 @@ class Boxes(list):
 
 
 def boxes_in_crop(boxes: Iterable[Box], crop_tablet: SubTablet) -> Boxes:
-    crop_x, crop_y = crop_tablet.offset_in_root
     crop_h, crop_w = crop_tablet.shape
 
     transformed = Boxes(tablet=crop_tablet)
     for box in boxes or []:
-        root_cx, root_cy = box.tablet.to_root(box.cx, box.cy)
-        if not (crop_x <= root_cx < crop_x + crop_w and crop_y <= root_cy < crop_y + crop_h):
+        crop_box = box.to_tablet(crop_tablet)
+        if not (0 <= crop_box.cx < crop_w and 0 <= crop_box.cy < crop_h):
             continue
 
-        root_x1, root_y1 = box.tablet.to_root(box.x1, box.y1)
-        root_x2, root_y2 = box.tablet.to_root(box.x2, box.y2)
-        x1 = max(root_x1, crop_x)
-        y1 = max(root_y1, crop_y)
-        x2 = min(root_x2, crop_x + crop_w)
-        y2 = min(root_y2, crop_y + crop_h)
+        x1 = max(crop_box.x1, 0)
+        y1 = max(crop_box.y1, 0)
+        x2 = min(crop_box.x2, crop_w)
+        y2 = min(crop_box.y2, crop_h)
         if x1 >= x2 or y1 >= y2:
             continue
 
-        crop_x1, crop_y1 = crop_tablet.from_root(x1, y1)
-        crop_x2, crop_y2 = crop_tablet.from_root(x2, y2)
         transformed.append(Box(
-            x1=crop_x1,
-            y1=crop_y1,
-            x2=crop_x2,
-            y2=crop_y2,
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
             score=box.score,
             sign=box.sign,
             tablet=crop_tablet,
