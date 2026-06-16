@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from sign_alignment import LocalDataSource, ModelConfig, TabletImageDetector, TextVisualizer
 from sign_alignment.visualizer import ColorConfig
 from sign_alignment.pipeline import (
-    CropContext, PipelineConfig, Runner, SampleState, Step, VisOptions,
+    CropContext, Runner, SampleState, Step, VisOptions,
     align_text_rows,
     build_sign_match_info,
     create_box_sets,
@@ -46,13 +46,12 @@ if __name__ == "__main__":
     local_source = LocalDataSource(ANNOTATIONS_DIR)
     model_config = ModelConfig(CONFIG_FILE, CHECKPOINT_FILE, device='auto')
     tablet_detector = TabletImageDetector(model_config, SCORE_THRESHOLD, keep_crops=True)
-    context = CropContext(config=PipelineConfig(
+    context = CropContext(
         tablet_detector=tablet_detector,
         local_source=local_source,
         color_config=ColorConfig,
         output_dir=OUTPUT_DIR,
-    ), 
-    task_type="samples"
+        task_type="samples",
     )
 
     vis = VisOptions(info=True, display=False, save=True)

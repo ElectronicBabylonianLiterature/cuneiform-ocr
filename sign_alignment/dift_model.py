@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Optional
 import sys
 
+import torch
+
 
 @dataclass
 class DiftConfig:
@@ -22,32 +24,47 @@ class DiftConfig:
 
 def _add_repo_to_path(repo_root: str) -> str:
     root = str(Path(repo_root).expanduser())
-    if not root:
-        raise ValueError("DIFT repo_root is required")
     if root not in sys.path:
         sys.path.insert(0, root)
     return root
 
 
-def load_dift_model(config: DiftConfig):
-    _add_repo_to_path(config.repo_root)
-    from src.dift import SDFeaturizer
+class DiftModel:
+    def __init__(
+        self,
+        config: DiftConfig,
+        model=None,
+    ):
+        self.config = config
+        self.model = model
 
-    return SDFeaturizer(sd_id=config.weights_dir)
+    def load(self):
+        if self.model is not None:
+            return self.model
 
+        _add_repo_to_path(self.config.repo_root)
+        from src.dift import SDFeaturizer
 
-def make_dift_wrapper(
-    config: DiftConfig,
-    dift,
-    prompt: str = "",
-    img_size: Optional[int] = None,
-):
-    if dift is None:
-        raise ValueError("DIFT model is not loaded")
-    _add_repo_to_path(config.repo_root)
-    from src.dift import DiftWrapper
+        self.model = SDFeaturizer(sd_id=self.config.weights_dir)
+        return self.model
 
-    return DiftWrapper(
-        Namespace(prompt=prompt, img_size=img_size or config.img_size),
-        dift,
-    )
+    def unload(self) -> None:
+        self.model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def make_wrapper(
+        self,
+        prompt: str = "",
+        img_size: Optional[int] = None,
+    ):
+        _add_repo_to_path(self.config.repo_root)
+        from src.dift import DiftWrapper
+
+        return DiftWrapper(
+            Namespace(
+                prompt=prompt,
+                img_size=img_size or self.config.img_size,
+            ),
+            self.load(),
+        )

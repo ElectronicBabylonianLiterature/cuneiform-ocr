@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -14,6 +14,7 @@ from PIL import Image
 from .sign import Sign, SignResolver
 from .box import Box, Boxes
 from .data_source import CanonicalSignSource
+from .dift_model import DiftModel
 
 
 @dataclass
@@ -25,20 +26,29 @@ class CanonicalFeatureRecord:
     sign_name: str
 
 
+@dataclass(frozen=True)
+class DiftMatchConfig:
+    max_matches: int = 300
+    min_matches: int = 3
+    min_support: int = 12
+    ransac_threshold: Optional[float] = None
+
+
 class CanonicalFeatureCache:
-    def __init__(self, source: CanonicalSignSource, wrapper, img_size: int = 512,
-                 store_device: str = "cpu", store_dtype: torch.dtype = torch.float16,
-                 disk_dir: Optional[str] = None):
+    def __init__(
+        self,
+        source: CanonicalSignSource,
+        wrapper,
+        disk_dir: Optional[str] = None,
+        dtype: torch.dtype = torch.float16,
+    ):
         self.source = source
         self.wrapper = wrapper
-        self.img_size = img_size
-        self.store_device = store_device
-        self.store_dtype = store_dtype
+        self.dtype = dtype
         self.disk_dir = Path(disk_dir).expanduser() if disk_dir else None
         if self.disk_dir is not None:
             self.disk_dir.mkdir(parents=True, exist_ok=True)
         self._cache: Dict[str, CanonicalFeatureRecord] = {}
-        self._ordered_ids: List[str] = []
 
     def __len__(self) -> int:
         return len(self._cache)
@@ -55,63 +65,8 @@ class CanonicalFeatureCache:
         if rec is None:
             rec = self._featurize_sign(sign, sid)
             self._save_to_disk(sign, rec)
-        return self._remember(sid, rec)
-
-    def precompute_all(self, verbose: bool = True,
-                       limit: Optional[int] = None,
-                       progress_every: int = 50) -> Dict[str, int]:
-        names = self.source.list_sign_names()
-        return self.precompute(names, verbose=verbose, limit=limit,
-                               progress_every=progress_every)
-
-    def precompute(self, sign_names: Iterable[str], verbose: bool = True,
-                   limit: Optional[int] = None,
-                   progress_every: int = 50) -> Dict[str, int]:
-        names = list(dict.fromkeys(sign_names))
-        if limit is not None:
-            names = names[:limit]
-
-        stats = {"total": len(names), "computed": 0, "cached": 0, "disk_cached": 0}
-
-        for i, name in enumerate(names, start=1):
-            sign = SignResolver.from_name(name)
-            sid = self.source.get_id(sign)
-            if sid is None:
-                raise KeyError(f"{name} is listed by the source but has no source id")
-
-            if sid in self._cache:
-                stats["cached"] += 1
-            else:
-                rec = self._load_from_disk(sign, sid)
-                if rec is not None:
-                    stats["disk_cached"] += 1
-                else:
-                    rec = self._featurize_sign(sign, sid)
-                    self._save_to_disk(sign, rec)
-                    stats["computed"] += 1
-                self._remember(sid, rec)
-
-            self._report_precompute(i, len(names), stats, verbose, progress_every)
-        return stats
-
-    def _remember(self, sid: str, rec: CanonicalFeatureRecord) -> CanonicalFeatureRecord:
         self._cache[sid] = rec
-        if sid not in self._ordered_ids:
-            self._ordered_ids.append(sid)
         return rec
-
-    @staticmethod
-    def _report_precompute(
-        i: int,
-        total: int,
-        stats: Dict[str, int],
-        verbose: bool,
-        progress_every: int,
-    ) -> None:
-        if verbose and (i % progress_every == 0 or i == total):
-            print(f"    [precompute] {i}/{total} "
-                  f"(computed={stats['computed']}, cached={stats['cached']}, "
-                  f"disk={stats['disk_cached']})")
 
     def _disk_path(self, sign: Sign) -> Optional[Path]:
         if self.disk_dir is None:
@@ -125,15 +80,8 @@ class CanonicalFeatureCache:
         path = self._disk_path(sign)
         if path is None or not path.exists():
             return None
-        try:
-            data = torch.load(
-                path, map_location=self.store_device, weights_only=False
-            )
-        except TypeError:
-            data = torch.load(path, map_location=self.store_device)
-        feature_map = data["feature_map"].to(
-            device=self.store_device, dtype=self.store_dtype
-        )
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        feature_map = data["feature_map"].to(dtype=self.dtype)
         img = data["img"]
         if not isinstance(img, np.ndarray):
             img = np.asarray(img, dtype=np.uint8)
@@ -150,9 +98,7 @@ class CanonicalFeatureCache:
         if path is None:
             return
         payload = {
-            "feature_map": rec.feature_map.detach().to(
-                device=self.store_device, dtype=self.store_dtype
-            ),
+            "feature_map": rec.feature_map.detach().cpu().to(dtype=self.dtype),
             "img": rec.img,
             "img_size": rec.img_size,
             "sign_id": rec.sign_id,
@@ -164,85 +110,174 @@ class CanonicalFeatureCache:
         img = self.source.get_image(sign)
         if img is None:
             raise KeyError(f"{sign.name} has no canonical image")
-        with torch.no_grad():
-            fm = self.wrapper.featurize(Image.fromarray(_to_rgb(img)))
-        fm_cpu = fm.detach().to(device=self.store_device, dtype=self.store_dtype,
-                                non_blocking=False)
-        del fm
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         return CanonicalFeatureRecord(
-            feature_map=fm_cpu,
+            feature_map=self.featurize(img).cpu().to(dtype=self.dtype),
             img=img, img_size=img.shape[:2],
             sign_id=sid, sign_name=sign.name,
         )
 
-    @property
-    def ordered_records(self) -> List[CanonicalFeatureRecord]:
-        return [self._cache[sid] for sid in self._ordered_ids]
+    def featurize(self, image: np.ndarray) -> torch.Tensor:
+        with torch.no_grad():
+            return self.wrapper.featurize(
+                Image.fromarray(_to_rgb(image))
+            ).detach()
 
-    @property
-    def ready(self) -> bool:
-        return len(self._cache) > 0
+    def match(
+        self,
+        record: CanonicalFeatureRecord,
+        image: np.ndarray,
+        config: DiftMatchConfig,
+    ) -> "DiftCropMatchResult":
+        return self.match_features(
+            record,
+            self.featurize(image),
+            image.shape[:2],
+            config,
+        )
+
+    def match_features(
+        self,
+        record: CanonicalFeatureRecord,
+        feature_map: torch.Tensor,
+        image_shape: Tuple[int, int],
+        config: DiftMatchConfig,
+    ) -> "DiftCropMatchResult":
+        return match_dift_features(
+            record.feature_map,
+            feature_map,
+            record.img.shape[:2],
+            image_shape,
+            config,
+        )
 
 
 @dataclass
 class DiftAlignmentConfig:
-    precompute_limit: Optional[int] = None
     feature_viz_max_signs: int = 12
     affine_probe_iteration: Optional[int] = 10
     affine_probe_padding_ratio: float = 0.2
     affine_probe_max_boxes: Optional[int] = None
-    affine_probe_max_matches: int = 300
-    affine_probe_min_matches: int = 3
-    affine_probe_ransac_threshold: Optional[float] = None
     affine_probe_thumb: int = 128
     canonical_overlay_max_boxes: Optional[int] = None
+    manual_match_max_lines: int = 80
+    manual_match_thumb: int = 360
+    match: DiftMatchConfig = field(default_factory=DiftMatchConfig)
+
+
+@dataclass
+class CanonicalFeatureSet:
+    source: CanonicalSignSource
+    cache: CanonicalFeatureCache
+    period: str
+
+
+@dataclass
+class DiftRuntime:
+    model: DiftModel
+    source: CanonicalSignSource
+    feature_dir: Optional[str] = None
+    config: DiftAlignmentConfig = field(default_factory=DiftAlignmentConfig)
+    _sources: Dict[str, CanonicalSignSource] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _caches: Dict[str, CanonicalFeatureCache] = field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    def setup(self, period: str) -> CanonicalFeatureSet:
+        source = self._sources.get(period)
+        if source is None:
+            source = self.source.for_period(period)
+            self._sources[period] = source
+
+        key = source.cache_namespace()
+        cache = self._caches.get(key)
+        if cache is None:
+            cache = CanonicalFeatureCache(
+                source,
+                self.model.make_wrapper(),
+                disk_dir=self.feature_dir,
+            )
+            self._caches[key] = cache
+
+        return CanonicalFeatureSet(
+            source=source,
+            cache=cache,
+            period=period,
+        )
 
 
 @dataclass
 class DiftAffineProbeResult:
-    sign_name: str
     sign_box: Box
     crop_img: np.ndarray
     crop_offset: Tuple[int, int]
     padded_bbox: Tuple[int, int, int, int]
-    canonical_img: Optional[np.ndarray]
+    canonical_img: Optional[np.ndarray] = None
+    match: Optional["DiftCropMatchResult"] = None
+    message: str = ""
+
+    @property
+    def sign_name(self) -> str:
+        return self.sign_box.sign_name
+
+    @property
+    def affine(self) -> Optional[np.ndarray]:
+        return self.match.affine if self.match else None
+
+    @property
+    def affine_full(self) -> Optional[np.ndarray]:
+        return _affine_with_offset(self.affine, self.crop_offset)
+
+    @property
+    def n_matches(self) -> int:
+        return self.match.n_matches if self.match else 0
+
+    @property
+    def n_inliers(self) -> int:
+        return self.match.n_inliers if self.match else 0
+
+    @property
+    def mean_inlier_similarity(self) -> float:
+        return self.match.mean_inlier_similarity if self.match else 0.0
+
+
+@dataclass
+class DiftCropMatchResult:
+    """Local DIFT matches and an interpretable, uncalibrated match score."""
+
     affine: Optional[np.ndarray]
-    affine_full: Optional[np.ndarray]
+    src_points: np.ndarray
+    dst_points: np.ndarray
+    similarities: np.ndarray
+    inlier_mask: np.ndarray
     n_matches: int
     n_inliers: int
     mean_inlier_similarity: float
+    semantic_score: float
+    global_similarity_score: float
+    geometry_score: float
+    support_score: float
+    score: float
     message: str = ""
 
+    @property
+    def coarse_score(self) -> float:
+        return self.geometry_score * self.support_score
 
-def _probe_result(
-    sb: Box,
-    crop_img: np.ndarray,
-    crop_offset: Tuple[int, int],
-    padded_bbox: Tuple[int, int, int, int],
-    canonical_img: Optional[np.ndarray] = None,
-    affine: Optional[np.ndarray] = None,
-    affine_full: Optional[np.ndarray] = None,
-    n_matches: int = 0,
-    n_inliers: int = 0,
-    mean_inlier_similarity: float = 0.0,
-    message: str = "",
-) -> DiftAffineProbeResult:
-    return DiftAffineProbeResult(
-        sign_name=sb.sign_name,
-        sign_box=sb.copy(),
-        crop_img=crop_img,
-        crop_offset=crop_offset,
-        padded_bbox=padded_bbox,
-        canonical_img=canonical_img,
-        affine=affine,
-        affine_full=affine_full,
-        n_matches=n_matches,
-        n_inliers=n_inliers,
-        mean_inlier_similarity=mean_inlier_similarity,
-        message=message,
-    )
+
+@dataclass
+class CanonicalOverlay:
+    iteration: int
+    image: np.ndarray
+    stats: Dict[str, Any]
+
+
+@dataclass
+class DiftAffineProbe:
+    iteration: int
+    boxes: Boxes
+    results: List[DiftAffineProbeResult]
 
 
 def canonical_feature_norm_image(feature_map: torch.Tensor) -> np.ndarray:
@@ -279,13 +314,10 @@ def render_canonical_feature_grid(
 
 
 def collect_detected_canonical_feature_rows(
-    boxes: Optional[Boxes],
-    cache: Optional[CanonicalFeatureCache],
+    boxes: Boxes,
+    cache: CanonicalFeatureCache,
     max_signs: int = 12,
 ) -> Tuple[List[Tuple[str, CanonicalFeatureRecord]], List[str], int]:
-    if boxes is None or cache is None:
-        return [], [], 0
-
     detected_names = list(dict.fromkeys(
         sb.sign_name for sb in boxes
     ))
@@ -319,8 +351,6 @@ def render_canonical_sign_overlay(
         "skipped": 0,
         "missing_names": [],
     }
-    if image is None or boxes is None or cache is None:
-        return overlay, stats
 
     if max_boxes is not None:
         boxes = boxes[:max_boxes]
@@ -329,7 +359,7 @@ def render_canonical_sign_overlay(
     for sb in boxes:
         stats["total"] += 1
         rec = cache.get(sb.sign)
-        if rec is None or rec.img is None:
+        if rec is None:
             stats["missing"] += 1
             missing_names.append(sb.sign_name)
             if draw_boxes:
@@ -354,78 +384,75 @@ def render_canonical_sign_overlay(
 def build_dift_affine_probe(
     boxes: Boxes,
     cache: CanonicalFeatureCache,
-    padding_ratio: float = 0.2,
-    max_boxes: Optional[int] = None,
-    max_matches: int = 300,
-    min_matches: int = 3,
-    ransac_threshold: Optional[float] = None,
+    config: DiftAlignmentConfig,
 ) -> List[DiftAffineProbeResult]:
     """Estimate canonical-to-crop affine transforms for current sign boxes."""
-    if boxes is None or cache is None:
-        return []
-
     results: List[DiftAffineProbeResult] = []
-    if max_boxes is not None:
-        boxes = boxes[:max_boxes]
+    if config.affine_probe_max_boxes is not None:
+        boxes = boxes[:config.affine_probe_max_boxes]
 
     for sb in boxes:
-        crop, offset, padded_bbox = crop_sign_box(sb, padding_ratio)
+        padded_bbox = sb.crop_bounds(config.affine_probe_padding_ratio)
+        crop = sb.crop_image(config.affine_probe_padding_ratio)
+        offset = padded_bbox[:2]
         rec = cache.get(sb.sign)
         if rec is None:
-            results.append(_probe_result(sb, crop, offset, padded_bbox, message="missing canonical"))
+            results.append(DiftAffineProbeResult(
+                sign_box=sb.copy(),
+                crop_img=crop,
+                crop_offset=offset,
+                padded_bbox=padded_bbox,
+                message="missing canonical",
+            ))
             continue
 
-        crop_ft = _featurize_image(cache.wrapper, crop)
-        affine, n_matches, n_inliers, mean_sim = estimate_dift_affine(
-            rec.feature_map,
-            crop_ft,
-            src_img_shape=rec.img.shape[:2],
-            dst_img_shape=crop.shape[:2],
-            max_matches=max_matches,
-            min_matches=min_matches,
-            ransac_threshold=ransac_threshold,
-        )
-        affine_full = _affine_with_offset(affine, offset)
-        results.append(_probe_result(
-            sb, crop, offset, padded_bbox,
+        match = cache.match(rec, crop, config.match)
+        results.append(DiftAffineProbeResult(
+            sign_box=sb.copy(),
+            crop_img=crop,
+            crop_offset=offset,
+            padded_bbox=padded_bbox,
             canonical_img=rec.img,
-            affine=affine,
-            affine_full=affine_full,
-            n_matches=n_matches,
-            n_inliers=n_inliers,
-            mean_inlier_similarity=mean_sim,
-            message="" if affine is not None else "affine failed",
+            match=match,
+            message=match.message,
         ))
     return results
 
 
-def crop_sign_box(
-    sb: Box,
-    padding_ratio: float,
-) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int, int, int]]:
-    crop = sb.crop_image(padding_ratio)
-    x1, y1, x2, y2 = sb.crop_bounds(padding_ratio)
-    return crop, (x1, y1), (x1, y1, x2, y2)
-
-
-def estimate_dift_affine(
+def match_dift_features(
     src_ft: torch.Tensor,
     dst_ft: torch.Tensor,
     src_img_shape: Tuple[int, int],
     dst_img_shape: Tuple[int, int],
-    max_matches: int = 300,
-    min_matches: int = 3,
-    ransac_threshold: Optional[float] = None,
-) -> Tuple[Optional[np.ndarray], int, int, float]:
-    """Estimate a 2x3 affine from source canonical pixels to crop pixels."""
-    src_pts, dst_pts, sims = _best_buddies_points(
-        src_ft, dst_ft, src_img_shape, dst_img_shape, max_matches=max_matches
+    config: DiftMatchConfig = DiftMatchConfig(),
+) -> DiftCropMatchResult:
+    """Match local features and score semantic plus geometric agreement.
+
+    The score is not a calibrated probability. It combines mean cosine
+    similarity of affine inliers with their ratio among mutual matches and a
+    small-match penalty:
+
+        score = semantic * sqrt(geometry * support)
+    """
+    src_pts, dst_pts, sims, global_similarity = _best_buddies_points(
+        src_ft,
+        dst_ft,
+        src_img_shape,
+        dst_img_shape,
+        max_matches=config.max_matches,
     )
     n_matches = len(src_pts)
-    if n_matches < min_matches:
-        return None, n_matches, 0, 0.0
+    if n_matches < config.min_matches:
+        return _crop_match_result(
+            src_pts,
+            dst_pts,
+            sims,
+            global_similarity_score=global_similarity,
+            message=f"need at least {config.min_matches} mutual matches",
+            min_support=config.min_support,
+        )
 
-    threshold = ransac_threshold
+    threshold = config.ransac_threshold
     if threshold is None:
         threshold = max(3.0, 0.06 * max(dst_img_shape))
 
@@ -445,12 +472,71 @@ def estimate_dift_affine(
         if affine is not None:
             break
     if affine is None:
-        return None, n_matches, 0, 0.0
+        return _crop_match_result(
+            src_pts,
+            dst_pts,
+            sims,
+            global_similarity_score=global_similarity,
+            message="affine RANSAC failed",
+            min_support=config.min_support,
+        )
 
-    mask = inliers.ravel().astype(bool) if inliers is not None else np.ones(n_matches, dtype=bool)
-    n_inliers = int(mask.sum())
-    mean_sim = float(sims[mask].mean()) if n_inliers else 0.0
-    return affine, n_matches, n_inliers, mean_sim
+    mask = (
+        inliers.ravel().astype(bool)
+        if inliers is not None
+        else np.ones(n_matches, dtype=bool)
+    )
+    return _crop_match_result(
+        src_pts,
+        dst_pts,
+        sims,
+        global_similarity_score=global_similarity,
+        affine=affine,
+        inlier_mask=mask,
+        min_support=config.min_support,
+    )
+
+
+def _crop_match_result(
+    src_points: np.ndarray,
+    dst_points: np.ndarray,
+    similarities: np.ndarray,
+    global_similarity_score: float = 0.0,
+    affine: Optional[np.ndarray] = None,
+    inlier_mask: Optional[np.ndarray] = None,
+    min_support: int = 12,
+    message: str = "",
+) -> DiftCropMatchResult:
+    n_matches = len(src_points)
+    if inlier_mask is None:
+        inlier_mask = np.zeros(n_matches, dtype=bool)
+    else:
+        inlier_mask = np.asarray(inlier_mask, dtype=bool)
+    n_inliers = int(inlier_mask.sum())
+    mean_similarity = (
+        float(similarities[inlier_mask].mean()) if n_inliers else 0.0
+    )
+    semantic = float(np.clip(mean_similarity, 0.0, 1.0))
+    global_similarity = float(np.clip(global_similarity_score, 0.0, 1.0))
+    geometry = float(n_inliers / n_matches) if n_matches else 0.0
+    support = float(min(1.0, n_inliers / max(1, min_support)))
+    score = float(semantic * np.sqrt(geometry * support))
+    return DiftCropMatchResult(
+        affine=affine,
+        src_points=src_points,
+        dst_points=dst_points,
+        similarities=similarities,
+        inlier_mask=inlier_mask,
+        n_matches=n_matches,
+        n_inliers=n_inliers,
+        mean_inlier_similarity=mean_similarity,
+        semantic_score=semantic,
+        global_similarity_score=global_similarity,
+        geometry_score=geometry,
+        support_score=support,
+        score=score,
+        message=message,
+    )
 
 
 _OPTIMIZED_BBOX_COLOR = (0, 165, 255)      # orange, BGR
@@ -516,9 +602,105 @@ def render_dift_affine_probe(
     return overlay, grid
 
 
-def _featurize_image(wrapper, img: np.ndarray) -> torch.Tensor:
-    with torch.no_grad():
-        return wrapper.featurize(Image.fromarray(_to_rgb(img))).detach()
+def render_dift_feature_matches(
+    canonical_img: np.ndarray,
+    crop_img: np.ndarray,
+    result: DiftCropMatchResult,
+    thumb: int = 360,
+    max_lines: int = 80,
+) -> np.ndarray:
+    """Render canonical-to-crop mutual matches, highlighting RANSAC inliers."""
+    header_h = 72
+    gap = 24
+    margin = 12
+    canvas_w = margin * 2 + thumb * 2 + gap
+    canvas_h = header_h + thumb + margin
+    canvas = np.full((canvas_h, canvas_w, 3), 28, np.uint8)
+
+    left, left_scale, left_offset = _fit_to_square_with_geometry(
+        canonical_img, thumb
+    )
+    right, right_scale, right_offset = _fit_to_square_with_geometry(
+        crop_img, thumb
+    )
+    left_x = margin
+    right_x = margin + thumb + gap
+    canvas[header_h:header_h + thumb, left_x:left_x + thumb] = left
+    canvas[header_h:header_h + thumb, right_x:right_x + thumb] = right
+
+    _draw_text(
+        canvas,
+        (
+            f"score={result.score:.3f}  semantic={result.semantic_score:.3f}  "
+            f"geometry={result.geometry_score:.3f}  support={result.support_score:.3f}"
+        ),
+        24,
+        x=margin,
+        scale=0.5,
+    )
+    _draw_text(
+        canvas,
+        (
+            f"green=inlier, red=outlier  "
+            f"inliers={result.n_inliers}/{result.n_matches}"
+        ),
+        50,
+        x=margin,
+        scale=0.45,
+    )
+    _draw_text(canvas, "canonical", header_h - 7, x=left_x, scale=0.43)
+    _draw_text(canvas, "selected crop", header_h - 7, x=right_x, scale=0.43)
+
+    indices = _display_match_indices(result, max_lines)
+    for idx in indices:
+        src_x, src_y = result.src_points[idx]
+        dst_x, dst_y = result.dst_points[idx]
+        p1 = (
+            int(round(left_x + left_offset[0] + src_x * left_scale)),
+            int(round(header_h + left_offset[1] + src_y * left_scale)),
+        )
+        p2 = (
+            int(round(right_x + right_offset[0] + dst_x * right_scale)),
+            int(round(header_h + right_offset[1] + dst_y * right_scale)),
+        )
+        is_inlier = bool(result.inlier_mask[idx])
+        color = (80, 220, 100) if is_inlier else (90, 90, 210)
+        cv2.line(canvas, p1, p2, color, 1, cv2.LINE_AA)
+        cv2.circle(canvas, p1, 2, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, p2, 2, color, -1, cv2.LINE_AA)
+    return canvas
+
+
+def render_dift_crop_warp(
+    canonical_img: np.ndarray,
+    crop_img: np.ndarray,
+    result: DiftCropMatchResult,
+) -> np.ndarray:
+    """Overlay the affine-warped canonical image on the selected crop."""
+    crop = _to_bgr(crop_img)
+    if result.affine is None:
+        return crop.copy()
+
+    return _blend_affine(canonical_img, crop, result.affine)
+
+
+def _display_match_indices(
+    result: DiftCropMatchResult,
+    max_lines: int,
+) -> np.ndarray:
+    if result.n_matches == 0 or max_lines <= 0:
+        return np.zeros(0, dtype=np.int64)
+
+    order = np.argsort(result.similarities)[::-1]
+    inliers = order[result.inlier_mask[order]]
+    outliers = order[~result.inlier_mask[order]]
+    max_inliers = min(len(inliers), max(1, int(max_lines * 0.75)))
+    max_outliers = min(len(outliers), max_lines - max_inliers)
+    if max_inliers + max_outliers < max_lines:
+        max_inliers = min(len(inliers), max_lines - max_outliers)
+
+    # Draw outliers first so accepted correspondences remain legible.
+    return np.concatenate([outliers[:max_outliers], inliers[:max_inliers]])
 
 
 def _best_buddies_points(
@@ -527,7 +709,13 @@ def _best_buddies_points(
     src_img_shape: Tuple[int, int],
     dst_img_shape: Tuple[int, int],
     max_matches: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Vectorized ProtoSnap best-buddies with per-image pixel coordinates.
+
+    ProtoSnap's helper assumes one square image size for both sides and uses a
+    quadratic Python loop. This equivalent keeps similarities for scoring and
+    maps each feature grid to its own source image shape.
+    """
     src = src_ft.detach().float()
     dst = dst_ft.detach().float()
     device = dst.device
@@ -537,6 +725,9 @@ def _best_buddies_points(
     src_flat = src.reshape(c, -1)
     dst_flat = dst.reshape(c, -1)
     sim = src_flat.T @ dst_flat
+    global_similarity = 0.5 * (
+        sim.max(dim=1).values.mean() + sim.max(dim=0).values.mean()
+    )
 
     src_to_dst = sim.argmax(dim=1)
     dst_to_src = sim.argmax(dim=0)
@@ -562,7 +753,7 @@ def _best_buddies_points(
         dst.shape[1], dst.shape[2],
         dst_img_shape[0], dst_img_shape[1],
     )
-    return src_pts, dst_pts, mutual_sim.detach().cpu().numpy()
+    return src_pts, dst_pts, mutual_sim.detach().cpu().numpy(), float(global_similarity.detach().cpu())
 
 
 def _feature_indices_to_image_points(
@@ -585,14 +776,7 @@ def _warp_overlay(res: DiftAffineProbeResult) -> np.ndarray:
     crop = _to_bgr(res.crop_img)
     if res.canonical_img is None or res.affine is None:
         return _draw_local_bbox(crop, res.sign_box, res.crop_offset)
-    src = _to_bgr(res.canonical_img)
-    h, w = crop.shape[:2]
-    warped = cv2.warpAffine(src, res.affine, (w, h), flags=cv2.INTER_LINEAR)
-    mask_src = np.full(src.shape[:2], 255, np.uint8)
-    mask = cv2.warpAffine(mask_src, res.affine, (w, h), flags=cv2.INTER_NEAREST) > 0
-    out = crop.copy()
-    out[mask] = (crop[mask].astype(np.float32) * 0.55
-                 + warped[mask].astype(np.float32) * 0.45).astype(np.uint8)
+    out = _blend_affine(res.canonical_img, crop, res.affine)
     _draw_local_bbox_inplace(out, res.sign_box, res.crop_offset,
                              _OPTIMIZED_BBOX_COLOR)
     warped_corners = _transformed_image_corners(
@@ -611,6 +795,29 @@ def _warp_overlay(res: DiftAffineProbeResult) -> np.ndarray:
                       thickness=1)
     _draw_center_marker(out, before_center, _OPTIMIZED_BBOX_COLOR, radius=3)
     _draw_center_marker(out, after_center, _TRANSFORMED_BBOX_COLOR, radius=3)
+    return out
+
+
+def _blend_affine(
+    source: np.ndarray,
+    target: np.ndarray,
+    affine: np.ndarray,
+) -> np.ndarray:
+    source = _to_bgr(source)
+    target = _to_bgr(target)
+    h, w = target.shape[:2]
+    warped = cv2.warpAffine(source, affine, (w, h), flags=cv2.INTER_LINEAR)
+    mask = cv2.warpAffine(
+        np.full(source.shape[:2], 255, np.uint8),
+        affine,
+        (w, h),
+        flags=cv2.INTER_NEAREST,
+    ) > 0
+    out = target.copy()
+    out[mask] = (
+        target[mask].astype(np.float32) * 0.55
+        + warped[mask].astype(np.float32) * 0.45
+    ).astype(np.uint8)
     return out
 
 
@@ -762,13 +969,21 @@ def _heat_to_bgr(heat: np.ndarray) -> np.ndarray:
 
 
 def _fit_to_square(img: Optional[np.ndarray], size: int) -> np.ndarray:
+    canvas, _, _ = _fit_to_square_with_geometry(img, size)
+    return canvas
+
+
+def _fit_to_square_with_geometry(
+    img: Optional[np.ndarray],
+    size: int,
+) -> Tuple[np.ndarray, float, Tuple[int, int]]:
     canvas = np.full((size, size, 3), 42, np.uint8)
     if img is None:
-        return canvas
+        return canvas, 1.0, (0, 0)
     im = _to_bgr(img)
     h, w = im.shape[:2]
     if h <= 0 or w <= 0:
-        return canvas
+        return canvas, 1.0, (0, 0)
     scale = size / max(h, w)
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
@@ -776,7 +991,7 @@ def _fit_to_square(img: Optional[np.ndarray], size: int) -> np.ndarray:
     y0 = (size - new_h) // 2
     x0 = (size - new_w) // 2
     canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
-    return canvas
+    return canvas, scale, (x0, y0)
 
 
 def _blank_panel(width: int, height: int, text: str) -> np.ndarray:

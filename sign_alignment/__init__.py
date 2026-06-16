@@ -34,6 +34,12 @@ from .detector import (
 
 from .dift_model import (
     DiftConfig,
+    DiftModel,
+)
+from .dift_align import (
+    DiftAlignmentConfig,
+    DiftMatchConfig,
+    DiftRuntime,
 )
 
 from .visualizer import (
@@ -92,6 +98,10 @@ __all__ = [
     'SingleImageDetector',
     'TabletImageDetector',
     'DiftConfig',
+    'DiftModel',
+    'DiftAlignmentConfig',
+    'DiftMatchConfig',
+    'DiftRuntime',
     
     # Visualization
     'BboxVisualizer',

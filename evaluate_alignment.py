@@ -30,7 +30,7 @@ from sign_alignment import (
 )
 from sign_alignment.visualizer import ColorConfig
 from sign_alignment.pipeline import (
-    CropContext, PipelineConfig, Runner, SampleState, Step, VisOptions,
+    CropContext, Runner, SampleState, Step, VisOptions,
     align_text_rows,
     build_sign_match_info,
     create_box_sets,
@@ -619,7 +619,7 @@ def _predict_detection_crops(
     """
     s = context.state
     raw_preds: List[Box] = []
-    for crop_idx in range(len(context.config.tablet_detector.get_crop_tablets())):
+    for crop_idx in range(len(context.tablet_detector.get_crop_tablets())):
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
@@ -659,7 +659,7 @@ def _predict_psr_crops(
     """
     s = context.state
     preds: List[Box] = []
-    for crop_idx in range(len(context.config.tablet_detector.get_crop_tablets())):
+    for crop_idx in range(len(context.tablet_detector.get_crop_tablets())):
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
@@ -720,7 +720,7 @@ def run_predictions(
         Tuple of (all_results, skipped) where all_results is a list of dicts with
         keys 'fragment_id', 'preds' (List[Box]), 'gts' (List[Box]).
     """
-    context.config.psr_params = psr_params  # None = step defaults
+    context.psr_params = psr_params  # None = step defaults
     vis = VisOptions(info=False, display=False, save=False)
     runner = Runner(context, vis=vis)
     all_results = []
@@ -961,15 +961,12 @@ if __name__ == "__main__":
     print("Model loaded.")
 
     context = CropContext(
-        config=PipelineConfig(
-            model_config=model_config,
-            tablet_detector=tablet_detector,
-            local_source=test_source,
-            api_source=SubtabletEBLAPISource(),
-            color_config=ColorConfig,
-            output_dir=EVAL_OUTPUT_DIR,
-        ),
-        task_type="evaluation"
+        tablet_detector=tablet_detector,
+        local_source=test_source,
+        api_source=SubtabletEBLAPISource(),
+        color_config=ColorConfig,
+        output_dir=EVAL_OUTPUT_DIR,
+        task_type="evaluation",
     )
 
     eval_fragments = fragments[:EVAL_SAMPLE_LIMIT]

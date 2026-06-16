@@ -23,19 +23,18 @@ class ModelConfig:
 
 
 class BaseDetector(ABC):
-    def __init__(self, model_config: Optional[ModelConfig] = None, score_threshold: float = 0.5, model = None):
+    def __init__(
+        self,
+        model_config: Optional[ModelConfig] = None,
+        score_threshold: float = 0.5,
+        is_load_now: bool = True,
+        model=None,
+    ):
         self.score_threshold = score_threshold
-        
-        if model is not None:
-            self.model = model
-        elif model_config is not None:
-            print("Initializing detector, loading model...")
-            register_all_modules()
-            model_config.device = self._select_device(model_config.device)
-            print(f"Using device: {model_config.device}")
-            self.model = init_detector(model_config.config_file, model_config.checkpoint_file, device=model_config.device)
-        else:
-            raise ValueError("Either model_config or model must be provided")
+        self.model_config = model_config
+        self.model = model
+        if self.model is None and is_load_now:
+            self.load_model()
     
     @abstractmethod
     def detect(self, tablet: Tablet) -> Boxes:
@@ -45,19 +44,22 @@ class BaseDetector(ABC):
         if device == 'auto':
             device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         return device
+    
+    def load_model(self) -> None:
+        print("Loading model...")
+        register_all_modules()
+        device = self._select_device(self.model_config.device)
+        print(f"Using device: {device}")
+        self.model = init_detector(
+            self.model_config.config_file,
+            self.model_config.checkpoint_file,
+            device=device,
+        )
 
     def unload_model(self) -> None:
-        """Release the detector model from GPU memory."""
-        import gc
-        if self.model is None:
-            return
-        self.model.cpu()
-        del self.model
         self.model = None
-        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print("Detector model unloaded from GPU.")
 
     def _filter_detections(self, labels, bboxes, scores, tablet: Tablet) -> Boxes:
         mask = scores > self.score_threshold
@@ -93,9 +95,17 @@ class SingleImageDetector(BaseDetector):
         return self._filter_detections(labels, bboxes, scores, tablet)
     
 class TabletImageDetector(BaseDetector):
-    def __init__(self, model_config: ModelConfig, score_threshold: float = 0.5, 
-                 visualize_crop: bool = False, logging_crop: bool = False, keep_crops: bool = False, is_crop_itself: bool = False):
-        super().__init__(model_config, score_threshold)
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        score_threshold: float = 0.5,
+        visualize_crop: bool = False,
+        logging_crop: bool = False,
+        keep_crops: bool = False,
+        is_crop_itself: bool = False,
+        is_load_now: bool = True,
+    ):
+        super().__init__(model_config, score_threshold, is_load_now=is_load_now)
         self.visualize_crop = visualize_crop
         self.logging_crop = logging_crop
         self.keep_crops = keep_crops
@@ -106,6 +116,9 @@ class TabletImageDetector(BaseDetector):
         
     
     def detect(self, tablet: Tablet) -> Boxes:
+        if self.model is None:
+            self.load_model()
+
         if self.keep_crops:
             self.crop_tablets = []
             self.crop_boxes = []

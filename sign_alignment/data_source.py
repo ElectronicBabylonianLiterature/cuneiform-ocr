@@ -37,6 +37,9 @@ def _decode_base64_gray(image: str) -> np.ndarray:
 
 
 class CanonicalSignSource:
+    def for_period(self, period: str) -> "CanonicalSignSource":
+        return self
+
     def is_ready(self) -> bool:
         return bool(self.list_sign_names())
 
@@ -64,7 +67,7 @@ class EBLMongoCanonicalSource(CanonicalSignSource):
     def __init__(
         self,
         mongodb_uri: Optional[str],
-        period: Optional[str],
+        period: Optional[str] = None,
         db_name: str = "ebl",
         form: str = "canonical1",
         require_centroid: bool = True,
@@ -75,7 +78,19 @@ class EBLMongoCanonicalSource(CanonicalSignSource):
         self.form = form
         self.require_centroid = require_centroid
         self._images_by_sign: Dict[str, np.ndarray] = {}
-        self._load()
+        if period is not None:
+            self._load()
+
+    def for_period(self, period: str) -> "EBLMongoCanonicalSource":
+        if period == self.period:
+            return self
+        return EBLMongoCanonicalSource(
+            mongodb_uri=self.mongodb_uri,
+            period=period,
+            db_name=self.db_name,
+            form=self.form,
+            require_centroid=self.require_centroid,
+        )
 
     def get_image(self, sign: Sign) -> Optional[np.ndarray]:
         return self._images_by_sign.get(sign.name)
