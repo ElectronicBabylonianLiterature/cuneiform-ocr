@@ -35,140 +35,105 @@ def _decode_base64_gray(image: str) -> np.ndarray:
     raw = base64.b64decode(image)
     return np.asarray(Image.open(io.BytesIO(raw)).convert("L"))
 
-
-class CanonicalSignSource:
-    def for_period(self, period: str) -> "CanonicalSignSource":
-        return self
-
-    def is_ready(self) -> bool:
-        return bool(self.list_sign_names())
-
-    def get_image(self, sign: Sign) -> Optional[np.ndarray]:
+# next generate source class
+class DataSource:
+    def get(self, sign_name: str, period: str) -> Optional[np.ndarray]:
         raise NotImplementedError
+    
+class PrototypeSource(DataSource):
+    SIGNS_API_URL = "https://www.ebl.lmu.de/api/signs"
+    IMAGE_SIZE = 512
+    PADDING = 20
+    PERIOD_FONTS = {
+        "Old-Babylonian-Monumental": "SantakkuM.woff",
+        "Old-Babylonian-Literature": "OBFreie.woff",
+        "Old-Babylonian-Cursive": "Santakku.woff",
+        "Hittite": "UllikummiA.woff",
+        "Neo-Assyrian": "Assurbanipal.woff",
+        "Neo-Babylonian": "Esagil.woff",
+    }
+    
+    def __init__(self):
+        pass
+    
+    def get(self, sign_name: str, period: str):
+        FONT_DIR = Path(__file__).parent / "fonts"
+        if period not in self.PERIOD_FONTS:
+            src_period = "Neo-Assyrian"
+            print(f"Warning: period '{period}' not found, using '{src_period}'")
+        else:
+            src_period = period
+        font_file = FONT_DIR / self.PERIOD_FONTS[src_period]
 
-    def get_id(self, sign: Sign) -> Optional[str]:
-        raise NotImplementedError
+        from PIL import Image, ImageDraw, ImageFont
 
-    def list_sign_names(self) -> List[str]:
-        raise NotImplementedError
+        response = requests.get(
+            f"{self.SIGNS_API_URL}/{requests.utils.quote(sign_name, safe='')}",
+            timeout=1,
+        )
+        response.raise_for_status()
+        unicode_values = response.json().get("unicode", [])
 
-    def cache_namespace(self) -> str:
-        return type(self).__name__
+        if not unicode_values:
+            print(f"Warning: sign '{sign_name}' has no Unicode value")
+            return None
 
-    def cache_file_stem(self, sign: Sign) -> Optional[str]:
-        sid = self.get_id(sign)
-        return _safe_cache_part(sid) if sid else None
+        text = "".join(chr(codepoint) for codepoint in unicode_values)
 
-    def describe(self) -> str:
-        return type(self).__name__
+        font = ImageFont.truetype(str(font_file), self.IMAGE_SIZE)
+        probe = Image.new("RGB", (1, 1), "white")
+        draw = ImageDraw.Draw(probe)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        width = max(self.IMAGE_SIZE, bbox[2] - bbox[0] + 2 * self.PADDING)
+        height = max(self.IMAGE_SIZE, bbox[3] - bbox[1] + 2 * self.PADDING)
+
+        img = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(img)
+        x = (width - (bbox[2] - bbox[0])) // 2 - bbox[0]
+        y = (height - (bbox[3] - bbox[1])) // 2 - bbox[1]
+        draw.text((x, y), text, font=font, fill="black")
+
+        gray = img.convert("L")
+        bbox = gray.point(lambda p: 255 - p).getbbox()
+        cropped = gray.crop(bbox) if bbox else gray
+        padded = Image.new(
+            "L",
+            (cropped.width + 2 * self.PADDING, cropped.height + 2 * self.PADDING),
+            255,
+        )
+        padded.paste(cropped, (self.PADDING, self.PADDING))
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        resized = padded.resize((self.IMAGE_SIZE, self.IMAGE_SIZE), resample)
+
+        return np.array(resized)
 
 
-class EBLMongoCanonicalSource(CanonicalSignSource):
+class EBLMongoCanonicalSource(DataSource):
     def __init__(
         self,
         mongodb_uri: Optional[str],
-        period: Optional[str] = None,
         db_name: str = "ebl",
         form: str = "canonical1",
         require_centroid: bool = True,
     ):
         self.mongodb_uri = mongodb_uri
-        self.period = period
         self.db_name = db_name
         self.form = form
         self.require_centroid = require_centroid
-        self._images_by_sign: Dict[str, np.ndarray] = {}
-        if period is not None:
-            self._load()
 
-    def for_period(self, period: str) -> "EBLMongoCanonicalSource":
-        if period == self.period:
-            return self
-        return EBLMongoCanonicalSource(
-            mongodb_uri=self.mongodb_uri,
-            period=period,
-            db_name=self.db_name,
-            form=self.form,
-            require_centroid=self.require_centroid,
-        )
-
-    def get_image(self, sign: Sign) -> Optional[np.ndarray]:
-        return self._images_by_sign.get(sign.name)
-
-    def get_id(self, sign: Sign) -> Optional[str]:
-        if sign.name not in self._images_by_sign:
-            return None
-        return f"ebl/{self.period or 'period-missing'}/{self.form}/{sign.name}"
-
-    def list_sign_names(self) -> List[str]:
-        return sorted(self._images_by_sign)
-
-    def cache_namespace(self) -> str:
-        return f"ebl-mongo:{self.period or 'period-missing'}:{self.form}"
-
-    def cache_file_stem(self, sign: Sign) -> Optional[str]:
-        if sign.name not in self._images_by_sign:
-            return None
-        return "__".join(
-            _safe_cache_part(part)
-            for part in (sign.name, self.period or "period-missing", self.form)
-        )
-
-    def describe(self) -> str:
-        return (
-            f"eBL Mongo source period={self.period!r}, form={self.form!r}, "
-            f"canonical_images={len(self._images_by_sign)}"
-        )
-
-    def _load(self) -> None:
-        if not self.mongodb_uri or self.mongodb_uri == "YOUR_MONGODB_URI":
-            raise ValueError("MONGODB_URI is not configured")
-
+    def get(self, sign_name: str, period: str) -> Optional[np.ndarray]:
         from pymongo import MongoClient
 
-        client = MongoClient(self.mongodb_uri)
-        try:
-            docs = client[self.db_name]["annotations"].aggregate(
-                self._pipeline(), allowDiskUse=True
-            )
-            for item in docs:
-                sign_name = item.get("signName")
-                if not sign_name:
-                    raise ValueError(f"annotation without signName: {item}")
-                if sign_name not in self._images_by_sign:
-                    self._images_by_sign[sign_name] = _decode_base64_gray(
-                        item.get("image", "")
-                    )
-        finally:
-            client.close()
-
-        if not self._images_by_sign:
-            period_msg = f" for period {self.period!r}" if self.period else ""
-            raise RuntimeError(f"no {self.form!r} canonical images found{period_msg}")
-
-    def _pipeline(self) -> List[Dict[str, Any]]:
-        annotation_conditions: List[Dict[str, Any]] = [
-            {"$eq": ["$$annotation.data.type", "HasSign"]},
-            {"$eq": ["$$annotation.pcaClustering.form", self.form]},
-            {
-                "$ne": [
-                    {"$ifNull": ["$$annotation.croppedSign.imageId", None]},
-                    None,
-                ]
-            },
-        ]
+        annotation_match: Dict[str, Any] = {
+            "data.type": "HasSign",
+            "data.signName": sign_name,
+            "pcaClustering.form": self.form,
+            "croppedSign.imageId": {"$exists": True, "$ne": None},
+        }
         if self.require_centroid:
-            annotation_conditions.append(
-                {"$eq": ["$$annotation.pcaClustering.isCentroid", True]}
-            )
-
+            annotation_match["pcaClustering.isCentroid"] = True
         pipeline: List[Dict[str, Any]] = [
-            {
-                "$match": {
-                    "annotations.pcaClustering.form": self.form,
-                    "annotations.croppedSign.imageId": {"$exists": True},
-                }
-            },
+            {"$match": {"annotations": {"$elemMatch": annotation_match}}},
             {
                 "$lookup": {
                     "from": "fragments",
@@ -178,64 +143,52 @@ class EBLMongoCanonicalSource(CanonicalSignSource):
                 }
             },
             {"$unwind": "$fragment"},
+            {"$match": {"fragment.script.period": period}},
+            {"$unwind": "$annotations"},
+            {"$match": {
+                f"annotations.{key}": value
+                for key, value in annotation_match.items()
+            }},
+            {
+                "$lookup": {
+                    "from": "cropped_sign_images",
+                    "localField": "annotations.croppedSign.imageId",
+                    "foreignField": "_id",
+                    "as": "imageDoc",
+                }
+            },
+            {"$unwind": "$imageDoc"},
+            {
+                "$sort": {
+                    "annotations.pcaClustering.isMain": -1,
+                    "annotations.pcaClustering.clusterSize": -1,
+                    "annotations.pcaClustering.clusterRank": 1,
+                }
+            },
+            {"$limit": 1},
+            {
+                "$project": {
+                    "_id": 0,
+                    "fragmentNumber": 1,
+                    "signName": "$annotations.data.signName",
+                    "image": "$imageDoc.image",
+                    "period": "$fragment.script.period",
+                    "annotationId": "$annotations.data.id",
+                    "pcaClustering": "$annotations.pcaClustering",
+                }
+            },
         ]
-        if self.period:
-            pipeline.append({"$match": {"fragment.script.period": self.period}})
-
-        pipeline.extend(
-            [
-                {
-                    "$project": {
-                        "fragmentNumber": 1,
-                        "annotations": {
-                            "$filter": {
-                                "input": "$annotations",
-                                "as": "annotation",
-                                "cond": {"$and": annotation_conditions},
-                            }
-                        },
-                        "date": "$fragment.date",
-                        "period": "$fragment.script.period",
-                        "script": "$fragment.script",
-                        "provenance": "$fragment.archaeology.site",
-                    }
-                },
-                {"$unwind": "$annotations"},
-                {
-                    "$lookup": {
-                        "from": "cropped_sign_images",
-                        "localField": "annotations.croppedSign.imageId",
-                        "foreignField": "_id",
-                        "as": "imageDoc",
-                    }
-                },
-                {"$unwind": "$imageDoc"},
-                {
-                    "$project": {
-                        "_id": 0,
-                        "fragmentNumber": 1,
-                        "signName": "$annotations.data.signName",
-                        "image": "$imageDoc.image",
-                        "script": 1,
-                        "period": 1,
-                        "label": "$annotations.croppedSign.label",
-                        "date": 1,
-                        "provenance": 1,
-                        "annotationId": "$annotations.data.id",
-                        "pcaClustering": "$annotations.pcaClustering",
-                    }
-                },
-                {
-                    "$sort": {
-                        "signName": 1,
-                        "pcaClustering.isMain": -1,
-                        "pcaClustering.clusterSize": -1,
-                        "pcaClustering.clusterRank": 1,
-                    }
-                },
-            ]
-        )
-        return pipeline
+        client = MongoClient(self.mongodb_uri)
+        try:
+            item = next(
+                client[self.db_name]["annotations"].aggregate(
+                    pipeline, allowDiskUse=True
+                ),
+                None,
+            )
+            return _decode_base64_gray(item["image"]) if item else None
+        finally:
+            client.close()
 
 
 class SignAPIResolver:
@@ -420,38 +373,44 @@ class LocalTestDataSource:
 class EBLAPISource:
     BASE_URL = "https://ebl.badw.de/api"
 
-    def __init__(self, timeout: int = 60, retries: int = 3):
+    def __init__(
+        self,
+        timeout: int = 60,
+        retries: int = 3,
+        strip_subtablet_suffix: bool = False,
+    ):
         self.timeout = timeout
         self.retries = retries
+        self.strip_subtablet_suffix = strip_subtablet_suffix
         self._fragment_cache = {}
 
     def get_fragment_data(self, fragment_id: str) -> Optional[dict]:
-        if fragment_id in self._fragment_cache:
-            return self._fragment_cache[fragment_id]
+        api_fragment_id = self._api_fragment_id(fragment_id)
+        if api_fragment_id in self._fragment_cache:
+            return self._fragment_cache[api_fragment_id]
 
-        url = f"{self.BASE_URL}/fragments/{fragment_id}"
+        url = f"{self.BASE_URL}/fragments/{api_fragment_id}"
         last_err = None
         for attempt in range(self.retries + 1):
             try:
                 response = requests.get(url, timeout=self.timeout)
                 if response.status_code == 200:
                     data = response.json()
-                    self._fragment_cache[fragment_id] = data
+                    self._fragment_cache[api_fragment_id] = data
                     return data
                 last_err = f"HTTP {response.status_code}"
             except requests.RequestException as e:
                 last_err = str(e)
         print(
-            f"API request failed for fragment {fragment_id} "
+            f"API request failed for fragment {api_fragment_id} "
             f"after {self.retries + 1} attempts: {last_err}"
         )
         return None
 
-
-class SubtabletEBLAPISource(EBLAPISource):
-    def get_fragment_data(self, fragment_id: str) -> Optional[dict]:
-        api_id = re.sub(r'-\d+$', '', fragment_id)
-        return super().get_fragment_data(api_id)
+    def _api_fragment_id(self, fragment_id: str) -> str:
+        if self.strip_subtablet_suffix:
+            return re.sub(r'-\d+$', '', fragment_id)
+        return fragment_id
 
 
 class SignTextParser:

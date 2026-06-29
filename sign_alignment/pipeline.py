@@ -8,6 +8,7 @@ import torch
 
 from sign_alignment.detector import TabletImageDetector
 from sign_alignment.data_source import (
+    DataSource,
     EBLAPISource,
     LocalDataSource,
     SignAPIResolver,
@@ -196,6 +197,7 @@ class CropContext:
     img_idx: int = 1
     psr_params: Optional[dict] = None
     dift: Optional[DiftRuntime] = None
+    canonical_source: Optional[DataSource] = None
     state: SampleState = field(default_factory=SampleState)
     task_type: str = "debug"
 
@@ -946,7 +948,9 @@ def vis_parameter_changes(context: CropContext, vis: VisOptions) -> None:
 def setup_canonical_signs(context: CropContext) -> None:
     s = context.state
     period = s.fragment_data["script"]["period"]
-    s.canonical = context.dift.setup(period)
+    if context.canonical_source is None:
+        raise ValueError("canonical_source is required for DIFT setup")
+    s.canonical = context.dift.setup(context.canonical_source, period)
 
 
 def vis_canonical_signs(context: CropContext, vis: VisOptions) -> None:
@@ -956,7 +960,6 @@ def vis_canonical_signs(context: CropContext, vis: VisOptions) -> None:
         print("=== Canonical Signs Setup ===")
         print(f"  API period:   {canonical.period!r}")
         print(f"  Source:       {type(canonical.source).__name__}")
-        print(f"  Source info:  {canonical.source.describe()}")
         print(
             f"  Feature cache: {len(canonical.cache)} loaded; "
             "missing features are computed on demand"
@@ -1000,7 +1003,7 @@ def vis_dift_score_on_whole_tablet(context: CropContext, vis: VisOptions) -> Non
     box_height = s.detections.avg_height
     chosen_draw_box_ix = 0
     chosen_draw_box_iy = 0
-    sign_name = "TUR"
+    sign_name = "DUB"
     sign = SignResolver.from_name(sign_name)
 
     point_vis = s.crop_tablet.img.copy()
@@ -1098,7 +1101,12 @@ def vis_manual_dift_crop_match(
     import ipywidgets as widgets
     from IPython.display import clear_output, display
 
-    sign_names = s.canonical.source.list_sign_names()
+    sign_names = sorted({
+        box.sign_name
+        for boxes in (s.det_boxes, s.text_boxes)
+        if boxes
+        for box in boxes
+    })
     if not sign_names:
         print("=== Manual DIFT match skipped: no canonical signs are available ===")
         return

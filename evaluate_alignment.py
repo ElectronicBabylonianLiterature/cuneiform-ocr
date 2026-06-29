@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 from sign_alignment import (
     LocalTestDataSource,
-    SubtabletEBLAPISource,
+    EBLAPISource,
     ModelConfig, TabletImageDetector,
     Box, Boxes,
     hyperparameter_search,
@@ -963,7 +963,7 @@ if __name__ == "__main__":
     context = CropContext(
         tablet_detector=tablet_detector,
         local_source=test_source,
-        api_source=SubtabletEBLAPISource(),
+        api_source=EBLAPISource(strip_subtablet_suffix=True),
         color_config=ColorConfig,
         output_dir=EVAL_OUTPUT_DIR,
         task_type="evaluation",

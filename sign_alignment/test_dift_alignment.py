@@ -79,19 +79,9 @@ class OrderedFeatureAssignmentTest(unittest.TestCase):
 
 
 class DiftRuntimeTest(unittest.TestCase):
-    def test_reuses_period_cache_without_rebuilding_wrapper(self):
+    def test_reuses_canonical_cache_without_rebuilding_wrapper(self):
         class Source:
-            def __init__(self, period=None):
-                self.period = period
-
-            def for_period(self, period):
-                return Source(period)
-
-            def cache_namespace(self):
-                return f"test:{self.period}"
-
-            def list_sign_names(self):
-                raise AssertionError("runtime setup must not precompute every sign")
+            form = "canonical1"
 
         class Model:
             def __init__(self):
@@ -102,10 +92,11 @@ class DiftRuntimeTest(unittest.TestCase):
                 return object()
 
         model = Model()
-        runtime = DiftRuntime(model=model, source=Source())
+        source = Source()
+        runtime = DiftRuntime(model=model)
 
-        first = runtime.setup("Old Babylonian")
-        second = runtime.setup("Old Babylonian")
+        first = runtime.setup(source, "Old Babylonian")
+        second = runtime.setup(source, "Old Babylonian")
 
         self.assertIs(first.cache, second.cache)
         self.assertEqual(model.calls, 1)

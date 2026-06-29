@@ -13,8 +13,16 @@ from PIL import Image
 
 from .sign import Sign, SignResolver
 from .box import Box, Boxes
-from .data_source import CanonicalSignSource
+from .data_source import DataSource, _safe_cache_part
 from .dift_model import DiftModel
+
+
+def _source_cache_key(source: DataSource) -> str:
+    parts = [type(source).__name__]
+    form = getattr(source, "form", None)
+    if form:
+        parts.append(str(form))
+    return ":".join(parts)
 
 
 @dataclass
@@ -37,12 +45,15 @@ class DiftMatchConfig:
 class CanonicalFeatureCache:
     def __init__(
         self,
-        source: CanonicalSignSource,
+        source: DataSource,
+        period: str,
         wrapper,
         disk_dir: Optional[str] = None,
         dtype: torch.dtype = torch.float16,
     ):
         self.source = source
+        self.period = period
+        self.source_key = _source_cache_key(source)
         self.wrapper = wrapper
         self.dtype = dtype
         self.disk_dir = Path(disk_dir).expanduser() if disk_dir else None
@@ -54,16 +65,17 @@ class CanonicalFeatureCache:
         return len(self._cache)
 
     def get(self, sign: Sign) -> Optional[CanonicalFeatureRecord]:
-        sid = self.source.get_id(sign)
-        if not sid:
-            return None
+        sid = f"{self.source_key}/{self.period}/{sign.name}"
         rec = self._cache.get(sid)
         if rec is not None:
             return rec
 
         rec = self._load_from_disk(sign, sid)
         if rec is None:
-            rec = self._featurize_sign(sign, sid)
+            try:
+                rec = self._featurize_sign(sign, sid)
+            except KeyError:
+                return None
             self._save_to_disk(sign, rec)
         self._cache[sid] = rec
         return rec
@@ -71,9 +83,10 @@ class CanonicalFeatureCache:
     def _disk_path(self, sign: Sign) -> Optional[Path]:
         if self.disk_dir is None:
             return None
-        stem = self.source.cache_file_stem(sign)
-        if not stem:
-            return None
+        stem = "__".join(
+            _safe_cache_part(part)
+            for part in (sign.name, self.period, self.source_key)
+        )
         return self.disk_dir / f"{stem}.pt"
 
     def _load_from_disk(self, sign: Sign, sid: str) -> Optional[CanonicalFeatureRecord]:
@@ -107,7 +120,7 @@ class CanonicalFeatureCache:
         torch.save(payload, path)
 
     def _featurize_sign(self, sign: Sign, sid: str) -> CanonicalFeatureRecord:
-        img = self.source.get_image(sign)
+        img = self.source.get(sign.name, self.period)
         if img is None:
             raise KeyError(f"{sign.name} has no canonical image")
         return CanonicalFeatureRecord(
@@ -166,7 +179,7 @@ class DiftAlignmentConfig:
 
 @dataclass
 class CanonicalFeatureSet:
-    source: CanonicalSignSource
+    source: DataSource
     cache: CanonicalFeatureCache
     period: str
 
@@ -174,27 +187,23 @@ class CanonicalFeatureSet:
 @dataclass
 class DiftRuntime:
     model: DiftModel
-    source: CanonicalSignSource
     feature_dir: Optional[str] = None
     config: DiftAlignmentConfig = field(default_factory=DiftAlignmentConfig)
-    _sources: Dict[str, CanonicalSignSource] = field(
-        default_factory=dict, init=False, repr=False
-    )
     _caches: Dict[str, CanonicalFeatureCache] = field(
         default_factory=dict, init=False, repr=False
     )
 
-    def setup(self, period: str) -> CanonicalFeatureSet:
-        source = self._sources.get(period)
-        if source is None:
-            source = self.source.for_period(period)
-            self._sources[period] = source
-
-        key = source.cache_namespace()
+    def setup(
+        self,
+        source: DataSource,
+        period: str,
+    ) -> CanonicalFeatureSet:
+        key = f"{_source_cache_key(source)}:{period}"
         cache = self._caches.get(key)
         if cache is None:
             cache = CanonicalFeatureCache(
                 source,
+                period,
                 self.model.make_wrapper(),
                 disk_dir=self.feature_dir,
             )

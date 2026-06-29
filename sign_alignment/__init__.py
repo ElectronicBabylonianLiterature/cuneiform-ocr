@@ -6,12 +6,10 @@ between images and text transcriptions.
 """
 
 from .data_source import (
-    CanonicalSignSource,
     EBLMongoCanonicalSource,
     LocalDataSource,
     LocalTestDataSource,
     EBLAPISource,
-    SubtabletEBLAPISource,
     SignTextParser,
     SignAPIResolver,
 )
@@ -72,12 +70,10 @@ from .hyperparam import (
 
 __all__ = [
     # Data sources
-    'CanonicalSignSource',
     'EBLMongoCanonicalSource',
     'LocalDataSource',
     'LocalTestDataSource',
     'EBLAPISource',
-    'SubtabletEBLAPISource',
     'SignTextParser',
     'SignAPIResolver',
     
