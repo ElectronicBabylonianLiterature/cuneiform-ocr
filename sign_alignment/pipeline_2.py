@@ -18,7 +18,7 @@ import torch
 
 from . import pipeline as base
 from .box import Box, Boxes
-from .dift_align import DiftMatchConfig
+from .dift_align import DiftMatchConfig, source_foreground_mask
 
 
 Runner = base.Runner
@@ -188,7 +188,11 @@ class _FeatureCoarseAligner:
         self.context = context
         self.state = context.state
         self.config = context.feature_coarse_alignment
-        self.cache = self.state.canonical.cache
+        self.runtime = context.dift
+        self.source = self.runtime.source
+        if self.source is None:
+            raise ValueError("DiftRuntime.source must be set")
+        self.period = base._source_period(context)
         self.window_width = int(round(
             self.config.window_width
             if self.config.window_width is not None
@@ -377,42 +381,57 @@ class _FeatureCoarseAligner:
         if not unmatched or not candidates:
             return scores, timing
 
-        records = [
-            self.cache.get(text_boxes[text_idx].sign)
-            for text_idx in unmatched
-        ]
-        available = sum(record is not None for record in records)
+        source_items = []
+        for text_idx in unmatched:
+            sign = text_boxes[text_idx].sign
+            source_img = self.source.get(sign.name, self.period)
+            source_feature = self.runtime.get_sign_feature(sign, self.period)
+            source_items.append((source_img, source_feature))
+        available = sum(
+            source_img is not None and source_feature is not None
+            for source_img, source_feature in source_items
+        )
         timing.logical_pairs = available * len(candidates)
         if not available:
             return scores, timing
 
         for candidate_idx, candidate in enumerate(candidates):
-            crop = self.state.crop_tablet.img[
-                candidate.y1:candidate.y2,
-                candidate.x1:candidate.x2,
-            ]
+            crop_box = Box(
+                candidate.x1,
+                candidate.y1,
+                candidate.x2,
+                candidate.y2,
+                text_boxes[unmatched[0]].sign,
+                self.state.crop_tablet,
+            )
+            crop = crop_box.crop_image()
             _synchronize_cuda()
             started = time.perf_counter()
-            crop_features = self.cache.featurize(crop)
+            crop_features = self.runtime.featurize_image(crop)
             _synchronize_cuda()
             timing.crop_feature_seconds += time.perf_counter() - started
             timing.crop_features += 1
 
             matches_by_sign = {}
             for matrix_row, text_idx in enumerate(unmatched):
-                record = records[matrix_row]
-                if record is None:
+                source_img, source_feature = source_items[matrix_row]
+                if source_img is None or source_feature is None:
                     continue
                 sign_name = text_boxes[text_idx].sign_name
                 result = matches_by_sign.get(sign_name)
                 if result is None:
                     _synchronize_cuda()
                     started = time.perf_counter()
-                    result = self.cache.match_features(
-                        record,
+                    result = self.runtime.match(
+                        source_feature,
                         crop_features,
+                        source_img.shape[:2],
                         crop.shape[:2],
                         self.config.match,
+                        src_foreground_mask=source_foreground_mask(
+                            source_img,
+                            source_feature.shape[-2:],
+                        ),
                     )
                     _synchronize_cuda()
                     matches_by_sign[sign_name] = result

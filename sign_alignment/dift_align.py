@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from argparse import Namespace
 from dataclasses import dataclass, field
+import hashlib
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -11,27 +14,96 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .sign import Sign, SignResolver
+from .sign import Sign
 from .box import Box, Boxes
-from .data_source import DataSource, _safe_cache_part
-from .dift_model import DiftModel
-
-
-def _source_cache_key(source: DataSource) -> str:
-    parts = [type(source).__name__]
-    form = getattr(source, "form", None)
-    if form:
-        parts.append(str(form))
-    return ":".join(parts)
+from .data_source import DataSource
 
 
 @dataclass
-class CanonicalFeatureRecord:
-    feature_map: torch.Tensor          # (C, 64, 64), L2-normalized on C
-    img: np.ndarray                    # original canonical image (uint8 gray)
-    img_size: Tuple[int, int]          # (H, W) of canonical image
-    sign_id: str
-    sign_name: str
+class ImageView:
+    """Small RGB view over PIL, OpenCV/numpy and tensor images.
+
+    Numpy inputs are treated as OpenCV-style BGR/BGRA by default. PIL inputs
+    keep their native RGB interpretation. Callers with true RGB numpy arrays can
+    create an ImageView with ``assume_bgr=False`` and pass it to
+    ``DiftRuntime.featurize_image``.
+    """
+
+    src_img: Any
+    pil_rgb: Image.Image
+    dtype: Optional[Any] = None
+    shape: Optional[Tuple[int, ...]] = None
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+
+    @classmethod
+    def from_any(cls, img: Any, *, assume_bgr: bool = True) -> "ImageView":
+        if isinstance(img, ImageView):
+            return img
+
+        if isinstance(img, Image.Image):
+            arr = np.asarray(img)
+            return cls(
+                src_img=img,
+                pil_rgb=img.convert("RGB"),
+                dtype=arr.dtype,
+                shape=arr.shape,
+                min_value=float(arr.min()) if arr.size else None,
+                max_value=float(arr.max()) if arr.size else None,
+            )
+
+        if isinstance(img, torch.Tensor):
+            tensor = img.detach().cpu()
+            if tensor.ndim == 3 and tensor.shape[0] in (1, 3, 4):
+                tensor = tensor.permute(1, 2, 0)
+            arr = tensor.numpy()
+        else:
+            arr = np.asarray(img)
+
+        raw_min = float(arr.min()) if arr.size else None
+        raw_max = float(arr.max()) if arr.size else None
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.float32, copy=False)
+            if arr.size and raw_min is not None and raw_max is not None:
+                if 0.0 <= raw_min and raw_max <= 1.0:
+                    arr = arr * 255.0
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+        if arr.ndim == 2:
+            rgb = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+        elif arr.ndim == 3 and arr.shape[2] == 1:
+            rgb = cv2.cvtColor(arr[:, :, 0], cv2.COLOR_GRAY2RGB)
+        elif arr.ndim == 3 and arr.shape[2] == 3:
+            rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB) if assume_bgr else arr
+        elif arr.ndim == 3 and arr.shape[2] == 4:
+            code = cv2.COLOR_BGRA2RGB if assume_bgr else cv2.COLOR_RGBA2RGB
+            rgb = cv2.cvtColor(arr, code)
+        else:
+            raise ValueError(f"Unsupported image shape: {arr.shape}")
+
+        return cls(
+            src_img=img,
+            pil_rgb=Image.fromarray(rgb).convert("RGB"),
+            dtype=arr.dtype,
+            shape=arr.shape,
+            min_value=raw_min,
+            max_value=raw_max,
+        )
+
+    def as_pil(self) -> Image.Image:
+        return self.pil_rgb
+
+    def as_rgb_numpy(self) -> np.ndarray:
+        return np.asarray(self.pil_rgb)
+
+    def as_bgr_numpy(self) -> np.ndarray:
+        return cv2.cvtColor(self.as_rgb_numpy(), cv2.COLOR_RGB2BGR)
+
+    def as_gray_numpy(self) -> np.ndarray:
+        return cv2.cvtColor(self.as_rgb_numpy(), cv2.COLOR_RGB2GRAY)
+
+    def as_tensor_chw(self) -> torch.Tensor:
+        return torch.from_numpy(self.as_rgb_numpy()).permute(2, 0, 1)
 
 
 @dataclass(frozen=True)
@@ -42,128 +114,6 @@ class DiftMatchConfig:
     ransac_threshold: Optional[float] = None
 
 
-class CanonicalFeatureCache:
-    def __init__(
-        self,
-        source: DataSource,
-        period: str,
-        wrapper,
-        disk_dir: Optional[str] = None,
-        dtype: torch.dtype = torch.float16,
-    ):
-        self.source = source
-        self.period = period
-        self.source_key = _source_cache_key(source)
-        self.wrapper = wrapper
-        self.dtype = dtype
-        self.disk_dir = Path(disk_dir).expanduser() if disk_dir else None
-        if self.disk_dir is not None:
-            self.disk_dir.mkdir(parents=True, exist_ok=True)
-        self._cache: Dict[str, CanonicalFeatureRecord] = {}
-
-    def __len__(self) -> int:
-        return len(self._cache)
-
-    def get(self, sign: Sign) -> Optional[CanonicalFeatureRecord]:
-        sid = f"{self.source_key}/{self.period}/{sign.name}"
-        rec = self._cache.get(sid)
-        if rec is not None:
-            return rec
-
-        rec = self._load_from_disk(sign, sid)
-        if rec is None:
-            try:
-                rec = self._featurize_sign(sign, sid)
-            except KeyError:
-                return None
-            self._save_to_disk(sign, rec)
-        self._cache[sid] = rec
-        return rec
-
-    def _disk_path(self, sign: Sign) -> Optional[Path]:
-        if self.disk_dir is None:
-            return None
-        stem = "__".join(
-            _safe_cache_part(part)
-            for part in (sign.name, self.period, self.source_key)
-        )
-        return self.disk_dir / f"{stem}.pt"
-
-    def _load_from_disk(self, sign: Sign, sid: str) -> Optional[CanonicalFeatureRecord]:
-        path = self._disk_path(sign)
-        if path is None or not path.exists():
-            return None
-        data = torch.load(path, map_location="cpu", weights_only=False)
-        feature_map = data["feature_map"].to(dtype=self.dtype)
-        img = data["img"]
-        if not isinstance(img, np.ndarray):
-            img = np.asarray(img, dtype=np.uint8)
-        return CanonicalFeatureRecord(
-            feature_map=feature_map,
-            img=img,
-            img_size=tuple(data.get("img_size", img.shape[:2])),
-            sign_id=data.get("sign_id", sid),
-            sign_name=data.get("sign_name", sign.name),
-        )
-
-    def _save_to_disk(self, sign: Sign, rec: CanonicalFeatureRecord) -> None:
-        path = self._disk_path(sign)
-        if path is None:
-            return
-        payload = {
-            "feature_map": rec.feature_map.detach().cpu().to(dtype=self.dtype),
-            "img": rec.img,
-            "img_size": rec.img_size,
-            "sign_id": rec.sign_id,
-            "sign_name": rec.sign_name,
-        }
-        torch.save(payload, path)
-
-    def _featurize_sign(self, sign: Sign, sid: str) -> CanonicalFeatureRecord:
-        img = self.source.get(sign.name, self.period)
-        if img is None:
-            raise KeyError(f"{sign.name} has no canonical image")
-        return CanonicalFeatureRecord(
-            feature_map=self.featurize(img).cpu().to(dtype=self.dtype),
-            img=img, img_size=img.shape[:2],
-            sign_id=sid, sign_name=sign.name,
-        )
-
-    def featurize(self, image: np.ndarray) -> torch.Tensor:
-        with torch.no_grad():
-            return self.wrapper.featurize(
-                Image.fromarray(_to_rgb(image))
-            ).detach()
-
-    def match(
-        self,
-        record: CanonicalFeatureRecord,
-        image: np.ndarray,
-        config: DiftMatchConfig,
-    ) -> "DiftCropMatchResult":
-        return self.match_features(
-            record,
-            self.featurize(image),
-            image.shape[:2],
-            config,
-        )
-
-    def match_features(
-        self,
-        record: CanonicalFeatureRecord,
-        feature_map: torch.Tensor,
-        image_shape: Tuple[int, int],
-        config: DiftMatchConfig,
-    ) -> "DiftCropMatchResult":
-        return match_dift_features(
-            record.feature_map,
-            feature_map,
-            record.img.shape[:2],
-            image_shape,
-            config,
-        )
-
-
 @dataclass
 class DiftAlignmentConfig:
     feature_viz_max_signs: int = 12
@@ -171,49 +121,256 @@ class DiftAlignmentConfig:
     affine_probe_padding_ratio: float = 0.2
     affine_probe_max_boxes: Optional[int] = None
     affine_probe_thumb: int = 128
-    canonical_overlay_max_boxes: Optional[int] = None
+    source_overlay_max_boxes: Optional[int] = None
     manual_match_max_lines: int = 80
     manual_match_thumb: int = 360
     match: DiftMatchConfig = field(default_factory=DiftMatchConfig)
 
 
 @dataclass
-class CanonicalFeatureSet:
-    source: DataSource
-    cache: CanonicalFeatureCache
-    period: str
+class DiftMatchResult:
+    """Local DIFT matches and an interpretable, uncalibrated match score."""
+
+    affine: Optional[np.ndarray]
+    src_points: np.ndarray
+    dst_points: np.ndarray
+    similarities: np.ndarray
+    inlier_mask: np.ndarray
+    n_matches: int
+    n_inliers: int
+    mean_inlier_similarity: float
+    semantic_score: float
+    global_similarity_score: float
+    sim_withoutbg: float
+    geometry_score: float
+    support_score: float
+    score: float
+    coarse_score: float
+    message: str = ""
 
 
 @dataclass
 class DiftRuntime:
-    model: DiftModel
+    checkpoint: str
     feature_dir: Optional[str] = None
     config: DiftAlignmentConfig = field(default_factory=DiftAlignmentConfig)
-    _caches: Dict[str, CanonicalFeatureCache] = field(
-        default_factory=dict, init=False, repr=False
-    )
+    img_size: int = 512
+    prompt: str = ""
+    source: Optional[DataSource] = None
+    dtype: torch.dtype = torch.float16
+    feature_cache: Dict[str, torch.Tensor] = field(default_factory=dict)
+    sd_featurizer: Any = field(init=False, repr=False)
+    dift_wrapper: Any = field(init=False, repr=False)
 
-    def setup(
-        self,
-        source: DataSource,
-        period: str,
-    ) -> CanonicalFeatureSet:
-        key = f"{_source_cache_key(source)}:{period}"
-        cache = self._caches.get(key)
-        if cache is None:
-            cache = CanonicalFeatureCache(
-                source,
-                period,
-                self.model.make_wrapper(),
-                disk_dir=self.feature_dir,
-            )
-            self._caches[key] = cache
-
-        return CanonicalFeatureSet(
-            source=source,
-            cache=cache,
-            period=period,
+    def __post_init__(self) -> None:
+        from .dift_src.dift import DiftWrapper, SDFeaturizer
+        self.sd_featurizer = SDFeaturizer(sd_id=self.checkpoint)
+        self.dift_wrapper = DiftWrapper(
+            Namespace(prompt=self.prompt, img_size=self.img_size),
+            dift=self.sd_featurizer,
         )
+
+    def get_sign_feature(
+        self,
+        sign: Sign,
+        period: str,
+    ) -> Optional[torch.Tensor]:
+        source = self.source
+        if source is None:
+            raise ValueError("DiftRuntime.source must be set")
+        sid = self._sign_id(sign, period, source)
+
+        feature_map = self.feature_cache.get(sid)
+        if feature_map is not None:
+            return feature_map
+
+        feature_map = self.load_from_disk(sid)
+        if feature_map is not None:
+            self.feature_cache[sid] = feature_map
+            return feature_map
+
+        image = source.get(sign.name, period)
+        if image is None:
+            return None
+
+        feature_map = self.featurize_image(image).detach().cpu().to(dtype=self.dtype)
+        self.feature_cache[sid] = feature_map
+        self.save_to_disk(sid, feature_map)
+        return feature_map
+
+    def featurize_image(self, image: Any) -> torch.Tensor:
+        image_view = ImageView.from_any(image)
+        with torch.no_grad():
+            return self.dift_wrapper.featurize(image_view.as_pil()).detach()
+
+    def match(
+        self,
+        src_feature: torch.Tensor,
+        dst_feature: torch.Tensor,
+        src_img_shape: Tuple[int, int],
+        dst_img_shape: Tuple[int, int],
+        config: Optional[DiftMatchConfig] = None,
+        src_foreground_mask: Optional[np.ndarray] = None,
+    ) -> DiftMatchResult:
+        """Match local features and score semantic plus geometric agreement."""
+        config = config or self.config.match
+        src = src_feature.detach().float()
+        dst = dst_feature.detach().float()
+        device = dst.device
+        src = src.to(device=device)
+
+        c = src.shape[0]
+        src_flat = src.reshape(c, -1)
+        dst_flat = dst.reshape(c, -1)
+        sim = src_flat.T @ dst_flat
+        global_similarity = 0.5 * (
+            sim.max(dim=1).values.mean() + sim.max(dim=0).values.mean()
+        )
+        sim_withoutbg = _foreground_only_global_similarity(
+            sim,
+            src_foreground_mask,
+            fallback=global_similarity,
+        )
+
+        src_to_dst = sim.argmax(dim=1)
+        dst_to_src = sim.argmax(dim=0)
+        src_idx = torch.arange(sim.shape[0], device=device)
+        is_mutual = dst_to_src[src_to_dst] == src_idx
+        mutual_src = src_idx[is_mutual]
+        mutual_dst = src_to_dst[is_mutual]
+        mutual_sim = sim[mutual_src, mutual_dst]
+
+        if mutual_src.numel() > config.max_matches:
+            vals, keep = torch.topk(mutual_sim, k=config.max_matches)
+            mutual_src = mutual_src[keep]
+            mutual_dst = mutual_dst[keep]
+            mutual_sim = vals
+
+        src_points = _feature_indices_to_image_points(
+            mutual_src.detach().cpu().numpy(),
+            src.shape[1],
+            src.shape[2],
+            src_img_shape[0],
+            src_img_shape[1],
+        )
+        dst_points = _feature_indices_to_image_points(
+            mutual_dst.detach().cpu().numpy(),
+            dst.shape[1],
+            dst.shape[2],
+            dst_img_shape[0],
+            dst_img_shape[1],
+        )
+        similarities = mutual_sim.detach().cpu().numpy()
+        global_similarity_score = float(global_similarity.detach().cpu())
+        sim_withoutbg_score = float(sim_withoutbg.detach().cpu())
+
+        def finish(
+            *,
+            affine: Optional[np.ndarray] = None,
+            inlier_mask: Optional[np.ndarray] = None,
+            message: str = "",
+        ) -> DiftMatchResult:
+            n_matches = len(src_points)
+            if inlier_mask is None:
+                mask = np.zeros(n_matches, dtype=bool)
+            else:
+                mask = np.asarray(inlier_mask, dtype=bool)
+            n_inliers = int(mask.sum())
+            mean_similarity = (
+                float(similarities[mask].mean()) if n_inliers else 0.0
+            )
+            semantic = float(np.clip(mean_similarity, 0.0, 1.0))
+            global_score = float(np.clip(global_similarity_score, 0.0, 1.0))
+            no_bg_score = float(np.clip(sim_withoutbg_score, 0.0, 1.0))
+            geometry = float(n_inliers / n_matches) if n_matches else 0.0
+            support = float(min(1.0, n_inliers / max(1, config.min_support)))
+            coarse = float(geometry * support)
+            score = float(semantic * np.sqrt(coarse))
+            return DiftMatchResult(
+                affine=affine,
+                src_points=src_points,
+                dst_points=dst_points,
+                similarities=similarities,
+                inlier_mask=mask,
+                n_matches=n_matches,
+                n_inliers=n_inliers,
+                mean_inlier_similarity=mean_similarity,
+                semantic_score=semantic,
+                global_similarity_score=global_score,
+                sim_withoutbg=no_bg_score,
+                geometry_score=geometry,
+                support_score=support,
+                score=score,
+                coarse_score=coarse,
+                message=message,
+            )
+
+        n_matches = len(src_points)
+        if n_matches < config.min_matches:
+            return finish(
+                message=f"need at least {config.min_matches} mutual matches"
+            )
+
+        threshold = config.ransac_threshold
+        if threshold is None:
+            threshold = max(3.0, 0.06 * max(dst_img_shape))
+
+        src32 = src_points.astype(np.float32)
+        dst32 = dst_points.astype(np.float32)
+        affine = inliers = None
+        for estimator in (cv2.estimateAffine2D, cv2.estimateAffinePartial2D):
+            affine, inliers = estimator(
+                src32,
+                dst32,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=float(threshold),
+                maxIters=2000,
+                confidence=0.99,
+                refineIters=10,
+            )
+            if affine is not None:
+                break
+        if affine is None:
+            return finish(message="affine RANSAC failed")
+
+        inlier_mask = (
+            inliers.ravel().astype(bool)
+            if inliers is not None
+            else np.ones(n_matches, dtype=bool)
+        )
+        return finish(affine=affine, inlier_mask=inlier_mask)
+
+    def _sign_id(self, sign: Sign, period: str, source: DataSource) -> str:
+        return f"{source.key()}/{period}/{sign.name}"
+
+    def _make_disk_path(self, sid: str) -> Optional[Path]:
+        if not self.feature_dir:
+            return None
+        feature_dir = Path(self.feature_dir).expanduser()
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        readable = re.sub(r"[^\w.@+-]+", "_", sid, flags=re.UNICODE).strip("_")
+        readable = readable[:160] or "value"
+        digest = hashlib.sha1(sid.encode("utf-8")).hexdigest()[:10]
+        return feature_dir / f"{readable}_{digest}.pt"
+
+    def load_from_disk(self, sid: str) -> Optional[torch.Tensor]:
+        path = self._make_disk_path(sid)
+        if path is None or not path.exists():
+            return None
+        feature = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(feature, torch.Tensor):
+            return None
+        return feature.to(dtype=self.dtype)
+
+    def save_to_disk(
+        self,
+        sid: str,
+        feature: torch.Tensor,
+    ) -> None:
+        path = self._make_disk_path(sid)
+        if path is None:
+            return
+        torch.save(feature.detach().cpu().to(dtype=self.dtype), path)
 
 
 @dataclass
@@ -222,8 +379,8 @@ class DiftAffineProbeResult:
     crop_img: np.ndarray
     crop_offset: Tuple[int, int]
     padded_bbox: Tuple[int, int, int, int]
-    canonical_img: Optional[np.ndarray] = None
-    match: Optional["DiftCropMatchResult"] = None
+    source_img: Optional[np.ndarray] = None
+    match: Optional[DiftMatchResult] = None
     message: str = ""
 
     @property
@@ -252,31 +409,7 @@ class DiftAffineProbeResult:
 
 
 @dataclass
-class DiftCropMatchResult:
-    """Local DIFT matches and an interpretable, uncalibrated match score."""
-
-    affine: Optional[np.ndarray]
-    src_points: np.ndarray
-    dst_points: np.ndarray
-    similarities: np.ndarray
-    inlier_mask: np.ndarray
-    n_matches: int
-    n_inliers: int
-    mean_inlier_similarity: float
-    semantic_score: float
-    global_similarity_score: float
-    geometry_score: float
-    support_score: float
-    score: float
-    message: str = ""
-
-    @property
-    def coarse_score(self) -> float:
-        return self.geometry_score * self.support_score
-
-
-@dataclass
-class CanonicalOverlay:
+class SignOverlay:
     iteration: int
     image: np.ndarray
     stats: Dict[str, Any]
@@ -289,16 +422,18 @@ class DiftAffineProbe:
     results: List[DiftAffineProbeResult]
 
 
-def canonical_feature_norm_image(feature_map: torch.Tensor) -> np.ndarray:
+def source_feature_norm_image(feature_map: torch.Tensor) -> np.ndarray:
     fm = feature_map.detach().float().cpu()
     feat = torch.linalg.vector_norm(fm, dim=0).numpy()
     return _normalize01(feat)
 
 
-def canonical_feature_overlay(record: CanonicalFeatureRecord) -> np.ndarray:
-    img = record.img
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    heat = canonical_feature_norm_image(record.feature_map)
+def source_feature_overlay(
+    image: np.ndarray,
+    feature_map: torch.Tensor,
+) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    heat = source_feature_norm_image(feature_map)
     heat = cv2.resize(heat, (gray.shape[1], gray.shape[0]),
                       interpolation=cv2.INTER_CUBIC)
     heat_bgr = cv2.applyColorMap((heat * 255).astype(np.uint8),
@@ -307,51 +442,78 @@ def canonical_feature_overlay(record: CanonicalFeatureRecord) -> np.ndarray:
     return cv2.addWeighted(gray_bgr, 0.45, heat_bgr, 0.55, 0)
 
 
-def render_canonical_feature_grid(
-    rows: List[Tuple[str, CanonicalFeatureRecord]],
+def source_foreground_mask(
+    image: np.ndarray,
+    grid_shape: Tuple[int, int],
+) -> np.ndarray:
+    """Return a source-sign foreground mask at feature-grid resolution."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    grid_h, grid_w = map(int, grid_shape)
+    if grid_h <= 0 or grid_w <= 0:
+        return np.zeros((0, 0), dtype=bool)
+    resized = cv2.resize(
+        gray.astype(np.uint8),
+        (grid_w, grid_h),
+        interpolation=cv2.INTER_AREA,
+    )
+    return resized < 255
+
+
+def render_source_feature_grid(
+    rows: List[Tuple[str, np.ndarray, torch.Tensor]],
     thumb: int = 120,
 ) -> np.ndarray:
-    """Render [canonical | feature norm | overlay] rows for canonical signs."""
+    """Render [source image | feature norm | overlay] rows for signs."""
     grid_rows = []
-    for name, rec in rows:
+    for name, image, feature_map in rows:
         grid_rows.append([
-            (name[:18], _to_bgr(rec.img)),
-            ("DIFT feature norm", _heat_to_bgr(canonical_feature_norm_image(rec.feature_map))),
-            ("overlay", canonical_feature_overlay(rec)),
+            (name[:18], _to_bgr(image)),
+            ("DIFT feature norm", _heat_to_bgr(source_feature_norm_image(feature_map))),
+            ("overlay", source_feature_overlay(image, feature_map)),
         ])
-    return _render_grid(grid_rows, thumb, "No canonical features", header_h=24)
+    return _render_grid(grid_rows, thumb, "No source features", header_h=24)
 
 
-def collect_detected_canonical_feature_rows(
+def collect_detected_source_feature_rows(
     boxes: Boxes,
-    cache: CanonicalFeatureCache,
+    runtime: DiftRuntime,
+    period: str,
     max_signs: int = 12,
-) -> Tuple[List[Tuple[str, CanonicalFeatureRecord]], List[str], int]:
-    detected_names = list(dict.fromkeys(
-        sb.sign_name for sb in boxes
-    ))
-    rows: List[Tuple[str, CanonicalFeatureRecord]] = []
+) -> Tuple[List[Tuple[str, np.ndarray, torch.Tensor]], List[str], int]:
+    source = runtime.source
+    if source is None:
+        raise ValueError("DiftRuntime.source must be set")
+    detected = {}
+    for sb in boxes:
+        detected.setdefault(sb.sign_name, sb.sign)
+
+    rows: List[Tuple[str, np.ndarray, torch.Tensor]] = []
     missing: List[str] = []
-    for name in detected_names:
-        rec = cache.get(SignResolver.from_name(name))
-        if rec is None:
+    for name, sign in detected.items():
+        image = source.get(sign.name, period)
+        feature_map = runtime.get_sign_feature(sign, period)
+        if image is None or feature_map is None:
             missing.append(name)
             continue
-        rows.append((name, rec))
+        rows.append((name, image, feature_map))
         if len(rows) >= max_signs:
             break
-    return rows, missing, len(detected_names)
+    return rows, missing, len(detected)
 
 
-def render_canonical_sign_overlay(
+def render_source_sign_overlay(
     image: np.ndarray,
     boxes: Boxes,
-    cache: CanonicalFeatureCache,
+    runtime: DiftRuntime,
+    period: str,
     max_boxes: Optional[int] = None,
     draw_boxes: bool = True,
     draw_labels: bool = True,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Paste canonical sign images into the current sign boxes."""
+    """Paste source sign images into the current sign boxes."""
+    source = runtime.source
+    if source is None:
+        raise ValueError("DiftRuntime.source must be set")
     overlay = _to_bgr(image).copy()
     stats: Dict[str, Any] = {
         "total": 0,
@@ -367,8 +529,8 @@ def render_canonical_sign_overlay(
     missing_names = []
     for sb in boxes:
         stats["total"] += 1
-        rec = cache.get(sb.sign)
-        if rec is None:
+        source_img = source.get(sb.sign_name, period)
+        if source_img is None:
             stats["missing"] += 1
             missing_names.append(sb.sign_name)
             if draw_boxes:
@@ -376,7 +538,7 @@ def render_canonical_sign_overlay(
                                draw_label=draw_labels)
             continue
 
-        pasted = _paste_canonical_into_box(overlay, rec.img, sb)
+        pasted = _paste_source_into_box(overlay, source_img, sb)
         if pasted:
             stats["pasted"] += 1
         else:
@@ -392,10 +554,14 @@ def render_canonical_sign_overlay(
 
 def build_dift_affine_probe(
     boxes: Boxes,
-    cache: CanonicalFeatureCache,
+    runtime: DiftRuntime,
+    period: str,
     config: DiftAlignmentConfig,
 ) -> List[DiftAffineProbeResult]:
-    """Estimate canonical-to-crop affine transforms for current sign boxes."""
+    """Estimate source-to-crop affine transforms for current sign boxes."""
+    source = runtime.source
+    if source is None:
+        raise ValueError("DiftRuntime.source must be set")
     results: List[DiftAffineProbeResult] = []
     if config.affine_probe_max_boxes is not None:
         boxes = boxes[:config.affine_probe_max_boxes]
@@ -404,148 +570,40 @@ def build_dift_affine_probe(
         padded_bbox = sb.crop_bounds(config.affine_probe_padding_ratio)
         crop = sb.crop_image(config.affine_probe_padding_ratio)
         offset = padded_bbox[:2]
-        rec = cache.get(sb.sign)
-        if rec is None:
+        source_img = source.get(sb.sign_name, period)
+        source_feature = runtime.get_sign_feature(sb.sign, period)
+        if source_img is None or source_feature is None:
             results.append(DiftAffineProbeResult(
                 sign_box=sb.copy(),
                 crop_img=crop,
                 crop_offset=offset,
                 padded_bbox=padded_bbox,
-                message="missing canonical",
+                message="missing source",
             ))
             continue
 
-        match = cache.match(rec, crop, config.match)
+        crop_feature = runtime.featurize_image(crop)
+        match = runtime.match(
+            source_feature,
+            crop_feature,
+            source_img.shape[:2],
+            crop.shape[:2],
+            config.match,
+            src_foreground_mask=source_foreground_mask(
+                source_img,
+                source_feature.shape[-2:],
+            ),
+        )
         results.append(DiftAffineProbeResult(
             sign_box=sb.copy(),
             crop_img=crop,
             crop_offset=offset,
             padded_bbox=padded_bbox,
-            canonical_img=rec.img,
+            source_img=source_img,
             match=match,
             message=match.message,
         ))
     return results
-
-
-def match_dift_features(
-    src_ft: torch.Tensor,
-    dst_ft: torch.Tensor,
-    src_img_shape: Tuple[int, int],
-    dst_img_shape: Tuple[int, int],
-    config: DiftMatchConfig = DiftMatchConfig(),
-) -> DiftCropMatchResult:
-    """Match local features and score semantic plus geometric agreement.
-
-    The score is not a calibrated probability. It combines mean cosine
-    similarity of affine inliers with their ratio among mutual matches and a
-    small-match penalty:
-
-        score = semantic * sqrt(geometry * support)
-    """
-    src_pts, dst_pts, sims, global_similarity = _best_buddies_points(
-        src_ft,
-        dst_ft,
-        src_img_shape,
-        dst_img_shape,
-        max_matches=config.max_matches,
-    )
-    n_matches = len(src_pts)
-    if n_matches < config.min_matches:
-        return _crop_match_result(
-            src_pts,
-            dst_pts,
-            sims,
-            global_similarity_score=global_similarity,
-            message=f"need at least {config.min_matches} mutual matches",
-            min_support=config.min_support,
-        )
-
-    threshold = config.ransac_threshold
-    if threshold is None:
-        threshold = max(3.0, 0.06 * max(dst_img_shape))
-
-    src32 = src_pts.astype(np.float32)
-    dst32 = dst_pts.astype(np.float32)
-    affine = inliers = None
-    for estimator in (cv2.estimateAffine2D, cv2.estimateAffinePartial2D):
-        affine, inliers = estimator(
-            src32,
-            dst32,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=float(threshold),
-            maxIters=2000,
-            confidence=0.99,
-            refineIters=10,
-        )
-        if affine is not None:
-            break
-    if affine is None:
-        return _crop_match_result(
-            src_pts,
-            dst_pts,
-            sims,
-            global_similarity_score=global_similarity,
-            message="affine RANSAC failed",
-            min_support=config.min_support,
-        )
-
-    mask = (
-        inliers.ravel().astype(bool)
-        if inliers is not None
-        else np.ones(n_matches, dtype=bool)
-    )
-    return _crop_match_result(
-        src_pts,
-        dst_pts,
-        sims,
-        global_similarity_score=global_similarity,
-        affine=affine,
-        inlier_mask=mask,
-        min_support=config.min_support,
-    )
-
-
-def _crop_match_result(
-    src_points: np.ndarray,
-    dst_points: np.ndarray,
-    similarities: np.ndarray,
-    global_similarity_score: float = 0.0,
-    affine: Optional[np.ndarray] = None,
-    inlier_mask: Optional[np.ndarray] = None,
-    min_support: int = 12,
-    message: str = "",
-) -> DiftCropMatchResult:
-    n_matches = len(src_points)
-    if inlier_mask is None:
-        inlier_mask = np.zeros(n_matches, dtype=bool)
-    else:
-        inlier_mask = np.asarray(inlier_mask, dtype=bool)
-    n_inliers = int(inlier_mask.sum())
-    mean_similarity = (
-        float(similarities[inlier_mask].mean()) if n_inliers else 0.0
-    )
-    semantic = float(np.clip(mean_similarity, 0.0, 1.0))
-    global_similarity = float(np.clip(global_similarity_score, 0.0, 1.0))
-    geometry = float(n_inliers / n_matches) if n_matches else 0.0
-    support = float(min(1.0, n_inliers / max(1, min_support)))
-    score = float(semantic * np.sqrt(geometry * support))
-    return DiftCropMatchResult(
-        affine=affine,
-        src_points=src_points,
-        dst_points=dst_points,
-        similarities=similarities,
-        inlier_mask=inlier_mask,
-        n_matches=n_matches,
-        n_inliers=n_inliers,
-        mean_inlier_similarity=mean_similarity,
-        semantic_score=semantic,
-        global_similarity_score=global_similarity,
-        geometry_score=geometry,
-        support_score=support,
-        score=score,
-        message=message,
-    )
 
 
 _OPTIMIZED_BBOX_COLOR = (0, 165, 255)      # orange, BGR
@@ -566,17 +624,17 @@ def render_dift_affine_probe(
         _draw_sign_box(overlay, sb, _OPTIMIZED_BBOX_COLOR,
                        draw_label=True, thickness=2)
     for res in results:
-        if res.affine_full is None or res.canonical_img is None:
+        if res.affine_full is None or res.source_img is None:
             continue
         warped = _transformed_image_corners(
-            res.canonical_img.shape[:2], res.affine_full
+            res.source_img.shape[:2], res.affine_full
         )
         cv2.polylines(overlay, [warped.astype(np.int32)], isClosed=True,
                       color=_TRANSFORMED_BBOX_COLOR,
                       thickness=2, lineType=cv2.LINE_AA)
         before_center = _as_int_point((res.sign_box.cx, res.sign_box.cy))
         after_center = _as_int_point(
-            _transformed_image_center(res.canonical_img.shape[:2], res.affine_full)
+            _transformed_image_center(res.source_img.shape[:2], res.affine_full)
         )
         _draw_dashed_line(overlay, before_center, after_center, _CENTER_LINK_COLOR,
                           thickness=2)
@@ -586,7 +644,7 @@ def render_dift_affine_probe(
     grid_rows = []
     for res in results:
         crop_vis = _draw_local_bbox(res.crop_img, res.sign_box, res.crop_offset)
-        canon_vis = _to_bgr(res.canonical_img) if res.canonical_img is not None else None
+        source_vis = _to_bgr(res.source_img) if res.source_img is not None else None
         warp_vis = _warp_overlay(res)
         status = (
             f"{res.sign_name[:10]} {res.n_inliers}/{res.n_matches} "
@@ -596,7 +654,7 @@ def render_dift_affine_probe(
         )
         grid_rows.append([
             (f"crop iter {iteration}", crop_vis),
-            ("canonical", canon_vis),
+            ("source", source_vis),
             (status, warp_vis),
         ])
 
@@ -612,14 +670,14 @@ def render_dift_affine_probe(
 
 
 def render_dift_feature_matches(
-    canonical_img: np.ndarray,
+    source_img: np.ndarray,
     crop_img: np.ndarray,
-    result: DiftCropMatchResult,
+    result: DiftMatchResult,
     thumb: int = 360,
     max_lines: int = 80,
 ) -> np.ndarray:
-    """Render canonical-to-crop mutual matches, highlighting RANSAC inliers."""
-    header_h = 72
+    """Render source-to-crop mutual matches, highlighting RANSAC inliers."""
+    header_h = 92
     gap = 24
     margin = 12
     canvas_w = margin * 2 + thumb * 2 + gap
@@ -627,7 +685,7 @@ def render_dift_feature_matches(
     canvas = np.full((canvas_h, canvas_w, 3), 28, np.uint8)
 
     left, left_scale, left_offset = _fit_to_square_with_geometry(
-        canonical_img, thumb
+        source_img, thumb
     )
     right, right_scale, right_offset = _fit_to_square_with_geometry(
         crop_img, thumb
@@ -650,14 +708,24 @@ def render_dift_feature_matches(
     _draw_text(
         canvas,
         (
-            f"green=inlier, red=outlier  "
-            f"inliers={result.n_inliers}/{result.n_matches}"
+            f"global={result.global_similarity_score:.3f}  "
+            f"sim_withoutbg={result.sim_withoutbg:.3f}"
         ),
-        50,
+        48,
         x=margin,
         scale=0.45,
     )
-    _draw_text(canvas, "canonical", header_h - 7, x=left_x, scale=0.43)
+    _draw_text(
+        canvas,
+        (
+            f"green=inlier, red=outlier  "
+            f"inliers={result.n_inliers}/{result.n_matches}"
+        ),
+        72,
+        x=margin,
+        scale=0.45,
+    )
+    _draw_text(canvas, "source", header_h - 7, x=left_x, scale=0.43)
     _draw_text(canvas, "selected crop", header_h - 7, x=right_x, scale=0.43)
 
     indices = _display_match_indices(result, max_lines)
@@ -681,20 +749,20 @@ def render_dift_feature_matches(
 
 
 def render_dift_crop_warp(
-    canonical_img: np.ndarray,
+    source_img: np.ndarray,
     crop_img: np.ndarray,
-    result: DiftCropMatchResult,
+    result: DiftMatchResult,
 ) -> np.ndarray:
-    """Overlay the affine-warped canonical image on the selected crop."""
+    """Overlay the affine-warped source image on the selected crop."""
     crop = _to_bgr(crop_img)
     if result.affine is None:
         return crop.copy()
 
-    return _blend_affine(canonical_img, crop, result.affine)
+    return _blend_affine(source_img, crop, result.affine)
 
 
 def _display_match_indices(
-    result: DiftCropMatchResult,
+    result: DiftMatchResult,
     max_lines: int,
 ) -> np.ndarray:
     if result.n_matches == 0 or max_lines <= 0:
@@ -712,57 +780,27 @@ def _display_match_indices(
     return np.concatenate([outliers[:max_outliers], inliers[:max_inliers]])
 
 
-def _best_buddies_points(
-    src_ft: torch.Tensor,
-    dst_ft: torch.Tensor,
-    src_img_shape: Tuple[int, int],
-    dst_img_shape: Tuple[int, int],
-    max_matches: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Vectorized ProtoSnap best-buddies with per-image pixel coordinates.
+def _foreground_only_global_similarity(
+    sim: torch.Tensor,
+    src_foreground_mask: Optional[np.ndarray],
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    if src_foreground_mask is None:
+        return fallback
 
-    ProtoSnap's helper assumes one square image size for both sides and uses a
-    quadratic Python loop. This equivalent keeps similarities for scoring and
-    maps each feature grid to its own source image shape.
-    """
-    src = src_ft.detach().float()
-    dst = dst_ft.detach().float()
-    device = dst.device
-    src = src.to(device=device)
-
-    c = src.shape[0]
-    src_flat = src.reshape(c, -1)
-    dst_flat = dst.reshape(c, -1)
-    sim = src_flat.T @ dst_flat
-    global_similarity = 0.5 * (
-        sim.max(dim=1).values.mean() + sim.max(dim=0).values.mean()
+    mask = torch.as_tensor(
+        np.asarray(src_foreground_mask, dtype=bool).reshape(-1),
+        device=sim.device,
+        dtype=torch.bool,
     )
+    if mask.numel() != sim.shape[0] or not bool(mask.any()):
+        return fallback
 
-    src_to_dst = sim.argmax(dim=1)
-    dst_to_src = sim.argmax(dim=0)
-    src_idx = torch.arange(sim.shape[0], device=device)
-    is_mutual = dst_to_src[src_to_dst] == src_idx
-    mutual_src = src_idx[is_mutual]
-    mutual_dst = src_to_dst[is_mutual]
-    mutual_sim = sim[mutual_src, mutual_dst]
-
-    if mutual_src.numel() > max_matches:
-        vals, keep = torch.topk(mutual_sim, k=max_matches)
-        mutual_src = mutual_src[keep]
-        mutual_dst = mutual_dst[keep]
-        mutual_sim = vals
-
-    src_pts = _feature_indices_to_image_points(
-        mutual_src.detach().cpu().numpy(),
-        src.shape[1], src.shape[2],
-        src_img_shape[0], src_img_shape[1],
+    foreground_sim = sim[mask]
+    return 0.5 * (
+        foreground_sim.max(dim=1).values.mean()
+        + foreground_sim.max(dim=0).values.mean()
     )
-    dst_pts = _feature_indices_to_image_points(
-        mutual_dst.detach().cpu().numpy(),
-        dst.shape[1], dst.shape[2],
-        dst_img_shape[0], dst_img_shape[1],
-    )
-    return src_pts, dst_pts, mutual_sim.detach().cpu().numpy(), float(global_similarity.detach().cpu())
 
 
 def _feature_indices_to_image_points(
@@ -783,13 +821,13 @@ def _feature_indices_to_image_points(
 
 def _warp_overlay(res: DiftAffineProbeResult) -> np.ndarray:
     crop = _to_bgr(res.crop_img)
-    if res.canonical_img is None or res.affine is None:
+    if res.source_img is None or res.affine is None:
         return _draw_local_bbox(crop, res.sign_box, res.crop_offset)
-    out = _blend_affine(res.canonical_img, crop, res.affine)
+    out = _blend_affine(res.source_img, crop, res.affine)
     _draw_local_bbox_inplace(out, res.sign_box, res.crop_offset,
                              _OPTIMIZED_BBOX_COLOR)
     warped_corners = _transformed_image_corners(
-        res.canonical_img.shape[:2], res.affine
+        res.source_img.shape[:2], res.affine
     )
     cv2.polylines(out, [warped_corners.astype(np.int32)], isClosed=True,
                   color=_TRANSFORMED_BBOX_COLOR, thickness=2,
@@ -798,7 +836,7 @@ def _warp_overlay(res: DiftAffineProbeResult) -> np.ndarray:
         (res.sign_box.cx - res.crop_offset[0], res.sign_box.cy - res.crop_offset[1])
     )
     after_center = _as_int_point(
-        _transformed_image_center(res.canonical_img.shape[:2], res.affine)
+        _transformed_image_center(res.source_img.shape[:2], res.affine)
     )
     _draw_dashed_line(out, before_center, after_center, _CENTER_LINK_COLOR,
                       thickness=1)
@@ -879,9 +917,9 @@ def _draw_sign_box(
                    x=max(0, p1[0]), color=color, scale=0.42)
 
 
-def _paste_canonical_into_box(
+def _paste_source_into_box(
     out: np.ndarray,
-    canonical_img: np.ndarray,
+    source_img: np.ndarray,
     sb: Box,
 ) -> bool:
     img_h, img_w = out.shape[:2]
@@ -901,8 +939,8 @@ def _paste_canonical_into_box(
     if clip_x2 <= clip_x1 or clip_y2 <= clip_y1:
         return False
 
-    canonical_bgr = _to_bgr(canonical_img)
-    patch = cv2.resize(canonical_bgr, (box_w, box_h),
+    source_bgr = _to_bgr(source_img)
+    patch = cv2.resize(source_bgr, (box_w, box_h),
                        interpolation=cv2.INTER_AREA)
 
     px1 = clip_x1 - x1
@@ -1056,21 +1094,7 @@ def _draw_text(
 def _to_bgr(img: Optional[np.ndarray]) -> np.ndarray:
     if img is None:
         return np.zeros((1, 1, 3), np.uint8)
-    arr = np.asarray(img)
-    if arr.ndim == 2:
-        return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
-    if arr.shape[2] == 4:
-        return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_RGBA2BGR)
-    return arr.astype(np.uint8)
-
-
-def _to_rgb(img: np.ndarray) -> np.ndarray:
-    arr = np.asarray(img)
-    if arr.ndim == 2:
-        return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2RGB)
-    if arr.shape[2] == 4:
-        return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_RGBA2RGB)
-    return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_BGR2RGB)
+    return ImageView.from_any(img).as_bgr_numpy()
 
 
 def _normalize01(values: np.ndarray) -> np.ndarray:

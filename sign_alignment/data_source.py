@@ -1,5 +1,4 @@
 import base64
-import hashlib
 import io
 import json
 import os
@@ -17,16 +16,6 @@ from .box import Box, Boxes
 from .tablet import Tablet
 
 
-def _safe_cache_part(value: Optional[str]) -> str:
-    if not value:
-        return "none"
-    text = str(value)
-    readable = re.sub(r"[^\w.@+-]+", "_", text, flags=re.UNICODE).strip("_")
-    readable = readable[:80] or "value"
-    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
-    return f"{readable}_{digest}"
-
-
 def _decode_base64_gray(image: str) -> np.ndarray:
     if not image:
         raise ValueError("empty image payload")
@@ -37,6 +26,13 @@ def _decode_base64_gray(image: str) -> np.ndarray:
 
 # next generate source class
 class DataSource:
+    def key(self) -> str:
+        parts = [type(self).__name__]
+        form = getattr(self, "form", None)
+        if form:
+            parts.append(str(form))
+        return ":".join(parts)
+
     def get(self, sign_name: str, period: str) -> Optional[np.ndarray]:
         raise NotImplementedError
     

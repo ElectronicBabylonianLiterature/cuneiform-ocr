@@ -33,17 +33,17 @@ from data_processing.line_process import (
     match_signs_in_row_dp,
 )
 from sign_alignment.dift_align import (
-    CanonicalFeatureSet,
-    CanonicalOverlay,
     DiftAffineProbe,
     DiftRuntime,
+    SignOverlay,
     build_dift_affine_probe,
-    collect_detected_canonical_feature_rows,
-    render_canonical_feature_grid,
-    render_canonical_sign_overlay,
+    collect_detected_source_feature_rows,
     render_dift_crop_warp,
     render_dift_affine_probe,
     render_dift_feature_matches,
+    render_source_feature_grid,
+    render_source_sign_overlay,
+    source_foreground_mask,
 )
 
 if TYPE_CHECKING:
@@ -176,14 +176,17 @@ class SampleState:
     # PSR optimizer
     optimizer: Optional[PointSetRegistrationOptimizer] = None
 
-    canonical: Optional[CanonicalFeatureSet] = None
+    source_period: Optional[str] = None
     dift_affine_probe: Optional[DiftAffineProbe] = None
-    canonical_overlay: Optional[CanonicalOverlay] = None
+    source_overlay: Optional[SignOverlay] = None
     feature_coarse: Optional["FeatureCoarseRun"] = None
     dift_sampling_scores: Optional[list] = None
     dift_sampling_score_image: Optional[np.ndarray] = None
     dift_sampling_semantic_image: Optional[np.ndarray] = None
     dift_sampling_global_similarity_image: Optional[np.ndarray] = None
+    dift_sampling_sim_withoutbg_image: Optional[np.ndarray] = None
+    dift_sampling_foreground_mask: Optional[np.ndarray] = None
+    dift_sampling_foreground_mask_image: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -197,6 +200,7 @@ class CropContext:
     img_idx: int = 1
     psr_params: Optional[dict] = None
     dift: Optional[DiftRuntime] = None
+    sign_source: Optional[DataSource] = None
     canonical_source: Optional[DataSource] = None
     state: SampleState = field(default_factory=SampleState)
     task_type: str = "debug"
@@ -218,6 +222,14 @@ def _out(context: CropContext, suffix: str) -> str:
         context.output_dir,
         f"{context.task_type}_{context.state.fragment_id}_{suffix}",
     )
+
+
+def _source_period(context: CropContext) -> str:
+    period = context.state.source_period
+    if period is None:
+        period = context.state.fragment_data["script"]["period"]
+        context.state.source_period = period
+    return period
 
 
 def _display_bgr(img: np.ndarray, title: str, px_per_in: float = 80.0) -> None:
@@ -752,48 +764,49 @@ def vis_optimization(context: CropContext, vis: VisOptions) -> None:
         )
 
 
-def create_canonical_sign_overlay(context: CropContext) -> None:
+def create_source_sign_overlay(context: CropContext) -> None:
     s = context.state
-    image, stats = render_canonical_sign_overlay(
+    image, stats = render_source_sign_overlay(
         image=s.crop_tablet.img,
         boxes=s.optimizer.get_optimized_boxes(),
-        cache=s.canonical.cache,
-        max_boxes=context.dift.config.canonical_overlay_max_boxes,
+        runtime=context.dift,
+        period=_source_period(context),
+        max_boxes=context.dift.config.source_overlay_max_boxes,
         draw_boxes=False,
         draw_labels=False,
     )
-    s.canonical_overlay = CanonicalOverlay(
+    s.source_overlay = SignOverlay(
         iteration=len(s.optimizer.loss_history),
         image=image,
         stats=stats,
     )
 
 
-def vis_canonical_sign_overlay(
+def vis_source_sign_overlay(
     context: CropContext,
     vis: VisOptions,
 ) -> None:
     s = context.state
-    result = s.canonical_overlay
+    result = s.source_overlay
     if result is None:
         return
 
     if vis.info:
         stats = result.stats
         print(
-            f"=== Canonical Sign Overlay @ iter {result.iteration}: "
+            f"=== Source Sign Overlay @ iter {result.iteration}: "
             f"{stats.get('pasted', 0)}/{stats.get('total', 0)} pasted ==="
         )
         missing = stats.get("missing_names") or []
         if missing:
             suffix = " ..." if len(missing) > 20 else ""
-            print(f"  Missing canonical images: {', '.join(missing[:20])}{suffix}")
+            print(f"  Missing source images: {', '.join(missing[:20])}{suffix}")
 
     if vis.save:
         cv2.imwrite(
             _out(
                 context,
-                f"canonical_sign_overlay_iter{result.iteration}.jpg",
+                f"source_sign_overlay_iter{result.iteration}.jpg",
             ),
             result.image,
             [cv2.IMWRITE_JPEG_QUALITY, 92],
@@ -801,7 +814,7 @@ def vis_canonical_sign_overlay(
     if vis.display:
         _display_bgr(
             result.image,
-            f"Canonical signs pasted at PSR boxes @ iter {result.iteration}",
+            f"Source signs pasted at PSR boxes @ iter {result.iteration}",
         )
 
 
@@ -813,7 +826,8 @@ def run_dift_affine_probe(context: CropContext) -> None:
         boxes=boxes,
         results=build_dift_affine_probe(
             boxes,
-            s.canonical.cache,
+            context.dift,
+            _source_period(context),
             context.dift.config,
         ),
     )
@@ -945,47 +959,114 @@ def vis_parameter_changes(context: CropContext, vis: VisOptions) -> None:
         )
 
 
-def setup_canonical_signs(context: CropContext) -> None:
+def setup_source_signs(context: CropContext) -> None:
     s = context.state
-    period = s.fragment_data["script"]["period"]
-    if context.canonical_source is None:
-        raise ValueError("canonical_source is required for DIFT setup")
-    s.canonical = context.dift.setup(context.canonical_source, period)
+    s.source_period = s.fragment_data["script"]["period"]
+    context.dift.source = context.sign_source or context.canonical_source
+    if context.dift.source is None:
+        raise ValueError("CropContext requires sign_source")
 
 
-def vis_canonical_signs(context: CropContext, vis: VisOptions) -> None:
+def vis_source_signs(context: CropContext, vis: VisOptions) -> None:
     s = context.state
-    canonical = s.canonical
+    source = context.dift.source
+    if source is None:
+        raise ValueError("DiftRuntime.source must be set")
+    period = _source_period(context)
     if vis.info:
-        print("=== Canonical Signs Setup ===")
-        print(f"  API period:   {canonical.period!r}")
-        print(f"  Source:       {type(canonical.source).__name__}")
+        print("=== Source Signs Setup ===")
+        print(f"  API period:   {period!r}")
+        print(f"  Source:       {type(source).__name__}")
         print(
-            f"  Feature cache: {len(canonical.cache)} loaded; "
+            f"  Feature cache: {len(context.dift.feature_cache)} loaded; "
             "missing features are computed on demand"
         )
 
-    rows, missing, total = collect_detected_canonical_feature_rows(
+    rows, missing, total = collect_detected_source_feature_rows(
         s.det_boxes,
-        canonical.cache,
+        context.dift,
+        period,
         max_signs=context.dift.config.feature_viz_max_signs,
     )
     if vis.info and total:
         print(f"  Feature-map viz: detected unique signs={total}, shown={len(rows)}")
         if missing:
-            print("  Missing canonical features: " + ", ".join(missing[:20]))
+            print("  Missing source features: " + ", ".join(missing[:20]))
     if not rows:
         return
 
-    grid = render_canonical_feature_grid(rows)
+    grid = render_source_feature_grid(rows)
     if vis.display:
-        _display_bgr(grid, "Canonical DIFT feature maps", px_per_in=60.0)
+        _display_bgr(grid, "Source DIFT feature maps", px_per_in=60.0)
     if vis.save:
         cv2.imwrite(
-            _out(context, "canonical_feature_maps.jpg"),
+            _out(context, "source_feature_maps.jpg"),
             grid,
             [cv2.IMWRITE_JPEG_QUALITY, 90],
         )
+
+
+def _render_source_foreground_mask(
+    source_img: np.ndarray,
+    foreground_mask: np.ndarray,
+) -> np.ndarray:
+    source = np.asarray(source_img)
+    if source.ndim == 2:
+        source_bgr = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    elif source.ndim == 3 and source.shape[2] == 1:
+        source_bgr = cv2.cvtColor(
+            source[:, :, 0].astype(np.uint8),
+            cv2.COLOR_GRAY2BGR,
+        )
+    elif source.ndim == 3 and source.shape[2] == 4:
+        source_bgr = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_BGRA2BGR)
+    elif source.ndim == 3 and source.shape[2] == 3:
+        source_bgr = source.astype(np.uint8).copy()
+    else:
+        raise ValueError(f"Unsupported source image shape: {source.shape}")
+
+    h, w = source_bgr.shape[:2]
+    mask = np.asarray(foreground_mask, dtype=bool)
+    mask_img = cv2.resize(
+        mask.astype(np.uint8) * 255,
+        (w, h),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    mask_bgr = cv2.cvtColor(mask_img, cv2.COLOR_GRAY2BGR)
+
+    overlay = source_bgr.copy()
+    foreground = mask_img.astype(bool)
+    overlay[foreground] = (
+        overlay[foreground].astype(np.float32) * 0.35
+        + np.array([0, 180, 0], dtype=np.float32) * 0.65
+    ).astype(np.uint8)
+
+    panels = [
+        ("source", source_bgr),
+        ("foreground mask", mask_bgr),
+        ("mask overlay", overlay),
+    ]
+    header_h = 30
+    gap = 6
+    canvas = np.full(
+        (h + header_h, len(panels) * w + (len(panels) - 1) * gap, 3),
+        35,
+        dtype=np.uint8,
+    )
+    for idx, (label, image) in enumerate(panels):
+        x0 = idx * (w + gap)
+        cv2.putText(
+            canvas,
+            label,
+            (x0 + 6, 21),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (230, 230, 230),
+            1,
+            cv2.LINE_AA,
+        )
+        canvas[header_h:, x0:x0 + w] = image
+    return canvas
 
 
 def vis_dift_score_on_whole_tablet(context: CropContext, vis: VisOptions) -> None:
@@ -1003,8 +1084,24 @@ def vis_dift_score_on_whole_tablet(context: CropContext, vis: VisOptions) -> Non
     box_height = s.detections.avg_height
     chosen_draw_box_ix = 0
     chosen_draw_box_iy = 0
-    sign_name = "DUB"
+    sign_name = "TUR"
     sign = SignResolver.from_name(sign_name)
+    source = context.dift.source
+    if source is None:
+        raise ValueError("DiftRuntime.source must be set")
+    period = _source_period(context)
+    source_img = source.get(sign.name, period)
+    source_feature = context.dift.get_sign_feature(sign, period)
+    if source_img is None or source_feature is None:
+        raise KeyError(f"no source image/feature for sign {sign_name!r}")
+    foreground_mask = source_foreground_mask(
+        source_img,
+        source_feature.shape[-2:],
+    )
+    foreground_mask_vis = _render_source_foreground_mask(
+        source_img,
+        foreground_mask,
+    )
 
     point_vis = s.crop_tablet.img.copy()
     for iy, cy in enumerate(y_coords):
@@ -1017,29 +1114,42 @@ def vis_dift_score_on_whole_tablet(context: CropContext, vis: VisOptions) -> Non
             cv2.circle(point_vis, (cx, cy), 9, (0, 0, 255), -1, cv2.LINE_AA)
             cv2.putText(point_vis, f"{iy},{ix}", (cx + 16, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     if vis.display:
+        _display_bgr(foreground_mask_vis, "DIFT source foreground mask")
         _display_bgr(point_vis, "DIFT sampling points and boxes on crop tablet")
 
     score_grid = np.zeros((len(y_coords), len(x_coords)), dtype=np.float32)
     semantic_grid = np.zeros((len(y_coords), len(x_coords)), dtype=np.float32)
     global_similarity_grid = np.zeros((len(y_coords), len(x_coords)), dtype=np.float32)
+    sim_withoutbg_grid = np.zeros((len(y_coords), len(x_coords)), dtype=np.float32)
     score_rows = []
     from tqdm.auto import tqdm
     points = [(iy, ix, cy, cx) for iy, cy in enumerate(y_coords) for ix, cx in enumerate(x_coords)]
     for iy, ix, cy, cx in tqdm(points, desc="DIFT scores", disable=not vis.info):
         box = Box.from_center(cx=cx, cy=cy, width=box_width, height=box_height, sign=sign, tablet=s.crop_tablet)
         x1, y1, x2, y2 = box.crop_bounds()
-        _, _, result = _compute_manual_dift_crop_match(context, bounds=(x1, x2, y1, y2), sign_name=sign_name)
+        crop = box.crop_image()
+        crop_feature = context.dift.featurize_image(crop)
+        result = context.dift.match(
+            source_feature,
+            crop_feature,
+            source_img.shape[:2],
+            crop.shape[:2],
+            context.dift.config.match,
+            src_foreground_mask=foreground_mask,
+        )
         score_grid[iy, ix] = result.coarse_score
         semantic_grid[iy, ix] = result.semantic_score
         global_similarity_grid[iy, ix] = result.global_similarity_score
+        sim_withoutbg_grid[iy, ix] = result.sim_withoutbg
         score_rows.append({
             "ix": ix,
             "iy": iy,
             "center": (cx, cy),
-            "bounds": (x1, x2, y1, y2),
+            "bounds": (x1, y1, x2, y2),
             "score": result.score,
             "semantic": result.semantic_score,
             "global_similarity": result.global_similarity_score,
+            "sim_withoutbg": result.sim_withoutbg,
             "geometry": result.geometry_score,
             "support": result.support_score,
             "coarse": result.coarse_score,
@@ -1071,27 +1181,38 @@ def vis_dift_score_on_whole_tablet(context: CropContext, vis: VisOptions) -> Non
     score_vis = make_heatmap(score_grid)
     semantic_vis = make_heatmap(semantic_grid)
     global_similarity_vis = make_heatmap(global_similarity_grid)
+    sim_withoutbg_vis = make_heatmap(sim_withoutbg_grid)
 
     s.dift_sampling_scores = score_rows
+    s.dift_sampling_foreground_mask = foreground_mask
+    s.dift_sampling_foreground_mask_image = foreground_mask_vis
     s.dift_sampling_score_image = score_vis
     s.dift_sampling_semantic_image = semantic_vis
     s.dift_sampling_global_similarity_image = global_similarity_vis
+    s.dift_sampling_sim_withoutbg_image = sim_withoutbg_vis
 
     if vis.display:
         _display_bgr(score_vis, "DIFT coarse scores (geometry * support)")
         _display_bgr(semantic_vis, "DIFT semantic scores")
         _display_bgr(global_similarity_vis, "DIFT global similarity")
+        _display_bgr(sim_withoutbg_vis, "DIFT sim_withoutbg")
     if vis.save:
+        cv2.imwrite(
+            _out(context, "dift_sampling_source_foreground_mask.jpg"),
+            foreground_mask_vis,
+            [cv2.IMWRITE_JPEG_QUALITY, 90],
+        )
         cv2.imwrite(_out(context, "dift_sampling_coarse_scores.jpg"), score_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
         cv2.imwrite(_out(context, "dift_sampling_semantic_scores.jpg"), semantic_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
         cv2.imwrite(_out(context, "dift_sampling_global_similarity.jpg"), global_similarity_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        cv2.imwrite(_out(context, "dift_sampling_sim_withoutbg.jpg"), sim_withoutbg_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
 
 def vis_manual_dift_crop_match(
     context: CropContext,
     vis: VisOptions,
 ) -> None:
-    """Create notebook controls for manual crop-to-canonical DIFT matching."""
+    """Create notebook controls for manual crop-to-source DIFT matching."""
     s = context.state
     if not vis.display:
         if vis.info:
@@ -1108,13 +1229,13 @@ def vis_manual_dift_crop_match(
         for box in boxes
     })
     if not sign_names:
-        print("=== Manual DIFT match skipped: no canonical signs are available ===")
+        print("=== Manual DIFT match skipped: no source signs are available ===")
         return
 
-    default_bounds, default_sign = _manual_dift_match_defaults(
+    default_box, default_sign = _manual_dift_match_defaults(
         s, sign_names
     )
-    x1_default, x2_default, y1_default, y2_default = default_bounds
+    x1_default, y1_default, x2_default, y2_default = default_box.crop_bounds()
     width_default = x2_default - x1_default
     height_default = y2_default - y1_default
     img_h, img_w = s.crop_tablet.img.shape[:2]
@@ -1156,14 +1277,14 @@ def vis_manual_dift_crop_match(
         options=sign_names,
         value=default_sign,
         description="sign",
-        placeholder="canonical sign name",
+        placeholder="source sign name",
         layout=widgets.Layout(width="420px"),
         style={"description_width": "42px"},
     )
     compare_button = widgets.Button(
         description="Compare crop",
         button_style="primary",
-        tooltip="Compute the crop feature and compare it with the cached canonical feature",
+        tooltip="Compute the crop feature and compare it with the source feature",
     )
     output = widgets.Output()
 
@@ -1172,6 +1293,10 @@ def vis_manual_dift_crop_match(
         print(
             "score = semantic * sqrt(geometry * support); "
             "this is an uncalibrated diagnostic score, not a probability."
+        )
+        print(
+            "sim_withoutbg uses only non-white prototype foreground features "
+            "for global similarity."
         )
         print(
             f"Subtablet coordinate range: x=[0, {img_w}], y=[0, {img_h}]"
@@ -1186,22 +1311,45 @@ def vis_manual_dift_crop_match(
                 y1 = y1_input.value
                 x2 = x1 + width_input.value
                 y2 = y1 + height_input.value
-                bounds = (
-                    x1,
-                    x2,
-                    y1,
-                    y2,
+                sign_name = sign_input.value
+                box = Box(
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    sign=SignResolver.from_name(sign_name),
+                    tablet=s.crop_tablet,
                 )
-                record, crop, result = _compute_manual_dift_crop_match(
-                    context,
-                    bounds=bounds,
-                    sign_name=sign_input.value,
+                crop = box.crop_image()
+                source = context.dift.source
+                if source is None:
+                    raise ValueError("DiftRuntime.source must be set")
+                period = _source_period(context)
+                source_img = source.get(box.sign_name, period)
+                source_feature = context.dift.get_sign_feature(box.sign, period)
+                if source_img is None or source_feature is None:
+                    raise KeyError(f"no source image/feature for sign {sign_name!r}")
+                crop_feature = context.dift.featurize_image(crop)
+                result = context.dift.match(
+                    source_feature,
+                    crop_feature,
+                    source_img.shape[:2],
+                    crop.shape[:2],
+                    context.dift.config.match,
+                    src_foreground_mask=source_foreground_mask(
+                        source_img,
+                        source_feature.shape[-2:],
+                    ),
                 )
                 print(
                     f"score={result.score:.4f}  "
                     f"semantic={result.semantic_score:.4f}  "
                     f"geometry={result.geometry_score:.4f}  "
                     f"support={result.support_score:.4f}"
+                )
+                print(
+                    f"global_similarity={result.global_similarity_score:.4f}  "
+                    f"sim_withoutbg={result.sim_withoutbg:.4f}"
                 )
                 print(
                     f"mutual matches={result.n_matches}, "
@@ -1212,8 +1360,8 @@ def vis_manual_dift_crop_match(
                     print(f"status: {result.message}")
                 figure = _manual_dift_match_figure(
                     context,
-                    bounds,
-                    record.img,
+                    box,
+                    source_img,
                     crop,
                     result,
                 )
@@ -1236,7 +1384,7 @@ def vis_manual_dift_crop_match(
 def _manual_dift_match_defaults(
     state: SampleState,
     sign_names: list[str],
-) -> tuple[tuple[int, int, int, int], str]:
+) -> tuple[Box, str]:
     img_h, img_w = state.crop_tablet.img.shape[:2]
     available = set(sign_names)
     if state.det_boxes:
@@ -1245,49 +1393,28 @@ def _manual_dift_match_defaults(
         ]
         if candidates:
             box = candidates[0]
-            x1 = max(0, min(img_w - 1, int(np.floor(box.x1))))
-            x2 = max(x1 + 1, min(img_w, int(np.ceil(box.x2))))
-            y1 = max(0, min(img_h - 1, int(np.floor(box.y1))))
-            y2 = max(y1 + 1, min(img_h, int(np.ceil(box.y2))))
-            return (x1, x2, y1, y2), box.sign_name
+            return box.copy(), box.sign_name
 
     x1 = img_w // 4
     x2 = max(x1 + 1, img_w * 3 // 4)
     y1 = img_h // 4
     y2 = max(y1 + 1, img_h * 3 // 4)
-    return (x1, min(x2, img_w), y1, min(y2, img_h)), sign_names[0]
-
-
-def _compute_manual_dift_crop_match(
-    context: CropContext,
-    bounds: tuple[int, int, int, int],
-    sign_name: str,
-):
-    s = context.state
-    x1, x2, y1, y2 = map(int, bounds)
-    img_h, img_w = s.crop_tablet.img.shape[:2]
-    if not (0 <= x1 < x2 <= img_w and 0 <= y1 < y2 <= img_h):
-        raise ValueError(
-            f"invalid bounds {(x1, x2, y1, y2)} for image "
-            f"width={img_w}, height={img_h}"
-        )
-
-    sign_name = sign_name.strip()
-    if not sign_name:
-        raise ValueError("canonical sign name is required")
-    record = s.canonical.cache.get(SignResolver.from_name(sign_name))
-    if record is None:
-        raise KeyError(f"no canonical image/feature for sign {sign_name!r}")
-
-    crop = s.crop_tablet.img[y1:y2, x1:x2].copy()
-    result = s.canonical.cache.match(record, crop, context.dift.config.match)
-    return record, crop, result
+    sign = SignResolver.from_name(sign_names[0])
+    box = Box(
+        x1=x1,
+        y1=y1,
+        x2=min(x2, img_w),
+        y2=min(y2, img_h),
+        sign=sign,
+        tablet=state.crop_tablet,
+    )
+    return box, sign_names[0]
 
 
 def _manual_dift_match_figure(
     context: CropContext,
-    bounds: tuple[int, int, int, int],
-    canonical_img: np.ndarray,
+    box: Box,
+    source_img: np.ndarray,
     crop_img: np.ndarray,
     result,
 ):
@@ -1296,24 +1423,24 @@ def _manual_dift_match_figure(
 
     config = context.dift.config
     matches = render_dift_feature_matches(
-        canonical_img,
+        source_img,
         crop_img,
         result,
         thumb=config.manual_match_thumb,
         max_lines=config.manual_match_max_lines,
     )
-    warp = render_dift_crop_warp(canonical_img, crop_img, result)
+    warp = render_dift_crop_warp(source_img, crop_img, result)
 
     fig = plt.figure(figsize=(18, 10), constrained_layout=True)
     grid = fig.add_gridspec(2, 3, height_ratios=(1.0, 1.15))
     overview_ax = fig.add_subplot(grid[0, 0])
-    canonical_ax = fig.add_subplot(grid[0, 1])
+    source_ax = fig.add_subplot(grid[0, 1])
     crop_ax = fig.add_subplot(grid[0, 2])
     matches_ax = fig.add_subplot(grid[1, :2])
     warp_ax = fig.add_subplot(grid[1, 2])
 
     _imshow_notebook(overview_ax, context.state.crop_tablet.img)
-    x1, x2, y1, y2 = bounds
+    x1, y1, x2, y2 = box.crop_bounds()
     overview_ax.add_patch(Rectangle(
         (x1, y1),
         x2 - x1,
@@ -1326,25 +1453,28 @@ def _manual_dift_match_figure(
         f"Subtablet crop: x1={x1}, y1={y1}, "
         f"w={x2 - x1}, h={y2 - y1} (x2={x2}, y2={y2})"
     )
-    _imshow_notebook(canonical_ax, canonical_img)
-    canonical_ax.set_title("Canonical sign")
+    _imshow_notebook(source_ax, source_img)
+    source_ax.set_title("Source sign")
     _imshow_notebook(crop_ax, crop_img)
     crop_ax.set_title("Selected crop")
     _imshow_notebook(matches_ax, matches)
     matches_ax.set_title("DIFT mutual matches and affine-RANSAC inliers")
     _imshow_notebook(warp_ax, warp)
-    warp_ax.set_title("Warped canonical overlay")
+    warp_ax.set_title("Warped source overlay")
 
     for axis in (
         overview_ax,
-        canonical_ax,
+        source_ax,
         crop_ax,
         matches_ax,
         warp_ax,
     ):
         axis.axis("off")
     fig.suptitle(
-        f"Manual DIFT match score: {result.score:.3f}",
+        (
+            f"Manual DIFT match score: {result.score:.3f}  "
+            f"sim_withoutbg: {result.sim_withoutbg:.3f}"
+        ),
         fontsize=15,
     )
     return fig
