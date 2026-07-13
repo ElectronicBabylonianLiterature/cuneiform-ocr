@@ -34,7 +34,7 @@ class ImageView:
     max_value: Optional[float] = None
     
     @classmethod
-    def from_any(cls, img: Any, *, assume_bgr: bool = False) -> "ImageView":
+    def from_any(cls, img: Any, *, assume_bgr: bool = True) -> "ImageView":
         if isinstance(img, ImageView):
             return img
         if isinstance(img, Image.Image):
@@ -101,7 +101,30 @@ class ImageView:
 
 @dataclass
 class DiftMatchResult:
-    similarity_tensor: torch.Tensor # H, W, H, W
+    affine: Optional[np.ndarray]
+    src_points: np.ndarray
+    dst_points: np.ndarray
+    similarities: np.ndarray
+    inlier_mask: np.ndarray
+    n_matches: int
+    n_inliers: int
+    mean_inlier_similarity: float
+    semantic_score: float
+    global_similarity_score: float
+    sim_withoutbg: float
+    geometry_score: float
+    support_score: float
+    score: float
+    coarse_score: float
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class DiftMatchConfig:
+    max_matches: int = 300
+    min_matches: int = 3
+    min_support: int = 12
+    ransac_threshold: Optional[float] = None
 
 
 @dataclass
@@ -186,14 +209,184 @@ class DiftContext:
             feature_map = self.dift_wrapper.featurize(image_view.as_pil()).detach()
             return feature_map
     
-    def match(self, src_feature: torch.Tensor, target_feature: torch.Tensor) -> DiftMatchResult:
-        similarity_tensor = self.dift_wrapper.get_similarity_tensor(src_feature, target_feature)
-        return DiftMatchResult(
-            similarity_tensor=similarity_tensor
+    def match(
+        self,
+        src_feature: torch.Tensor,
+        dst_feature: torch.Tensor,
+        src_img_shape: Tuple[int, int],
+        dst_img_shape: Tuple[int, int],
+        config: Optional[DiftMatchConfig] = None,
+        src_foreground_mask: Optional[np.ndarray] = None,
+    ) -> DiftMatchResult:
+        """Match local features and score semantic plus geometric agreement."""
+        config = config or DiftMatchConfig()
+        src = src_feature.detach().float()
+        dst = dst_feature.detach().float()
+        device = dst.device
+        src = src.to(device=device)
+
+        c = src.shape[0]
+        src_flat = src.reshape(c, -1)
+        dst_flat = dst.reshape(c, -1)
+        sim = src_flat.T @ dst_flat
+        global_similarity = 0.5 * (
+            sim.max(dim=1).values.mean() + sim.max(dim=0).values.mean()
+        )
+        sim_withoutbg = _foreground_only_global_similarity(
+            sim,
+            src_foreground_mask,
+            fallback=global_similarity,
+        )
+
+        src_to_dst = sim.argmax(dim=1)
+        dst_to_src = sim.argmax(dim=0)
+        src_idx = torch.arange(sim.shape[0], device=device)
+        is_mutual = dst_to_src[src_to_dst] == src_idx
+        mutual_src = src_idx[is_mutual]
+        mutual_dst = src_to_dst[is_mutual]
+        mutual_sim = sim[mutual_src, mutual_dst]
+
+        if mutual_src.numel() > config.max_matches:
+            vals, keep = torch.topk(mutual_sim, k=config.max_matches)
+            mutual_src = mutual_src[keep]
+            mutual_dst = mutual_dst[keep]
+            mutual_sim = vals
+
+        src_points = _feature_indices_to_image_points(
+            mutual_src.detach().cpu().numpy(),
+            src.shape[1],
+            src.shape[2],
+            src_img_shape[0],
+            src_img_shape[1],
+        )
+        dst_points = _feature_indices_to_image_points(
+            mutual_dst.detach().cpu().numpy(),
+            dst.shape[1],
+            dst.shape[2],
+            dst_img_shape[0],
+            dst_img_shape[1],
+        )
+        similarities = mutual_sim.detach().cpu().numpy()
+        global_similarity_score = float(global_similarity.detach().cpu())
+        sim_withoutbg_score = float(sim_withoutbg.detach().cpu())
+
+        def finish(
+            *,
+            affine: Optional[np.ndarray] = None,
+            inlier_mask: Optional[np.ndarray] = None,
+            message: str = "",
+        ) -> DiftMatchResult:
+            n_matches = len(src_points)
+            if inlier_mask is None:
+                mask = np.zeros(n_matches, dtype=bool)
+            else:
+                mask = np.asarray(inlier_mask, dtype=bool)
+            n_inliers = int(mask.sum())
+            mean_similarity = (
+                float(similarities[mask].mean()) if n_inliers else 0.0
             )
+            semantic = float(np.clip(mean_similarity, 0.0, 1.0))
+            global_score = float(np.clip(global_similarity_score, 0.0, 1.0))
+            no_bg_score = float(np.clip(sim_withoutbg_score, 0.0, 1.0))
+            geometry = float(n_inliers / n_matches) if n_matches else 0.0
+            support = float(min(1.0, n_inliers / max(1, config.min_support)))
+            coarse = float(geometry * support)
+            score = float(semantic * np.sqrt(coarse))
+            return DiftMatchResult(
+                affine=affine,
+                src_points=src_points,
+                dst_points=dst_points,
+                similarities=similarities,
+                inlier_mask=mask,
+                n_matches=n_matches,
+                n_inliers=n_inliers,
+                mean_inlier_similarity=mean_similarity,
+                semantic_score=semantic,
+                global_similarity_score=global_score,
+                sim_withoutbg=no_bg_score,
+                geometry_score=geometry,
+                support_score=support,
+                score=score,
+                coarse_score=coarse,
+                message=message,
+            )
+
+        n_matches = len(src_points)
+        if n_matches < config.min_matches:
+            return finish(
+                message=f"need at least {config.min_matches} mutual matches"
+            )
+
+        threshold = config.ransac_threshold
+        if threshold is None:
+            threshold = max(3.0, 0.06 * max(dst_img_shape))
+
+        src32 = src_points.astype(np.float32)
+        dst32 = dst_points.astype(np.float32)
+        affine = inliers = None
+        for estimator in (cv2.estimateAffine2D, cv2.estimateAffinePartial2D):
+            affine, inliers = estimator(
+                src32,
+                dst32,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=float(threshold),
+                maxIters=2000,
+                confidence=0.99,
+                refineIters=10,
+            )
+            if affine is not None:
+                break
+        if affine is None:
+            return finish(message="affine RANSAC failed")
+
+        inlier_mask = (
+            inliers.ravel().astype(bool)
+            if inliers is not None
+            else np.ones(n_matches, dtype=bool)
+        )
+        return finish(affine=affine, inlier_mask=inlier_mask)
 
         
     
+
+def _foreground_only_global_similarity(
+    sim: torch.Tensor,
+    src_foreground_mask: Optional[np.ndarray],
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    if src_foreground_mask is None:
+        return fallback
+
+    mask = torch.as_tensor(
+        np.asarray(src_foreground_mask, dtype=bool).reshape(-1),
+        device=sim.device,
+        dtype=torch.bool,
+    )
+    if mask.numel() != sim.shape[0] or not bool(mask.any()):
+        return fallback
+
+    foreground_sim = sim[mask]
+    return 0.5 * (
+        foreground_sim.max(dim=1).values.mean()
+        + foreground_sim.max(dim=0).values.mean()
+    )
+
+
+def _feature_indices_to_image_points(
+    indices: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    img_h: int,
+    img_w: int,
+) -> np.ndarray:
+    if indices.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    ys = indices // grid_w
+    xs = indices % grid_w
+    pts_x = (xs + 0.5) / grid_w * img_w
+    pts_y = (ys + 0.5) / grid_h * img_h
+    return np.stack([pts_x, pts_y], axis=1).astype(np.float32)
+
 
 DIFT_CHECKPOINT = os.path.expanduser("~/erc-src/ProtoSnap/weights/SD_with_prompt")
 
@@ -241,10 +434,179 @@ print(f"Cosine similarity between new feature and 3_AN previous feature: {cosine
 
 print(f"Feature for sign {sign.name} in period {period}: shape={feature_an.shape}, dtype={feature_an.dtype}")
 
-# print(help(dift.SDFeaturizer))
-
-
 # =============
+
+from sign_alignment.data_source import LocalDataSource
+from sign_alignment.detector import ModelConfig, TabletImageDetector
+from sign_alignment.tablet import Tablet
+
+
+ANNOTATIONS_DIR = os.path.expanduser("~/erc-work-data/data-of-cuneiform-ocr-data/filtered_annotations")
+CONFIG_FILE = "configs/detr.py"
+CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/epoch_1000.pth")
+SCORE_THRESHOLD = 0.5
+
+test_detector = TabletImageDetector(
+    score_threshold=SCORE_THRESHOLD,
+    model_config=ModelConfig(
+        config_file=CONFIG_FILE,
+        checkpoint_file=CHECKPOINT_FILE,
+        device="auto",
+    ),
+    keep_crops=True,
+    is_crop_itself=False,
+)
+test_root_tablet = Tablet(
+    img=LocalDataSource(ANNOTATIONS_DIR).load_image("YBC.12860"),
+    name="YBC.12860",
+)
+test_detector.detect(test_root_tablet)
+test_tablet = test_detector.get_crop_tablets()[5]
+
+# show test_tablet.img
+ImageView.from_any(test_tablet.img).as_pil().save("/tmp/test_tablet.png")
+print(f"Saved test_tablet image to /tmp/test_tablet.png")
+
+# Crop detected signs in crop_5.
+test_boxes = test_detector.get_crop_boxes()[5]
+test_sign_names = ("AN", "TUR", "LU")
+test_boxes_by_sign = {name: next(b for b in test_boxes if b.sign_name == name) for name in test_sign_names}
+test_crop_imgs_by_sign = {name: box.crop_image() for name, box in test_boxes_by_sign.items()}
+
+for sign_name, crop_img in test_crop_imgs_by_sign.items():
+    crop_path = f"/tmp/test_box_crop_{sign_name}.png"
+    box = test_boxes_by_sign[sign_name]
+    ImageView.from_any(crop_img).as_pil().save(crop_path)
+    print(f"Saved {sign_name} detected sign crop to {crop_path}; bbox={box.bbox}, score={box.score:.4f}")
+
+box_an = test_boxes_by_sign["AN"]
+box_tur = test_boxes_by_sign["TUR"]
+box_lu = test_boxes_by_sign["LU"]
+crop_img_an = test_crop_imgs_by_sign["AN"]
+crop_img_tur = test_crop_imgs_by_sign["TUR"]
+crop_img_lu = test_crop_imgs_by_sign["LU"]
+
+# Set this by hand for a random crop area: x1, y1, x2, y2 in crop_5 coordinates.
+manual_crop_xyxy = (500, 500, 920, 820)
+x1, y1, x2, y2 = manual_crop_xyxy
+crop_img_manual = test_tablet.img[y1:y2, x1:x2].copy()
+ImageView.from_any(crop_img_manual).as_pil().save("/tmp/test_box_crop_manual.png")
+print(f"Saved manual crop to /tmp/test_box_crop_manual.png; bbox={list(manual_crop_xyxy)}")
+
+
+prototype_an = context.source.get(sign_name="AN", period=period)
+
+
+
+# cal features on prototype and crop
+prototype_an_feature = context.featurize_image(prototype_an)
+crop_img_an_feature = context.featurize_image(crop_img_an)
+
+match_result_an = context.match(
+    src_feature=prototype_an_feature,
+    dst_feature=crop_img_an_feature,
+    src_img_shape=ImageView.from_any(prototype_an).shape[:2],
+    dst_img_shape=crop_img_an.shape[:2],
+)
+
+
+
+print(prototype_an_feature.shape, crop_img_an_feature.shape)
+
+
+# saliency map
+def save_crop_saliency(prototype_img, prototype_feature, crop_img, crop_feature, name: str):
+    proto_gray = ImageView.from_any(prototype_img).as_gray_numpy()
+    grid_h, grid_w = prototype_feature.shape[1:]
+    proto_mask = cv2.resize(
+        proto_gray,
+        (grid_w, grid_h),
+        interpolation=cv2.INTER_AREA,
+    ) != 255
+
+    src = prototype_feature.detach().float()
+    dst = crop_feature.detach().float().to(device=src.device)
+    mask = torch.as_tensor(proto_mask, device=src.device, dtype=torch.bool)
+    sim = torch.einsum("cij,ckl->ijkl", src, dst)
+    saliency = sim[mask, :, :].mean(dim=0) - sim[~mask, :, :].mean(dim=0)
+    saliency -= saliency.min()
+    saliency /= saliency.max().clamp_min(1e-6)
+
+    
+    clahe = cv2.createCLAHE(clipLimit=10.0, tileGridSize=(2, 2))
+    saliency_np = saliency.detach().cpu().numpy()
+    saliency_eq = clahe.apply((saliency_np * 255).astype(np.uint8)).astype(np.float32)
+    saliency_eq -= saliency_eq.mean()
+    saliency_eq = np.clip(saliency_eq, 0.0, None)
+    saliency_eq /= max(float(saliency_eq.max()), 1e-6)
+
+    saliency_eq = saliency.detach().cpu().numpy().astype(np.float32) # bypass equalization for now
+
+    crop_view = ImageView.from_any(crop_img)
+    crop_h, crop_w = crop_view.shape[:2]
+    saliency_full = cv2.resize(
+        saliency_eq,
+        (crop_w, crop_h),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    saliency_heat = cv2.applyColorMap(
+        (saliency_full * 255).astype(np.uint8),
+        cv2.COLORMAP_JET,
+    )
+    saliency_overlay = cv2.addWeighted(
+        crop_view.as_bgr_numpy(),
+        0.55,
+        saliency_heat,
+        0.45,
+        0,
+    )
+    heat_path = f"/tmp/crop_img_{name}_saliency.png"
+    overlay_path = f"/tmp/crop_img_{name}_saliency_overlay.png"
+    cv2.imwrite(heat_path, saliency_heat)
+    cv2.imwrite(overlay_path, saliency_overlay)
+    print(f"Saved {name} saliency map to {heat_path}")
+    print(f"Saved {name} saliency overlay to {overlay_path}")
+
+
+prototype_imgs_by_name = {
+    "an": prototype_an,
+    "tur": context.source.get(sign_name="TUR", period=period),
+    "lu": context.source.get(sign_name="LU", period=period),
+}
+prototype_features_by_name = {
+    name: context.featurize_image(img)
+    for name, img in prototype_imgs_by_name.items()
+}
+crop_imgs_for_saliency = {
+    "an": crop_img_an,
+    "tur": crop_img_tur,
+    "lu": crop_img_lu,
+    "manual": crop_img_manual,
+}
+crop_features_for_saliency = {
+    "an": crop_img_an_feature,
+    "tur": context.featurize_image(crop_img_tur),
+    "lu": context.featurize_image(crop_img_lu),
+    "manual": context.featurize_image(crop_img_manual),
+}
+
+for name in ("an", "tur", "lu"):
+    save_crop_saliency(
+        prototype_imgs_by_name[name],
+        prototype_features_by_name[name],
+        crop_imgs_for_saliency[name],
+        crop_features_for_saliency[name],
+        name,
+    )
+
+save_crop_saliency(
+    prototype_an,
+    prototype_an_feature,
+    crop_img_manual,
+    crop_features_for_saliency["manual"],
+    "manual_an",
+)
+
 
 
 note = \

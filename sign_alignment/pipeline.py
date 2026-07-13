@@ -187,6 +187,14 @@ class SampleState:
     dift_sampling_sim_withoutbg_image: Optional[np.ndarray] = None
     dift_sampling_foreground_mask: Optional[np.ndarray] = None
     dift_sampling_foreground_mask_image: Optional[np.ndarray] = None
+    dift_sampling_inlier_score_image: Optional[np.ndarray] = None
+    dift_sampling_certainty_image: Optional[np.ndarray] = None
+    dift_sampling_bending_energy_image: Optional[np.ndarray] = None
+    dift_sampling_jacobian_fold_image: Optional[np.ndarray] = None
+    dift_sampling_local_distortion_image: Optional[np.ndarray] = None
+    dift_sampling_scale_image: Optional[np.ndarray] = None
+    dift_sampling_affine_angle_image: Optional[np.ndarray] = None
+    dift_sampling_affine_iou_image: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -1084,79 +1092,114 @@ def vis_dift_score_on_whole_tablet(context: CropContext, vis: VisOptions) -> Non
     box_height = s.detections.avg_height
     chosen_draw_box_ix = 0
     chosen_draw_box_iy = 0
-    sign_name = "TUR"
-    sign = SignResolver.from_name(sign_name)
+    sign_names = ["AN", "TUR", "DA", "A", "I"]
+    first_sign = SignResolver.from_name(sign_names[0])
     source = context.dift.source
     if source is None:
         raise ValueError("DiftRuntime.source must be set")
     period = _source_period(context)
-    source_img = source.get(sign.name, period)
-    source_feature = context.dift.get_sign_feature(sign, period)
-    if source_img is None or source_feature is None:
-        raise KeyError(f"no source image/feature for sign {sign_name!r}")
-    foreground_mask = source_foreground_mask(
-        source_img,
-        source_feature.shape[-2:],
-    )
-    foreground_mask_vis = _render_source_foreground_mask(
-        source_img,
-        foreground_mask,
-    )
 
     point_vis = s.crop_tablet.img.copy()
     for iy, cy in enumerate(y_coords):
         for ix, cx in enumerate(x_coords):
             if ix == chosen_draw_box_ix and iy == chosen_draw_box_iy:
-                box = Box.from_center(cx=cx, cy=cy, width=box_width, height=box_height, sign=sign, tablet=s.crop_tablet)
+                box = Box.from_center(cx=cx, cy=cy, width=box_width, height=box_height, sign=first_sign, tablet=s.crop_tablet)
                 x1, y1, x2, y2 = box.crop_bounds()
                 cv2.rectangle(point_vis, (x1, y1), (x2 - 1, y2 - 1), (0, 255, 255), 2, cv2.LINE_AA)
             cv2.circle(point_vis, (cx, cy), 15, (255, 255, 255), -1, cv2.LINE_AA)
             cv2.circle(point_vis, (cx, cy), 9, (0, 0, 255), -1, cv2.LINE_AA)
             cv2.putText(point_vis, f"{iy},{ix}", (cx + 16, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    if vis.display:
-        _display_bgr(foreground_mask_vis, "DIFT source foreground mask")
-        _display_bgr(point_vis, "DIFT sampling points and boxes on crop tablet")
 
-    score_grid = np.zeros((len(y_coords), len(x_coords)), dtype=np.float32)
-    semantic_grid = np.zeros((len(y_coords), len(x_coords)), dtype=np.float32)
-    global_similarity_grid = np.zeros((len(y_coords), len(x_coords)), dtype=np.float32)
-    sim_withoutbg_grid = np.zeros((len(y_coords), len(x_coords)), dtype=np.float32)
-    score_rows = []
     from tqdm.auto import tqdm
     points = [(iy, ix, cy, cx) for iy, cy in enumerate(y_coords) for ix, cx in enumerate(x_coords)]
-    for iy, ix, cy, cx in tqdm(points, desc="DIFT scores", disable=not vis.info):
-        box = Box.from_center(cx=cx, cy=cy, width=box_width, height=box_height, sign=sign, tablet=s.crop_tablet)
+    sign_runs = []
+    for sign_name in sign_names:
+        sign = SignResolver.from_name(sign_name)
+        source_img = source.get(sign.name, period)
+        source_feature = context.dift.get_sign_feature(sign, period)
+        if source_img is None or source_feature is None:
+            raise KeyError(f"no source image/feature for sign {sign_name!r}")
+        foreground_mask = source_foreground_mask(
+            source_img,
+            source_feature.shape[-2:],
+        )
+        foreground_mask_vis = _render_source_foreground_mask(
+            source_img,
+            foreground_mask,
+        )
+        shape = (len(y_coords), len(x_coords))
+        sign_runs.append({
+            "sign_name": sign_name,
+            "source_img": source_img,
+            "source_feature": source_feature,
+            "foreground_mask": foreground_mask,
+            "foreground_mask_vis": foreground_mask_vis,
+            "coarse_grid": np.zeros(shape, dtype=np.float32),
+            "affine_angle_grid": np.zeros(shape, dtype=np.float32),
+            "affine_iou_grid": np.zeros(shape, dtype=np.float32),
+            "inlier_score_grid": np.zeros(shape, dtype=np.float32),
+            "semantic_grid": np.zeros(shape, dtype=np.float32),
+            "global_similarity_grid": np.zeros(shape, dtype=np.float32),
+            "sim_withoutbg_grid": np.zeros(shape, dtype=np.float32),
+            "certainty_grid": np.zeros(shape, dtype=np.float32),
+            "bending_energy_grid": np.zeros(shape, dtype=np.float32),
+            "jacobian_fold_grid": np.zeros(shape, dtype=np.float32),
+            "local_distortion_grid": np.zeros(shape, dtype=np.float32),
+            "scale_grid": np.zeros(shape, dtype=np.float32),
+            "score_rows": [],
+        })
+
+    for iy, ix, cy, cx in tqdm(points, desc=f"DIFT scores x{len(sign_runs)} signs", disable=not vis.info):
+        box = Box.from_center(cx=cx, cy=cy, width=box_width, height=box_height, sign=first_sign, tablet=s.crop_tablet)
         x1, y1, x2, y2 = box.crop_bounds()
         crop = box.crop_image()
         crop_feature = context.dift.featurize_image(crop)
-        result = context.dift.match(
-            source_feature,
-            crop_feature,
-            source_img.shape[:2],
-            crop.shape[:2],
-            context.dift.config.match,
-            src_foreground_mask=foreground_mask,
-        )
-        score_grid[iy, ix] = result.coarse_score
-        semantic_grid[iy, ix] = result.semantic_score
-        global_similarity_grid[iy, ix] = result.global_similarity_score
-        sim_withoutbg_grid[iy, ix] = result.sim_withoutbg
-        score_rows.append({
-            "ix": ix,
-            "iy": iy,
-            "center": (cx, cy),
-            "bounds": (x1, y1, x2, y2),
-            "score": result.score,
-            "semantic": result.semantic_score,
-            "global_similarity": result.global_similarity_score,
-            "sim_withoutbg": result.sim_withoutbg,
-            "geometry": result.geometry_score,
-            "support": result.support_score,
-            "coarse": result.coarse_score,
-            "n_matches": result.n_matches,
-            "n_inliers": result.n_inliers,
-            "message": result.message,
-        })
+        for run in sign_runs:
+            result = context.dift.match(
+                run["source_feature"],
+                crop_feature,
+                run["source_img"].shape[:2],
+                crop.shape[:2],
+                context.dift.config.match,
+                src_foreground_mask=run["foreground_mask"],
+            )
+            run["coarse_grid"][iy, ix] = result.coarse_score
+            run["affine_angle_grid"][iy, ix] = result.affine_angle_score
+            run["affine_iou_grid"][iy, ix] = result.affine_iou
+            run["inlier_score_grid"][iy, ix] = result.inlier_score
+            run["semantic_grid"][iy, ix] = result.semantic_score
+            run["global_similarity_grid"][iy, ix] = result.global_similarity_score
+            run["sim_withoutbg_grid"][iy, ix] = result.sim_withoutbg
+            run["certainty_grid"][iy, ix] = result.certainty_score
+            run["bending_energy_grid"][iy, ix] = result.bending_energy_score
+            run["jacobian_fold_grid"][iy, ix] = result.jacobian_fold_score
+            run["local_distortion_grid"][iy, ix] = result.local_distortion_score
+            run["scale_grid"][iy, ix] = result.scale_score
+            run["score_rows"].append({
+                "sign": run["sign_name"],
+                "ix": ix,
+                "iy": iy,
+                "center": (cx, cy),
+                "bounds": (x1, y1, x2, y2),
+                "score": result.score,
+                "semantic": result.semantic_score,
+                "global_similarity": result.global_similarity_score,
+                "sim_withoutbg": result.sim_withoutbg,
+                "affine_iou": result.affine_iou,
+                "affine_angle_score": result.affine_angle_score,
+                "geometry": result.geometry_score,
+                "support": result.support_score,
+                "coarse": result.coarse_score,
+                "inlier_score": result.inlier_score,
+                "certainty_score": result.certainty_score,
+                "bending_energy_score": result.bending_energy_score,
+                "jacobian_fold_score": result.jacobian_fold_score,
+                "local_distortion_score": result.local_distortion_score,
+                "scale_score": result.scale_score,
+                "n_matches": result.n_matches,
+                "n_inliers": result.n_inliers,
+                "message": result.message,
+            })
 
     cell_size = 80
     axis_top, axis_left = 50, 60
@@ -1178,34 +1221,79 @@ def vis_dift_score_on_whole_tablet(context: CropContext, vis: VisOptions) -> Non
         cv2.putText(legend, "0.0", (60, 25 + bar_h), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0))
         return np.hstack([heat_axes, legend])
 
-    score_vis = make_heatmap(score_grid)
-    semantic_vis = make_heatmap(semantic_grid)
-    global_similarity_vis = make_heatmap(global_similarity_grid)
-    sim_withoutbg_vis = make_heatmap(sim_withoutbg_grid)
+    def safe_sign_name(name: str) -> str:
+        safe = "".join(
+            ch if ch.isalnum() or ch in ".@+-" else "_"
+            for ch in name
+        ).strip("_")
+        return safe or "sign"
 
-    s.dift_sampling_scores = score_rows
-    s.dift_sampling_foreground_mask = foreground_mask
-    s.dift_sampling_foreground_mask_image = foreground_mask_vis
-    s.dift_sampling_score_image = score_vis
-    s.dift_sampling_semantic_image = semantic_vis
-    s.dift_sampling_global_similarity_image = global_similarity_vis
-    s.dift_sampling_sim_withoutbg_image = sim_withoutbg_vis
+    for sign_idx, run in enumerate(sign_runs):
+        sign_name = run["sign_name"]
+        score_vis = make_heatmap(run["coarse_grid"])
+        affine_angle_vis = make_heatmap(run["affine_angle_grid"])
+        affine_iou_vis = make_heatmap(run["affine_iou_grid"])
+        inlier_score_vis = make_heatmap(run["inlier_score_grid"])
+        semantic_vis = make_heatmap(run["semantic_grid"])
+        global_similarity_vis = make_heatmap(run["global_similarity_grid"])
+        sim_withoutbg_vis = make_heatmap(run["sim_withoutbg_grid"])
+        certainty_vis = make_heatmap(run["certainty_grid"])
+        bending_energy_vis = make_heatmap(run["bending_energy_grid"])
+        jacobian_fold_vis = make_heatmap(run["jacobian_fold_grid"])
+        local_distortion_vis = make_heatmap(run["local_distortion_grid"])
+        scale_vis = make_heatmap(run["scale_grid"])
 
-    if vis.display:
-        _display_bgr(score_vis, "DIFT coarse scores (geometry * support)")
-        _display_bgr(semantic_vis, "DIFT semantic scores")
-        _display_bgr(global_similarity_vis, "DIFT global similarity")
-        _display_bgr(sim_withoutbg_vis, "DIFT sim_withoutbg")
-    if vis.save:
-        cv2.imwrite(
-            _out(context, "dift_sampling_source_foreground_mask.jpg"),
-            foreground_mask_vis,
-            [cv2.IMWRITE_JPEG_QUALITY, 90],
-        )
-        cv2.imwrite(_out(context, "dift_sampling_coarse_scores.jpg"), score_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        cv2.imwrite(_out(context, "dift_sampling_semantic_scores.jpg"), semantic_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        cv2.imwrite(_out(context, "dift_sampling_global_similarity.jpg"), global_similarity_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        cv2.imwrite(_out(context, "dift_sampling_sim_withoutbg.jpg"), sim_withoutbg_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if sign_idx == 0:
+            s.dift_sampling_scores = run["score_rows"]
+            s.dift_sampling_foreground_mask = run["foreground_mask"]
+            s.dift_sampling_foreground_mask_image = run["foreground_mask_vis"]
+            s.dift_sampling_score_image = score_vis
+            s.dift_sampling_affine_angle_image = affine_angle_vis
+            s.dift_sampling_affine_iou_image = affine_iou_vis
+            s.dift_sampling_inlier_score_image = inlier_score_vis
+            s.dift_sampling_semantic_image = semantic_vis
+            s.dift_sampling_global_similarity_image = global_similarity_vis
+            s.dift_sampling_sim_withoutbg_image = sim_withoutbg_vis
+            s.dift_sampling_certainty_image = certainty_vis
+            s.dift_sampling_bending_energy_image = bending_energy_vis
+            s.dift_sampling_jacobian_fold_image = jacobian_fold_vis
+            s.dift_sampling_local_distortion_image = local_distortion_vis
+            s.dift_sampling_scale_image = scale_vis
+
+        if vis.display and sign_idx == 0:
+            _display_bgr(run["foreground_mask_vis"], f"DIFT source foreground mask ({sign_name})")
+            _display_bgr(point_vis, f"DIFT sampling points and boxes on crop tablet ({sign_name})")
+            _display_bgr(score_vis, f"DIFT coarse scores ({sign_name}, relaxed IoU + angle)")
+            _display_bgr(affine_angle_vis, f"DIFT affine rectangle-angle scores ({sign_name})")
+            _display_bgr(affine_iou_vis, f"DIFT raw affine IoU ({sign_name})")
+            _display_bgr(inlier_score_vis, f"DIFT inlier scores ({sign_name}, old coarse score)")
+            _display_bgr(semantic_vis, f"DIFT semantic scores ({sign_name})")
+            _display_bgr(global_similarity_vis, f"DIFT global similarity ({sign_name})")
+            _display_bgr(sim_withoutbg_vis, f"DIFT sim_withoutbg ({sign_name})")
+            _display_bgr(certainty_vis, f"DIFT dense certainty scores ({sign_name})")
+            _display_bgr(bending_energy_vis, f"DIFT bending energy scores ({sign_name})")
+            _display_bgr(jacobian_fold_vis, f"DIFT Jacobian non-fold scores ({sign_name})")
+            _display_bgr(local_distortion_vis, f"DIFT local distortion scores ({sign_name})")
+            _display_bgr(scale_vis, f"DIFT scale consistency scores ({sign_name})")
+        if vis.save:
+            sign_part = safe_sign_name(sign_name)
+            cv2.imwrite(
+                _out(context, f"dift_sampling_{sign_part}_source_foreground_mask.jpg"),
+                run["foreground_mask_vis"],
+                [cv2.IMWRITE_JPEG_QUALITY, 90],
+            )
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_coarse_scores.jpg"), score_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_affine_angle_scores.jpg"), affine_angle_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_affine_iou.jpg"), affine_iou_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_inlier_scores.jpg"), inlier_score_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_semantic_scores.jpg"), semantic_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_global_similarity.jpg"), global_similarity_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_sim_withoutbg.jpg"), sim_withoutbg_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_certainty_scores.jpg"), certainty_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_bending_energy_scores.jpg"), bending_energy_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_jacobian_fold_scores.jpg"), jacobian_fold_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_local_distortion_scores.jpg"), local_distortion_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_scale_scores.jpg"), scale_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
 
 def vis_manual_dift_crop_match(
@@ -1291,7 +1379,8 @@ def vis_manual_dift_crop_match(
     if vis.info:
         print("=== Manual DIFT Crop Match ===")
         print(
-            "score = semantic * sqrt(geometry * support); "
+            "score = semantic * sqrt(coarse), coarse = "
+            "sqrt(min(1, affine IoU / 0.7) * angle) * support; "
             "this is an uncalibrated diagnostic score, not a probability."
         )
         print(
@@ -1343,13 +1432,26 @@ def vis_manual_dift_crop_match(
                 )
                 print(
                     f"score={result.score:.4f}  "
+                    f"coarse={result.coarse_score:.4f}  "
+                    f"inlier_score={result.inlier_score:.4f}  "
                     f"semantic={result.semantic_score:.4f}  "
                     f"geometry={result.geometry_score:.4f}  "
                     f"support={result.support_score:.4f}"
                 )
                 print(
+                    f"affine_iou={result.affine_iou:.4f}  "
+                    f"affine_angle_score={result.affine_angle_score:.4f}"
+                )
+                print(
                     f"global_similarity={result.global_similarity_score:.4f}  "
                     f"sim_withoutbg={result.sim_withoutbg:.4f}"
+                )
+                print(
+                    f"certainty={result.certainty_score:.4f}  "
+                    f"bending={result.bending_energy_score:.4f}  "
+                    f"non_fold={result.jacobian_fold_score:.4f}  "
+                    f"distortion={result.local_distortion_score:.4f}  "
+                    f"scale={result.scale_score:.4f}"
                 )
                 print(
                     f"mutual matches={result.n_matches}, "
@@ -1392,7 +1494,7 @@ def _manual_dift_match_defaults(
             box for box in state.det_boxes if box.sign_name in available
         ]
         if candidates:
-            box = candidates[0]
+            box = candidates[10]
             return box.copy(), box.sign_name
 
     x1 = img_w // 4
@@ -1473,7 +1575,17 @@ def _manual_dift_match_figure(
     fig.suptitle(
         (
             f"Manual DIFT match score: {result.score:.3f}  "
-            f"sim_withoutbg: {result.sim_withoutbg:.3f}"
+            f"coarse: {result.coarse_score:.3f}  "
+            f"inlier: {result.inlier_score:.3f}  "
+            f"sim_withoutbg: {result.sim_withoutbg:.3f}\n"
+            f"geometry: {result.geometry_score:.3f}  "
+            f"affine IoU: {result.affine_iou:.3f}  "
+            f"affine angle score: {result.affine_angle_score:.3f}\n"
+            f"certainty: {result.certainty_score:.3f}  "
+            f"bending: {result.bending_energy_score:.3f}  "
+            f"non-fold: {result.jacobian_fold_score:.3f}  "
+            f"distortion: {result.local_distortion_score:.3f}  "
+            f"scale: {result.scale_score:.3f}"
         ),
         fontsize=15,
     )

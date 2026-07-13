@@ -142,8 +142,16 @@ class DiftMatchResult:
     semantic_score: float
     global_similarity_score: float
     sim_withoutbg: float
+    affine_iou: float
+    affine_angle_score: float
     geometry_score: float
     support_score: float
+    inlier_score: float
+    certainty_score: float
+    bending_energy_score: float
+    jacobian_fold_score: float
+    local_distortion_score: float
+    scale_score: float
     score: float
     coarse_score: float
     message: str = ""
@@ -223,6 +231,18 @@ class DiftRuntime:
         src_flat = src.reshape(c, -1)
         dst_flat = dst.reshape(c, -1)
         sim = src_flat.T @ dst_flat
+        (
+            certainty_score,
+            bending_energy_score,
+            jacobian_fold_score,
+            local_distortion_score,
+            scale_score,
+        ) = _dense_deformation_scores(
+            sim,
+            src.shape[-2:],
+            dst.shape[-2:],
+            src_foreground_mask,
+        )
         global_similarity = 0.5 * (
             sim.max(dim=1).values.mean() + sim.max(dim=0).values.mean()
         )
@@ -282,8 +302,16 @@ class DiftRuntime:
             semantic = float(np.clip(mean_similarity, 0.0, 1.0))
             global_score = float(np.clip(global_similarity_score, 0.0, 1.0))
             no_bg_score = float(np.clip(sim_withoutbg_score, 0.0, 1.0))
-            geometry = float(n_inliers / n_matches) if n_matches else 0.0
+            inlier_ratio = float(n_inliers / n_matches) if n_matches else 0.0
             support = float(min(1.0, n_inliers / max(1, config.min_support)))
+            inlier_score = float(inlier_ratio * support)
+            affine_iou = _affine_crop_iou(src_img_shape, dst_img_shape, affine)
+            affine_angle_score = _affine_rectangle_angle_score(
+                src_img_shape,
+                affine,
+            )
+            relaxed_iou = min(1.0, affine_iou / 0.7)
+            geometry = float(np.sqrt(relaxed_iou * affine_angle_score))
             coarse = float(geometry * support)
             score = float(semantic * np.sqrt(coarse))
             return DiftMatchResult(
@@ -298,8 +326,16 @@ class DiftRuntime:
                 semantic_score=semantic,
                 global_similarity_score=global_score,
                 sim_withoutbg=no_bg_score,
+                affine_iou=affine_iou,
+                affine_angle_score=affine_angle_score,
                 geometry_score=geometry,
                 support_score=support,
+                inlier_score=inlier_score,
+                certainty_score=certainty_score,
+                bending_energy_score=bending_energy_score,
+                jacobian_fold_score=jacobian_fold_score,
+                local_distortion_score=local_distortion_score,
+                scale_score=scale_score,
                 score=score,
                 coarse_score=coarse,
                 message=message,
@@ -677,7 +713,7 @@ def render_dift_feature_matches(
     max_lines: int = 80,
 ) -> np.ndarray:
     """Render source-to-crop mutual matches, highlighting RANSAC inliers."""
-    header_h = 92
+    header_h = 140
     gap = 24
     margin = 12
     canvas_w = margin * 2 + thumb * 2 + gap
@@ -698,12 +734,33 @@ def render_dift_feature_matches(
     _draw_text(
         canvas,
         (
-            f"score={result.score:.3f}  semantic={result.semantic_score:.3f}  "
-            f"geometry={result.geometry_score:.3f}  support={result.support_score:.3f}"
+            f"score={result.score:.3f}  coarse={result.coarse_score:.3f}  "
+            f"inlier_score={result.inlier_score:.3f}"
         ),
         24,
         x=margin,
-        scale=0.5,
+        scale=0.48,
+    )
+    _draw_text(
+        canvas,
+        (
+            f"semantic={result.semantic_score:.3f}  "
+            f"geometry={result.geometry_score:.3f}  "
+            f"support={result.support_score:.3f}"
+        ),
+        48,
+        x=margin,
+        scale=0.45,
+    )
+    _draw_text(
+        canvas,
+        (
+            f"affine_iou={result.affine_iou:.3f}  "
+            f"affine_angle_score={result.affine_angle_score:.3f}"
+        ),
+        72,
+        x=margin,
+        scale=0.45,
     )
     _draw_text(
         canvas,
@@ -711,7 +768,7 @@ def render_dift_feature_matches(
             f"global={result.global_similarity_score:.3f}  "
             f"sim_withoutbg={result.sim_withoutbg:.3f}"
         ),
-        48,
+        96,
         x=margin,
         scale=0.45,
     )
@@ -721,7 +778,7 @@ def render_dift_feature_matches(
             f"green=inlier, red=outlier  "
             f"inliers={result.n_inliers}/{result.n_matches}"
         ),
-        72,
+        120,
         x=margin,
         scale=0.45,
     )
@@ -800,6 +857,134 @@ def _foreground_only_global_similarity(
     return 0.5 * (
         foreground_sim.max(dim=1).values.mean()
         + foreground_sim.max(dim=0).values.mean()
+    )
+
+
+def _dense_deformation_scores(
+    sim: torch.Tensor,
+    src_grid_shape: Tuple[int, int],
+    dst_grid_shape: Tuple[int, int],
+    src_foreground_mask: Optional[np.ndarray],
+) -> Tuple[float, float, float, float, float]:
+    src_h, src_w = map(int, src_grid_shape)
+    dst_h, dst_w = map(int, dst_grid_shape)
+    temperature = 0.03
+
+    foreground = torch.ones(
+        (src_h, src_w),
+        dtype=torch.bool,
+        device=sim.device,
+    )
+    if src_foreground_mask is not None:
+        candidate = torch.as_tensor(
+            np.asarray(src_foreground_mask, dtype=bool),
+            dtype=torch.bool,
+            device=sim.device,
+        )
+        if candidate.shape == foreground.shape and bool(candidate.any()):
+            foreground = candidate
+
+    logits = sim / temperature
+    probability = logits.softmax(dim=1)
+    source_logits = logits.masked_fill(~foreground.reshape(-1, 1), -torch.inf)
+    probability.mul_(source_logits.softmax(dim=0))
+    del source_logits
+    del logits
+    probability.div_(probability.sum(dim=1, keepdim=True).clamp_min(1e-12))
+
+    if probability.shape[1] > 1:
+        entropy = -(probability * probability.clamp_min(1e-12).log()).sum(dim=1)
+        certainty = 1.0 - entropy / float(np.log(probability.shape[1]))
+    else:
+        certainty = torch.ones(probability.shape[0], device=sim.device)
+    certainty = certainty.clamp(0.0, 1.0).reshape(src_h, src_w)
+
+    certainty_score = float(certainty[foreground].mean().detach().cpu())
+
+    dst_y, dst_x = torch.meshgrid(
+        (torch.arange(dst_h, device=sim.device, dtype=sim.dtype) + 0.5) / dst_h,
+        (torch.arange(dst_w, device=sim.device, dtype=sim.dtype) + 0.5) / dst_w,
+        indexing="ij",
+    )
+    target_xy = torch.stack([dst_x.reshape(-1), dst_y.reshape(-1)], dim=1)
+    field = (probability @ target_xy).reshape(src_h, src_w, 2)
+    field_grid = field * field.new_tensor([src_w, src_h])
+
+    bending_sum = field.new_tensor(0.0)
+    bending_weight = 0.0
+    if src_w >= 3:
+        dxx = field_grid[:, 2:] - 2.0 * field_grid[:, 1:-1] + field_grid[:, :-2]
+        mask_x = foreground[:, 2:] & foreground[:, 1:-1] & foreground[:, :-2]
+        if bool(mask_x.any()):
+            bending_sum += dxx.square().sum(dim=-1)[mask_x].mean()
+            bending_weight += 1.0
+    if src_h >= 3:
+        dyy = field_grid[2:] - 2.0 * field_grid[1:-1] + field_grid[:-2]
+        mask_y = foreground[2:] & foreground[1:-1] & foreground[:-2]
+        if bool(mask_y.any()):
+            bending_sum += dyy.square().sum(dim=-1)[mask_y].mean()
+            bending_weight += 1.0
+    if src_h >= 2 and src_w >= 2:
+        dxy = (
+            field_grid[1:, 1:]
+            - field_grid[1:, :-1]
+            - field_grid[:-1, 1:]
+            + field_grid[:-1, :-1]
+        )
+        cell_mask = (
+            foreground[:-1, :-1]
+            & foreground[:-1, 1:]
+            & foreground[1:, :-1]
+            & foreground[1:, 1:]
+        )
+        if bool(cell_mask.any()):
+            bending_sum += 2.0 * dxy.square().sum(dim=-1)[cell_mask].mean()
+            bending_weight += 2.0
+    bending_energy_score = (
+        float((1.0 / (1.0 + bending_sum / bending_weight)).detach().cpu())
+        if bending_weight
+        else 0.0
+    )
+
+    jacobian_fold_score = 0.0
+    local_distortion_score = 0.0
+    scale_score = 0.0
+    if src_h >= 2 and src_w >= 2 and bool(cell_mask.any()):
+        dtarget_dx = (field[:-1, 1:] - field[:-1, :-1]) * src_w
+        dtarget_dy = (field[1:, :-1] - field[:-1, :-1]) * src_h
+        determinant = (
+            dtarget_dx[..., 0] * dtarget_dy[..., 1]
+            - dtarget_dx[..., 1] * dtarget_dy[..., 0]
+        )
+        fold_rate = (determinant[cell_mask] <= 0.0).float().mean()
+        jacobian_fold_score = float((1.0 - fold_rate).detach().cpu())
+
+        jacobian = torch.stack([dtarget_dx, dtarget_dy], dim=-1)
+        singular_values = torch.linalg.svdvals(jacobian[cell_mask])
+        largest = singular_values[:, 0]
+        smallest = singular_values[:, 1]
+        distortion = (
+            2.0 * largest * smallest
+            / (largest.square() + smallest.square() + 1e-12)
+        )
+        local_distortion_score = float(
+            distortion.clamp(0.0, 1.0).mean().detach().cpu()
+        )
+
+        local_scale = determinant[cell_mask].abs().sqrt()
+        scale_consistency = torch.exp(
+            -torch.abs(torch.log(local_scale.clamp_min(1e-12)))
+        )
+        scale_score = float(
+            scale_consistency.clamp(0.0, 1.0).mean().detach().cpu()
+        )
+
+    return (
+        certainty_score,
+        bending_energy_score,
+        jacobian_fold_score,
+        local_distortion_score,
+        scale_score,
     )
 
 
@@ -960,6 +1145,78 @@ def _transformed_image_corners(
     h, w = img_shape[:2]
     corners = np.array([[[0, 0], [w, 0], [w, h], [0, h]]], dtype=np.float32)
     return cv2.transform(corners, affine)[0]
+
+
+def _affine_crop_iou(
+    src_img_shape: Tuple[int, int],
+    dst_img_shape: Tuple[int, int],
+    affine: Optional[np.ndarray],
+) -> float:
+    """IoU between the affine-warped source image extent and the target crop."""
+    if affine is None:
+        return 0.0
+
+    dst_h, dst_w = dst_img_shape[:2]
+    if dst_h <= 0 or dst_w <= 0:
+        return 0.0
+
+    warped = _transformed_image_corners(src_img_shape, affine)
+    if not np.all(np.isfinite(warped)):
+        return 0.0
+
+    target = np.array(
+        [[0, 0], [dst_w, 0], [dst_w, dst_h], [0, dst_h]],
+        dtype=np.float32,
+    )
+    warped_poly = cv2.convexHull(warped.astype(np.float32))
+    target_poly = target.reshape(-1, 1, 2)
+    warped_area = float(cv2.contourArea(warped_poly))
+    target_area = float(dst_w * dst_h)
+    if warped_area <= 0.0 or target_area <= 0.0:
+        return 0.0
+
+    try:
+        intersection_area, _ = cv2.intersectConvexConvex(
+            warped_poly,
+            target_poly,
+        )
+    except cv2.error:
+        return 0.0
+
+    intersection_area = max(0.0, float(intersection_area))
+    union_area = warped_area + target_area - intersection_area
+    if union_area <= 0.0:
+        return 0.0
+    return float(np.clip(intersection_area / union_area, 0.0, 1.0))
+
+
+def _affine_rectangle_angle_score(
+    src_img_shape: Tuple[int, int],
+    affine: Optional[np.ndarray],
+) -> float:
+    """Score how closely the affine-warped source extent remains rectangular."""
+    if affine is None:
+        return 0.0
+
+    corners = _transformed_image_corners(src_img_shape, affine)
+    if not np.all(np.isfinite(corners)):
+        return 0.0
+
+    angles = []
+    for index in range(4):
+        center = corners[index]
+        before = corners[(index - 1) % 4] - center
+        after = corners[(index + 1) % 4] - center
+        denominator = float(np.linalg.norm(before) * np.linalg.norm(after))
+        if denominator <= 1e-12:
+            return 0.0
+        cosine = float(np.clip(np.dot(before, after) / denominator, -1.0, 1.0))
+        angles.append(float(np.degrees(np.arccos(cosine))))
+
+    adjacent_difference = np.abs(
+        np.asarray(angles) - np.roll(np.asarray(angles), -1)
+    ).mean()
+    return float(np.clip(1.0 - adjacent_difference / 180.0, 0.0, 1.0))
 
 
 def _transformed_image_center(

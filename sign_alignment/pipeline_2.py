@@ -80,6 +80,7 @@ class FeatureSignAssignment:
     score: float = 0.0
     geometry: float = 0.0
     support: float = 0.0
+    inlier_score: float = 0.0
     n_matches: int = 0
     n_inliers: int = 0
     candidate_idx: Optional[int] = None
@@ -102,6 +103,7 @@ class FeatureScoreGrid:
     score: np.ndarray
     geometry: np.ndarray
     support: np.ndarray
+    inlier_score: np.ndarray
     matches: np.ndarray
     inliers: np.ndarray
 
@@ -112,6 +114,7 @@ class FeatureScoreGrid:
             score=np.zeros(shape, dtype=np.float32),
             geometry=np.zeros(shape, dtype=np.float32),
             support=np.zeros(shape, dtype=np.float32),
+            inlier_score=np.zeros(shape, dtype=np.float32),
             matches=np.zeros(shape, dtype=np.int32),
             inliers=np.zeros(shape, dtype=np.int32),
         )
@@ -342,6 +345,7 @@ class _FeatureCoarseAligner:
                     score=score,
                     geometry=float(scores.geometry[matrix_row, candidate_idx]),
                     support=float(scores.support[matrix_row, candidate_idx]),
+                    inlier_score=float(scores.inlier_score[matrix_row, candidate_idx]),
                     n_matches=int(scores.matches[matrix_row, candidate_idx]),
                     n_inliers=int(scores.inliers[matrix_row, candidate_idx]),
                     candidate_idx=candidate_idx,
@@ -449,6 +453,7 @@ class _FeatureCoarseAligner:
                 scores.score[matrix_row, candidate_idx] = result.coarse_score
                 scores.geometry[matrix_row, candidate_idx] = result.geometry_score
                 scores.support[matrix_row, candidate_idx] = result.support_score
+                scores.inlier_score[matrix_row, candidate_idx] = result.inlier_score
                 scores.matches[matrix_row, candidate_idx] = result.n_matches
                 scores.inliers[matrix_row, candidate_idx] = result.n_inliers
 
@@ -764,7 +769,7 @@ def vis_feature_coarse_alignment(
         config = context.feature_coarse_alignment
         print("=== Experimental Feature Coarse Alignment ===")
         print(
-            f"score = geometry * support; step="
+            f"score = sqrt(relaxed IoU * angle) * support; step="
             f"{config.step_px:.0f}px; "
             f"window={run.window_size[0]}x{run.window_size[1]}"
         )
@@ -821,6 +826,7 @@ def vis_feature_coarse_alignment(
                     f"score={item.score:.3f} "
                     f"(geometry={item.geometry:.3f}, "
                     f"support={item.support:.3f}, "
+                    f"inlier_score={item.inlier_score:.3f}, "
                     f"inliers={item.n_inliers}/{item.n_matches})"
                 )
         timing_summary = run.timing
@@ -965,7 +971,7 @@ def _plot_score_matrices(
         axis.set_ylabel("unmatched text sign")
         axis.set_title(
             f"Text row {result.text_row_idx} -> "
-            f"Det row {result.det_row_idx}: geometry * support"
+            f"Det row {result.det_row_idx}: relaxed IoU + angle geometry"
         )
         fig.colorbar(heat, ax=axis, fraction=0.025, pad=0.02)
 
