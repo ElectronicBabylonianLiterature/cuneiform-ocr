@@ -125,6 +125,162 @@ class BoxRows:
     def counts(self) -> list[int]:
         return [len(row) for row in self.rows]
 
+    @classmethod
+    def detect_using_hough(
+        cls,
+        boxes: Boxes,
+        angle_range_deg: float = 15.0,
+        angle_step_deg: float = 1.0,
+        rho_step_factor: float = 0.04,
+        rho_sigma_factor: float = 0.10,
+        min_line_distance_factor: float = 0.30,
+        assignment_distance_factor: float = 0.24,
+        min_peak_votes: float = 1.25,
+        min_row_size: int = 2,
+    ) -> "BoxRows":
+        """Group boxes around parallel row baselines using a Hough-style vote.
+
+        Every detection center has equal weight. First, a global row angle is
+        selected by finding the angle that makes the projected center points
+        concentrate most strongly. Peaks in the normal-coordinate projection
+        then define parallel row baselines. Boxes are assigned to their nearest
+        baseline and ordered along the detected row direction.
+        """
+        if not boxes:
+            return cls(boxes=boxes, rows=[])
+
+        centers = np.asarray(
+            [[box.cx, box.cy] for box in boxes],
+            dtype=np.float64,
+        )
+        scale = float(np.median([box.height for box in boxes]))
+        rho_step = scale * rho_step_factor
+        rho_sigma = scale * rho_sigma_factor
+
+        angles_deg = np.arange(
+            -angle_range_deg,
+            angle_range_deg + angle_step_deg / 2,
+            angle_step_deg,
+        )
+        angle_scores = []
+        projected_by_angle = []
+        for angle_deg in angles_deg:
+            angle = np.deg2rad(angle_deg)
+            rhos = (
+                -centers[:, 0] * np.sin(angle)
+                + centers[:, 1] * np.cos(angle)
+            )
+            projected_by_angle.append(rhos)
+
+            pairwise_delta = (rhos[:, None] - rhos[None, :]) / rho_sigma
+            pairwise_votes = np.exp(-0.5 * pairwise_delta ** 2)
+            angle_scores.append(float((pairwise_votes.sum() - len(boxes)) / 2))
+
+        best_angle_idx = int(np.argmax(angle_scores))
+        best_angle_deg = float(angles_deg[best_angle_idx])
+        best_angle = np.deg2rad(best_angle_deg)
+        projected_rhos = projected_by_angle[best_angle_idx]
+
+        rho_grid = np.arange(
+            projected_rhos.min() - 2 * rho_sigma,
+            projected_rhos.max() + 2 * rho_sigma + rho_step,
+            rho_step,
+        )
+        normalized_delta = (
+            rho_grid[:, None] - projected_rhos[None, :]
+        ) / rho_sigma
+        accumulator = np.exp(-0.5 * normalized_delta ** 2).sum(axis=1)
+
+        all_projected_rhos = np.concatenate(projected_by_angle)
+        parameter_rho_grid = np.arange(
+            all_projected_rhos.min() - 2 * rho_sigma,
+            all_projected_rhos.max() + 2 * rho_sigma + rho_step,
+            rho_step,
+        )
+        parameter_space = []
+        for rhos in projected_by_angle:
+            normalized_delta = (
+                parameter_rho_grid[:, None] - rhos[None, :]
+            ) / rho_sigma
+            parameter_space.append(
+                np.exp(-0.5 * normalized_delta ** 2).sum(axis=1)
+            )
+        parameter_space = np.asarray(parameter_space).T
+
+        peak_indices = np.flatnonzero(
+            (accumulator[1:-1] >= accumulator[:-2])
+            & (accumulator[1:-1] > accumulator[2:])
+            & (accumulator[1:-1] >= min_peak_votes)
+        ) + 1
+        peak_indices = sorted(
+            peak_indices,
+            key=lambda idx: accumulator[idx],
+            reverse=True,
+        )
+
+        min_line_distance = scale * min_line_distance_factor
+        selected_rhos = []
+        for peak_idx in peak_indices:
+            rho = float(rho_grid[peak_idx])
+            if all(
+                abs(rho - selected) >= min_line_distance
+                for selected in selected_rhos
+            ):
+                selected_rhos.append(rho)
+        selected_rhos = np.asarray(sorted(selected_rhos), dtype=np.float64)
+
+        assignment_distance = scale * assignment_distance_factor
+        distances = np.abs(projected_rhos[:, None] - selected_rhos[None, :])
+        assignments = np.argmin(distances, axis=1)
+        assignments[distances.min(axis=1) > assignment_distance] = -1
+
+        for line_idx in range(len(selected_rhos)):
+            members = projected_rhos[assignments == line_idx]
+            if len(members):
+                selected_rhos[line_idx] = float(np.median(members))
+
+        distances = np.abs(projected_rhos[:, None] - selected_rhos[None, :])
+        assignments = np.argmin(distances, axis=1)
+        assignments[distances.min(axis=1) > assignment_distance] = -1
+
+        along_row = (
+            centers[:, 0] * np.cos(best_angle)
+            + centers[:, 1] * np.sin(best_angle)
+        )
+        detected_rows = []
+        assigned_indices = set()
+        for line_idx, rho in enumerate(selected_rhos):
+            indices = np.flatnonzero(assignments == line_idx).tolist()
+            if len(indices) < min_row_size:
+                continue
+            indices.sort(key=lambda idx: along_row[idx])
+            assigned_indices.update(indices)
+            detected_rows.append((
+                float(np.mean(centers[indices, 1])),
+                float(rho),
+                indices,
+            ))
+
+        detected_rows.sort(key=lambda item: item[0])
+        rows = [indices for _, _, indices in detected_rows]
+        rhos = [rho for _, rho, _ in detected_rows]
+        noise = sorted(
+            set(range(len(boxes))) - assigned_indices,
+            key=lambda idx: boxes[idx].cx,
+        )
+        result = cls(
+            boxes=boxes,
+            rows=rows,
+            noise=noise,
+        )
+        result.hough_angle_deg = best_angle_deg
+        result.hough_rhos = rhos
+        result.hough_angles_deg = angles_deg
+        result.hough_rho_grid = parameter_rho_grid
+        result.hough_parameter_space = parameter_space
+        result.hough_angle_scores = np.asarray(angle_scores)
+        return result
+
 
 @dataclass
 class SampleState:
@@ -153,6 +309,9 @@ class SampleState:
     # Box collections in the selected crop coordinate frame
     text_boxes: Optional[Boxes] = None
     aligned_boxes: Optional[Boxes] = None
+    result_without_optimization_boxes: Optional[Boxes] = None
+    result_without_optimization_relabelled: int = 0
+    result_without_optimization_changed: int = 0
     final_boxes: Optional[Boxes] = None
 
     # row matching
@@ -394,14 +553,15 @@ def vis_box_sets(context: CropContext, vis: VisOptions) -> None:
 
 def detect_rows(context: CropContext) -> None:
     s = context.state
-    s.det_rows = BoxRows.detect(
-        s.det_boxes,
-        eps=0.4,
-        min_samples=1,
-        lambda_weight=0.007,
-        avg_width=s.detections.avg_width,
-        avg_height=s.detections.avg_height,
-    )
+    # s.det_rows = BoxRows.detect(
+    #     s.det_boxes,
+    #     eps=0.4,
+    #     min_samples=1,
+    #     lambda_weight=0.007,
+    #     avg_width=s.detections.avg_width,
+    #     avg_height=s.detections.avg_height,
+    # )
+    s.det_rows = BoxRows.detect_using_hough(s.det_boxes)
 
 
 def vis_detected_rows_info(context: CropContext, vis: VisOptions) -> None:
@@ -413,6 +573,11 @@ def vis_detected_rows_info(context: CropContext, vis: VisOptions) -> None:
         f"Average sign size: {s.detections.avg_size:.2f} px, "
         f"detected {len(s.det_rows)} rows, {len(s.det_boxes)} signs"
     )
+    if getattr(s.det_rows, "hough_angle_deg", None) is not None:
+        print(
+            f"  Hough angle: {s.det_rows.hough_angle_deg:.1f} deg, "
+            f"baselines: {len(s.det_rows.hough_rhos)}"
+        )
     for row_idx, count in enumerate(s.det_rows.counts()):
         print(f"  Row {row_idx}: {count} boxes")
     if s.det_rows.noise:
@@ -466,6 +631,57 @@ def vis_row_matches(context: CropContext, vis: VisOptions) -> None:
     print(f"Det->Text: {s.det_to_text}")
 
 
+def _render_hough_parameter_space(rows: BoxRows) -> np.ndarray:
+    """Render the equal-weight Hough accumulator and selected row peaks."""
+    import matplotlib.pyplot as plt
+
+    angles = rows.hough_angles_deg
+    rho_grid = rows.hough_rho_grid
+    parameter_space = rows.hough_parameter_space
+    angle_step = float(angles[1] - angles[0])
+    rho_step = float(rho_grid[1] - rho_grid[0])
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    image = ax.imshow(
+        parameter_space,
+        cmap="magma",
+        aspect="auto",
+        interpolation="nearest",
+        extent=(
+            angles[0] - angle_step / 2,
+            angles[-1] + angle_step / 2,
+            rho_grid[-1] + rho_step / 2,
+            rho_grid[0] - rho_step / 2,
+        ),
+    )
+    ax.axvline(
+        rows.hough_angle_deg,
+        color="cyan",
+        linewidth=1.5,
+        label=f"selected angle: {rows.hough_angle_deg:.1f} deg",
+    )
+    ax.scatter(
+        np.full(len(rows.hough_rhos), rows.hough_angle_deg),
+        rows.hough_rhos,
+        color="lime",
+        marker="x",
+        s=45,
+        linewidths=1.5,
+        label="selected row baselines",
+    )
+    ax.set_xlabel("row angle theta (degrees)")
+    ax.set_ylabel("normal coordinate rho (pixels)")
+    ax.set_title("Hough parameter space from detection-box centers")
+    ax.legend(loc="upper right")
+    fig.colorbar(image, ax=ax, label="equal-weight Gaussian votes")
+    fig.tight_layout()
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    result = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+    plt.close(fig)
+    return result
+
+
 def vis_detection_rows(context: CropContext, vis: VisOptions) -> None:
     s = context.state
     row_vis = BboxVisualizer(color=(255, 0, 0))
@@ -481,12 +697,21 @@ def vis_detection_rows(context: CropContext, vis: VisOptions) -> None:
         marker_size=5,
     )
     s.det_row_vis_image = row_vis.result
+    s.hough_parameter_space_image = _render_hough_parameter_space(s.det_rows)
     if vis.info:
         print("Detection rows: D# on left margin, matched rows show D#->R#")
     if vis.display:
         row_vis.display_result(vis_opt="draw")
+        _display_bgr(
+            s.hough_parameter_space_image,
+            "Hough parameter space",
+        )
     if vis.save:
         row_vis.save(_out(context, "detection_rows.jpg"))
+        hough_path = _out(context, "hough_parameter_space.jpg")
+        cv2.imwrite(hough_path, s.hough_parameter_space_image)
+        if vis.info:
+            print(f"✓ Saved to: {os.path.abspath(hough_path)}")
 
 
 def match_signs_in_rows(context: CropContext) -> None:
@@ -572,6 +797,87 @@ def vis_aligned_rows(context: CropContext, vis: VisOptions) -> None:
     for row_idx, count in enumerate(s.aligned_rows.counts()):
         if count:
             print(f"  Row {row_idx}: {count} signs")
+
+
+def create_result_without_optimization(context: CropContext) -> None:
+    """Relabel copied detection boxes using the aligned text correspondences."""
+    s = context.state
+    result_boxes = s.det_boxes.copy()
+    relabelled = 0
+    changed = 0
+
+    for text_row_idx, matches in s.row_sign_matches.items():
+        if text_row_idx not in s.text_to_det:
+            continue
+        det_row_idx = s.text_to_det[text_row_idx]
+        aligned_row = s.aligned_rows.row_boxes(text_row_idx)
+        det_row_indices = s.det_rows.rows[det_row_idx]
+
+        for text_idx, det_idx in matches:
+            result_box = result_boxes[det_row_indices[det_idx]]
+            aligned_box = aligned_row[text_idx]
+            relabelled += 1
+            if result_box.sign_name != aligned_box.sign_name:
+                changed += 1
+            result_box.sign = aligned_box.sign
+
+    s.result_without_optimization_boxes = result_boxes
+    s.result_without_optimization_relabelled = relabelled
+    s.result_without_optimization_changed = changed
+
+
+def vis_result_without_optimization(
+    context: CropContext,
+    vis: VisOptions,
+) -> None:
+    s = context.state
+    image = s.crop_tablet.img
+    result_boxes = s.result_without_optimization_boxes
+
+    detection_vis = BboxVisualizer(color=(255, 0, 0))
+    detection_vis.draw_boxes(image.copy(), s.det_boxes)
+    result_vis = BboxVisualizer(color=(255, 255, 0))
+    result_vis.draw_boxes(image.copy(), result_boxes)
+
+    gt_base = BboxVisualizer(color=(0, 255, 0))
+    gt_base.draw_boxes(image.copy(), s.gt_boxes_crop or [])
+    gt_overlay = BboxVisualizer(color=(255, 255, 0))
+    gt_overlay.draw_boxes(gt_base.result, result_boxes)
+
+    comparison = CompositeVisualizer()
+    comparison.compose(
+        images=[
+            detection_vis.result,
+            result_vis.result,
+            gt_overlay.result,
+        ],
+        layout=(1, 3),
+        titles=[
+            "Detection",
+            "Result",
+            "Result + GT overlay",
+        ],
+        figsize=(24, 8),
+    )
+
+    if vis.info:
+        print("=== Result Without Optimization ===")
+        print(
+            f"  Relabelled matched boxes: "
+            f"{s.result_without_optimization_relabelled}"
+        )
+        print(
+            f"  Labels actually changed: "
+            f"{s.result_without_optimization_changed}"
+        )
+        print("  Box positions and sizes are copied from detections unchanged.")
+        print("  Red=Detection  Yellow=Relabelled result  Green=GT")
+    if vis.display:
+        comparison.display_result(vis_opt="draw")
+    if vis.save:
+        comparison.save(
+            _out(context, "results_without_optimization_comparison.jpg")
+        )
 
 
 def build_sign_match_info(context: CropContext) -> None:
@@ -726,7 +1032,7 @@ def vis_psr_optimizer(context: CropContext, vis: VisOptions) -> None:
 
 
 def _optimization_target(context: CropContext, stop_at_probe: bool) -> int:
-    total = int((context.psr_params or {}).get("num_iterations", 80))
+    total = int((context.psr_params or {}).get("num_iterations", 200))
     if not stop_at_probe:
         return total
     probe = context.dift.config.affine_probe_iteration

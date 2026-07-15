@@ -1,6 +1,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import hashlib
 from typing import List, Optional
 
 from mmdet.apis import init_detector, inference_detector
@@ -26,18 +27,19 @@ class BaseDetector(ABC):
     def __init__(
         self,
         model_config: Optional[ModelConfig] = None,
-        score_threshold: float = 0.5,
+        default_score_threshold: float = 0.5,
         is_load_now: bool = True,
         model=None,
     ):
-        self.score_threshold = score_threshold
+        self.default_score_threshold = default_score_threshold
         self.model_config = model_config
         self.model = model
+        self.result = {}
         if self.model is None and is_load_now:
             self.load_model()
     
     @abstractmethod
-    def detect(self, tablet: Tablet) -> Boxes:
+    def detect(self, tablet: Tablet, score_threshold: Optional[float] = None) -> Boxes:
         pass
     
     def _select_device(self, device: str):
@@ -61,11 +63,27 @@ class BaseDetector(ABC):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _filter_detections(self, labels, bboxes, scores, tablet: Tablet) -> Boxes:
-        mask = scores > self.score_threshold
+    def _filter_detections(self, labels, bboxes, scores, tablet: Tablet, score_threshold: float, deduplicate: bool = True) -> Boxes:
+        mask = scores > score_threshold
         labels = labels[mask]
         bboxes = bboxes[mask]
         scores = scores[mask]
+
+        if deduplicate:
+            score_order = np.argsort(-scores, kind="stable")
+            kept_indices = []
+            for idx in score_order:
+                is_duplicate = any(
+                    np.all(np.abs(bboxes[idx] - bboxes[kept_idx]) <= 2.0)
+                    for kept_idx in kept_indices
+                )
+                if not is_duplicate:
+                    kept_indices.append(int(idx))
+
+            kept_indices.sort()
+            labels = labels[kept_indices]
+            bboxes = bboxes[kept_indices]
+            scores = scores[kept_indices]
         
         detections = Boxes(tablet=tablet)
         for i in range(len(labels)):
@@ -84,28 +102,33 @@ class BaseDetector(ABC):
         return detections
 
 class SingleImageDetector(BaseDetector):
-    def detect(self, tablet: Tablet) -> Boxes:
-        result = inference_detector(self.model, tablet.img)
-        OCR_result = result.pred_instances.cpu()
+    def detect(self, tablet: Tablet, score_threshold: Optional[float] = None) -> Boxes:
+        if score_threshold is None:
+            score_threshold = self.default_score_threshold
+        img_hash = hashlib.sha256(tablet.img.tobytes()).digest()
+        img_key = (tablet.img.shape, tablet.img.dtype.str, img_hash)
+        if img_key not in self.result:
+            self.result[img_key] = inference_detector(self.model, tablet.img)
+        OCR_result = self.result[img_key].pred_instances.cpu()
         
         labels = OCR_result['labels'].numpy()
         bboxes = OCR_result['bboxes'].numpy()
         scores = OCR_result['scores'].numpy()
         
-        return self._filter_detections(labels, bboxes, scores, tablet)
+        return self._filter_detections(labels, bboxes, scores, tablet, score_threshold, deduplicate=True)
     
 class TabletImageDetector(BaseDetector):
     def __init__(
         self,
         model_config: ModelConfig,
-        score_threshold: float = 0.5,
+        default_score_threshold: float = 0.5,
         visualize_crop: bool = False,
         logging_crop: bool = False,
         keep_crops: bool = False,
         is_crop_itself: bool = False,
         is_load_now: bool = True,
     ):
-        super().__init__(model_config, score_threshold, is_load_now=is_load_now)
+        super().__init__(model_config, default_score_threshold, is_load_now=is_load_now)
         self.visualize_crop = visualize_crop
         self.logging_crop = logging_crop
         self.keep_crops = keep_crops
@@ -113,9 +136,10 @@ class TabletImageDetector(BaseDetector):
         self.crop_tablets = []
         self.crop_boxes = []
         self.crop_coordinates = []
-        
     
-    def detect(self, tablet: Tablet) -> Boxes:
+    def detect(self, tablet: Tablet, score_threshold: Optional[float] = None) -> Boxes:
+        if score_threshold is None:
+            score_threshold = self.default_score_threshold
         if self.model is None:
             self.load_model()
 
@@ -126,7 +150,7 @@ class TabletImageDetector(BaseDetector):
         if self.is_crop_itself:
             h, w = tablet.shape
             self.crop_coordinates = [{'x': 0, 'y': 0, 'w': w, 'h': h}]
-            single_detector = SingleImageDetector(model=self.model, score_threshold=self.score_threshold)
+            single_detector = SingleImageDetector(model=self.model, default_score_threshold=score_threshold)
             detections = single_detector.detect(tablet)
             if self.keep_crops:
                 crop_tablet = SubTablet(
@@ -151,7 +175,7 @@ class TabletImageDetector(BaseDetector):
         
         self.crop_coordinates = crop_coordinates
         
-        single_detector = SingleImageDetector(model=self.model, score_threshold=self.score_threshold)
+        single_detector = SingleImageDetector(model=self.model, default_score_threshold=score_threshold)
         
         all_detections = Boxes(tablet=tablet)
         
