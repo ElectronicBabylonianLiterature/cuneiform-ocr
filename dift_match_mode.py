@@ -477,7 +477,8 @@ for sign_name, crop_img in test_crop_imgs_by_sign.items():
     crop_path = f"/tmp/test_box_crop_{sign_name}.png"
     box = test_boxes_by_sign[sign_name]
     ImageView.from_any(crop_img).as_pil().save(crop_path)
-    print(f"Saved {sign_name} detected sign crop to {crop_path}; bbox={box.bbox}, score={box.score:.4f}")
+    bbox = [box.x1, box.y1, box.x2, box.y2]
+    print(f"Saved {sign_name} detected sign crop to {crop_path}; bbox={bbox}, score={box.score:.4f}")
 
 box_an = test_boxes_by_sign["AN"]
 box_tur = test_boxes_by_sign["TUR"]

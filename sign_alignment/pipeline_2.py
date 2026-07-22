@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from . import pipeline as base
-from .box import Box, Boxes
+from .box import Box, Boxes, SignCandidate
 from .dift_align import DiftMatchConfig, source_foreground_mask
 
 
@@ -308,13 +308,15 @@ class _FeatureCoarseAligner:
             if text_idx in anchors:
                 det_box = det_boxes[anchors[text_idx]]
                 box = Box(
-                    det_box.x1,
-                    det_box.y1,
-                    det_box.x2,
-                    det_box.y2,
-                    text_box.sign,
-                    text_box.tablet,
-                    det_box.score,
+                    x1=det_box.x1,
+                    y1=det_box.y1,
+                    x2=det_box.x2,
+                    y2=det_box.y2,
+                    candidates=[SignCandidate(
+                        sign=text_box.sign,
+                        score=det_box.score,
+                    )],
+                    tablet=text_box.tablet,
                 )
                 assignment = FeatureSignAssignment(
                     text_idx,
@@ -329,13 +331,15 @@ class _FeatureCoarseAligner:
                 matrix_row = unmatched_rows[text_idx]
                 score = float(scores.score[matrix_row, candidate_idx])
                 box = Box(
-                    candidate.x1,
-                    candidate.y1,
-                    candidate.x2,
-                    candidate.y2,
-                    text_box.sign,
-                    text_box.tablet,
-                    score,
+                    x1=candidate.x1,
+                    y1=candidate.y1,
+                    x2=candidate.x2,
+                    y2=candidate.y2,
+                    candidates=[SignCandidate(
+                        sign=text_box.sign,
+                        score=score,
+                    )],
+                    tablet=text_box.tablet,
                 )
                 assignment = FeatureSignAssignment(
                     text_idx,
@@ -401,12 +405,15 @@ class _FeatureCoarseAligner:
 
         for candidate_idx, candidate in enumerate(candidates):
             crop_box = Box(
-                candidate.x1,
-                candidate.y1,
-                candidate.x2,
-                candidate.y2,
-                text_boxes[unmatched[0]].sign,
-                self.state.crop_tablet,
+                x1=candidate.x1,
+                y1=candidate.y1,
+                x2=candidate.x2,
+                y2=candidate.y2,
+                candidates=[SignCandidate(
+                    sign=text_boxes[unmatched[0]].sign,
+                    score=1.0,
+                )],
+                tablet=self.state.crop_tablet,
             )
             crop = crop_box.crop_image()
             _synchronize_cuda()

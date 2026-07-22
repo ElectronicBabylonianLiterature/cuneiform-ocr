@@ -13,7 +13,7 @@ import numpy as np
 from data_processing.divide_photos import divide_tablet_photo
 
 from .sign import SignResolver
-from .box import Box, Boxes
+from .box import Box, Boxes, SignCandidate
 from .tablet import SubTablet, Tablet
 
 @dataclass
@@ -69,33 +69,34 @@ class BaseDetector(ABC):
         bboxes = bboxes[mask]
         scores = scores[mask]
 
+        groups = [[i] for i in range(len(labels))]
         if deduplicate:
             score_order = np.argsort(-scores, kind="stable")
-            kept_indices = []
+            groups = []
             for idx in score_order:
-                is_duplicate = any(
-                    np.all(np.abs(bboxes[idx] - bboxes[kept_idx]) <= 2.0)
-                    for kept_idx in kept_indices
-                )
-                if not is_duplicate:
-                    kept_indices.append(int(idx))
-
-            kept_indices.sort()
-            labels = labels[kept_indices]
-            bboxes = bboxes[kept_indices]
-            scores = scores[kept_indices]
+                for group in groups:
+                    if np.all(np.abs(bboxes[idx] - bboxes[group[0]]) <= 2.0):
+                        group.append(int(idx))
+                        break
+                else:
+                    groups.append([int(idx)])
         
         detections = Boxes(tablet=tablet)
-        for i in range(len(labels)):
-            bbox = bboxes[i]
-            sign = SignResolver.from_idx(labels[i])
+        for group in groups:
+            bbox = bboxes[group[0]]
+            candidates = [
+                SignCandidate(
+                    sign=SignResolver.from_idx(int(labels[i])),
+                    score=float(scores[i]),
+                )
+                for i in group
+            ]
             detections.append(Box(
                 x1=float(bbox[0]),
                 y1=float(bbox[1]),
                 x2=float(bbox[2]),
                 y2=float(bbox[3]),
-                score=float(scores[i]),
-                sign=sign,
+                candidates=candidates,
                 tablet=tablet,
             ))
         

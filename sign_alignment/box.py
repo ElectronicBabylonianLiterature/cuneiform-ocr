@@ -9,20 +9,25 @@ from .sign import Sign, SignResolver
 from .tablet import SubTablet, Tablet
 
 
+@dataclass(frozen=True)
+class SignCandidate:
+    sign: Sign
+    score: float
+
+
 @dataclass(init=False)
 class Box:
     """Unified sign box.
 
-    Coordinates are stored as corners, while center/size fields are exposed as
-    mutable properties for the alignment code.
+    Coordinates are stored as corners, while center and size values are exposed
+    as properties for the alignment code.
     """
 
     x1: float
     y1: float
     x2: float
     y2: float
-    score: float
-    sign: Sign
+    candidates: list[SignCandidate]
     tablet: Tablet
 
     def __init__(
@@ -31,16 +36,16 @@ class Box:
         y1: float,
         x2: float,
         y2: float,
-        sign: Sign,
         tablet: Tablet,
-        score: float = 1.0,
+        candidates: list[SignCandidate],
     ):
         self.x1 = float(x1)
         self.y1 = float(y1)
         self.x2 = float(x2)
         self.y2 = float(y2)
-        self.score = float(score)
-        self.sign = sign
+        if not candidates:
+            raise ValueError("Box requires at least one sign candidate")
+        self.candidates = list(candidates)
         self.tablet = tablet
 
     @classmethod
@@ -61,32 +66,17 @@ class Box:
             y1=float(cy) - half_h,
             x2=float(cx) + half_w,
             y2=float(cy) + half_h,
-            sign=sign,
+            candidates=[SignCandidate(sign=sign, score=float(score))],
             tablet=tablet,
-            score=score,
         )
 
     @property
     def width(self) -> float:
         return self.x2 - self.x1
 
-    @width.setter
-    def width(self, value: float) -> None:
-        cx = self.cx
-        half = float(value) / 2
-        self.x1 = cx - half
-        self.x2 = cx + half
-
     @property
     def height(self) -> float:
         return self.y2 - self.y1
-
-    @height.setter
-    def height(self, value: float) -> None:
-        cy = self.cy
-        half = float(value) / 2
-        self.y1 = cy - half
-        self.y2 = cy + half
 
     @property
     def cx(self) -> float:
@@ -109,30 +99,25 @@ class Box:
         self.y2 += dy
 
     @property
-    def area(self) -> float:
-        return self.width * self.height
+    def best_candidate(self) -> SignCandidate:
+        return max(self.candidates, key=lambda candidate: candidate.score)
 
     @property
-    def center(self) -> tuple[float, float]:
-        return self.cx, self.cy
+    def sign(self) -> Sign:
+        return self.best_candidate.sign
 
     @property
-    def bbox(self) -> list[float]:
-        return [self.x1, self.y1, self.x2, self.y2]
+    def score(self) -> float:
+        return self.best_candidate.score
 
     @property
     def sign_name(self) -> str:
         return self.sign.name
 
-    @property
-    def abz_name(self) -> str:
-        return self.sign.abz
-
     def copy(self) -> "Box":
         return Box(
             x1=self.x1, y1=self.y1, x2=self.x2, y2=self.y2,
-            score=self.score,
-            sign=self.sign,
+            candidates=self.candidates.copy(),
             tablet=self.tablet,
         )
 
@@ -161,9 +146,8 @@ class Box:
 
         return Box(
             x1=x1, y1=y1, x2=x2, y2=y2,
-            sign=self.sign,
+            candidates=self.candidates.copy(),
             tablet=tablet,
-            score=self.score,
         )
 
     def crop_bounds(
@@ -288,8 +272,7 @@ def boxes_in_crop(boxes: Iterable[Box], crop_tablet: SubTablet) -> Boxes:
             y1=y1,
             x2=x2,
             y2=y2,
-            score=box.score,
-            sign=box.sign,
+            candidates=box.candidates.copy(),
             tablet=crop_tablet,
         ))
     return transformed

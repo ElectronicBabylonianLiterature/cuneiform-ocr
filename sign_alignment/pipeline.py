@@ -14,7 +14,7 @@ from sign_alignment.data_source import (
     SignAPIResolver,
     SignTextParser,
 )
-from sign_alignment.box import Box, Boxes, boxes_in_crop
+from sign_alignment.box import Box, Boxes, SignCandidate, boxes_in_crop
 from sign_alignment.sign import SignResolver
 from sign_alignment.tablet import SubTablet, Tablet
 from sign_alignment.visualizer import (
@@ -371,6 +371,7 @@ class CropContext:
     canonical_source: Optional[DataSource] = None
     state: SampleState = field(default_factory=SampleState)
     task_type: str = "debug"
+    gt_visualization_excluded_prefixes: tuple[str, ...] = ("SURFACE_",)
 
 
 RunFn = Callable[[CropContext], None]
@@ -397,6 +398,25 @@ def _source_period(context: CropContext) -> str:
         period = context.state.fragment_data["script"]["period"]
         context.state.source_period = period
     return period
+
+
+def gt_boxes_for_visualization(
+    context: CropContext,
+    boxes: Optional[Boxes],
+) -> list[Box]:
+    """Return sign-level GT boxes, leaving the stored annotations unchanged."""
+    excluded_prefixes = tuple(
+        prefix.strip().upper()
+        for prefix in context.gt_visualization_excluded_prefixes
+        if prefix.strip()
+    )
+    if not excluded_prefixes:
+        return list(boxes or [])
+    return [
+        box
+        for box in boxes or []
+        if not box.sign_name.strip().upper().startswith(excluded_prefixes)
+    ]
 
 
 def _display_bgr(img: np.ndarray, title: str, px_per_in: float = 80.0) -> None:
@@ -434,13 +454,17 @@ def load_data(context: CropContext) -> None:
 
 def vis_loaded_data(context: CropContext, vis: VisOptions) -> None:
     s = context.state
+    visual_gt_boxes = gt_boxes_for_visualization(context, s.gt_boxes)
     gt_vis = BboxVisualizer(context.color_config.GT_COLOR.value)
-    gt_vis.draw_boxes(s.tablet.img.copy(), s.gt_boxes)
+    gt_vis.draw_boxes(s.tablet.img.copy(), visual_gt_boxes)
 
     if vis.info:
         total_text = sum(map(len, s.text_lines))
         total_unfiltered = sum(map(len, s.text_lines_unfiltered))
-        print(f"Ground truth boxes: {len(s.gt_boxes)}")
+        hidden_gt_count = len(s.gt_boxes or []) - len(visual_gt_boxes)
+        print(f"Ground truth sign boxes: {len(visual_gt_boxes)}")
+        if hidden_gt_count:
+            print(f"  Non-sign GT boxes hidden: {hidden_gt_count}")
         print(f"  Text lines: {len(s.text_lines)}, total signs: {total_text}")
         print(
             f"  Unfiltered: {total_unfiltered} signs, "
@@ -478,11 +502,11 @@ def vis_detections(context: CropContext, vis: VisOptions) -> None:
     s = context.state
     color = context.color_config.DET_COLOR.value
     full_vis = BboxVisualizer(color=color)
-    full_vis.draw_boxes(s.tablet.img.copy(), s.detections)
+    full_vis.draw_boxes(s.tablet.img.copy(), s.detections, show_scores=True)
     crop_vis = BboxVisualizer(color=color)
-    crop_vis.draw_boxes(s.crop_tablet.img.copy(), s.det_boxes)
-
+    crop_vis.draw_boxes(s.crop_tablet.img.copy(), s.det_boxes, show_scores=True)
     if vis.info:
+
         x, y = s.crop_tablet.offset_in_parent
         h, w = s.crop_tablet.shape
         print(f"Total detections (full image): {len(s.detections)}")
@@ -505,14 +529,23 @@ def transform_gt_to_crop(context: CropContext) -> None:
 
 def vis_crop_ground_truth(context: CropContext, vis: VisOptions) -> None:
     s = context.state
+    visual_gt_boxes = gt_boxes_for_visualization(context, s.gt_boxes)
+    visual_gt_boxes_crop = gt_boxes_for_visualization(context, s.gt_boxes_crop)
     if vis.info:
-        print(f"GT boxes (full image): {len(s.gt_boxes)}")
-        print(f"GT boxes (sub-image):  {len(s.gt_boxes_crop)}")
-    if not s.gt_boxes_crop:
+        print(f"GT sign boxes (full image): {len(visual_gt_boxes)}")
+        print(f"GT sign boxes (sub-image):  {len(visual_gt_boxes_crop)}")
+        hidden_gt_count = len(s.gt_boxes or []) - len(visual_gt_boxes)
+        hidden_gt_crop_count = len(s.gt_boxes_crop or []) - len(visual_gt_boxes_crop)
+        if hidden_gt_count or hidden_gt_crop_count:
+            print(
+                "Non-sign GT boxes hidden "
+                f"(full/sub-image): {hidden_gt_count}/{hidden_gt_crop_count}"
+            )
+    if not visual_gt_boxes_crop:
         return
 
     gt_vis = BboxVisualizer(color=context.color_config.GT_COLOR.value)
-    gt_vis.draw_boxes(s.crop_tablet.img.copy(), s.gt_boxes_crop)
+    gt_vis.draw_boxes(s.crop_tablet.img.copy(), visual_gt_boxes_crop)
     if vis.save:
         gt_vis.save(_out(context, "sub_image_gt.jpg"))
     if vis.display:
@@ -819,7 +852,9 @@ def create_result_without_optimization(context: CropContext) -> None:
             relabelled += 1
             if result_box.sign_name != aligned_box.sign_name:
                 changed += 1
-            result_box.sign = aligned_box.sign
+            result_box.candidates = [
+                SignCandidate(sign=aligned_box.sign, score=result_box.score)
+            ]
 
     s.result_without_optimization_boxes = result_boxes
     s.result_without_optimization_relabelled = relabelled
@@ -833,6 +868,7 @@ def vis_result_without_optimization(
     s = context.state
     image = s.crop_tablet.img
     result_boxes = s.result_without_optimization_boxes
+    visual_gt_boxes = gt_boxes_for_visualization(context, s.gt_boxes_crop)
 
     detection_vis = BboxVisualizer(color=(255, 0, 0))
     detection_vis.draw_boxes(image.copy(), s.det_boxes)
@@ -840,7 +876,7 @@ def vis_result_without_optimization(
     result_vis.draw_boxes(image.copy(), result_boxes)
 
     gt_base = BboxVisualizer(color=(0, 255, 0))
-    gt_base.draw_boxes(image.copy(), s.gt_boxes_crop or [])
+    gt_base.draw_boxes(image.copy(), visual_gt_boxes)
     gt_overlay = BboxVisualizer(color=(255, 255, 0))
     gt_overlay.draw_boxes(gt_base.result, result_boxes)
 
@@ -862,6 +898,9 @@ def vis_result_without_optimization(
 
     if vis.info:
         print("=== Result Without Optimization ===")
+        print(f"  Detection boxes: {len(s.det_boxes or [])}")
+        print(f"  Result boxes: {len(result_boxes or [])}")
+        print(f"  GT sign boxes: {len(visual_gt_boxes)}")
         print(
             f"  Relabelled matched boxes: "
             f"{s.result_without_optimization_relabelled}"
@@ -1205,7 +1244,10 @@ def vis_results_comparison(context: CropContext, vis: VisOptions) -> None:
     det_overlay.draw_boxes(det_base.result, s.final_boxes)
 
     gt_base = BboxVisualizer(color=(0, 255, 0))
-    gt_base.draw_boxes(image.copy(), s.gt_boxes_crop or [])
+    gt_base.draw_boxes(
+        image.copy(),
+        gt_boxes_for_visualization(context, s.gt_boxes_crop),
+    )
     gt_overlay = BboxVisualizer(color=(255, 255, 0))
     gt_overlay.draw_boxes(gt_base.result, s.final_boxes)
 
@@ -1712,7 +1754,10 @@ def vis_manual_dift_crop_match(
                     y1=y1,
                     x2=x2,
                     y2=y2,
-                    sign=SignResolver.from_name(sign_name),
+                    candidates=[SignCandidate(
+                        sign=SignResolver.from_name(sign_name),
+                        score=1.0,
+                    )],
                     tablet=s.crop_tablet,
                 )
                 crop = box.crop_image()
@@ -1813,7 +1858,7 @@ def _manual_dift_match_defaults(
         y1=y1,
         x2=min(x2, img_w),
         y2=min(y2, img_h),
-        sign=sign,
+        candidates=[SignCandidate(sign=sign, score=1.0)],
         tablet=state.crop_tablet,
     )
     return box, sign_names[0]

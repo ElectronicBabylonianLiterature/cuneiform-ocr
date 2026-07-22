@@ -12,7 +12,7 @@ import requests
 from PIL import Image
 
 from .sign import Sign, SignResolver
-from .box import Box, Boxes
+from .box import Box, Boxes, SignCandidate
 from .tablet import Tablet
 
 
@@ -291,8 +291,7 @@ class LocalDataSource:
                         y1=float(y),
                         x2=float(x + w),
                         y2=float(y + h),
-                        score=1.0,
-                        sign=sign,
+                        candidates=[SignCandidate(sign=sign, score=1.0)],
                         tablet=tablet,
                     )
                     boxes.append(bbox)
@@ -359,8 +358,7 @@ class LocalTestDataSource:
                 y1=float(y),
                 x2=float(x + w),
                 y2=float(y + h),
-                score=1.0,
-                sign=sign,
+                candidates=[SignCandidate(sign=sign, score=1.0)],
                 tablet=tablet,
             ))
         return boxes if boxes else None

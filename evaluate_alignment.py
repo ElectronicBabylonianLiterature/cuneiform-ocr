@@ -35,6 +35,7 @@ from sign_alignment.pipeline import (
     build_sign_match_info,
     create_box_sets,
     create_psr_optimizer,
+    create_result_without_optimization,
     detect_rows,
     detect_signs,
     load_data,
@@ -62,7 +63,7 @@ load_dotenv()
 COCO_TEST_DIR = os.path.expanduser("~/erc-work-data/ready-for-training/coco-recognition-2025-09/data/coco")
 CONFIG_FILE = "configs/detr.py"
 CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/epoch_1000.pth")
-SCORE_THRESHOLD = 0.5
+SCORE_THRESHOLD = 0.1
 EVAL_OUTPUT_DIR = "evaluation_results"
 
 # Number of fragments to evaluate / search
@@ -100,11 +101,12 @@ SEARCH_PSR_PARAMS['num_iterations'] = 40
 
 class PredictionMode(str, Enum):
     """Controls how bounding box predictions are produced during evaluation."""
-    PSR = "psr"              # Full pipeline: detection + PSR alignment optimization (default)
-    DETECTION = "detection"  # Raw detection model output only, no alignment optimization
+    PSR = "psr"                      # Detection + text alignment + PSR optimization
+    WITHOUT_PSR = "without_psr"      # Detection + text alignment, preserving detection geometry
+    DETECTION = "detection"          # Raw detection model output only
 
 # Default prediction mode used by run_evaluation
-DEFAULT_PREDICTION_MODE = PredictionMode.PSR
+DEFAULT_PREDICTION_MODE = PredictionMode.WITHOUT_PSR
 
 
 # ============ IoU & Metrics ============
@@ -643,6 +645,65 @@ def _predict_detection_crops(
     return preds
 
 
+def _run_without_psr_alignment_steps(runner: Runner) -> None:
+    """Run the notebook alignment flow through result_without_optimization.
+
+    Both PSR and WITHOUT_PSR use this shared prefix so row detection and
+    matching stay in sync.  In particular, ``detect_rows`` currently uses the
+    Hough-based row detector from ``sign_alignment.pipeline``.
+    """
+    runner.run([
+        Step("Transform GT to crop", transform_gt_to_crop, vis_crop_ground_truth),
+        Step("Create box sets", create_box_sets, vis_box_sets),
+        Step("Detect rows (Hough)", detect_rows, vis_detected_rows_info),
+        Step("Match rows", match_rows, vis_row_matches),
+        Step("Match signs", match_signs_in_rows, vis_sign_matches),
+        Step("Align text rows", align_text_rows, vis_aligned_rows),
+        Step(
+            "Result without PSR",
+            create_result_without_optimization,
+        ),
+    ])
+
+
+def _predict_without_psr_crops(
+    runner: Runner,
+    context: CropContext,
+    fid: str,
+    visualize: bool = False,
+    output_dir: str = EVAL_OUTPUT_DIR,
+) -> List[Box]:
+    """Return relabelled detections without changing their geometry or score."""
+    s = context.state
+    preds: List[Box] = []
+    for crop_idx in range(len(context.tablet_detector.get_crop_tablets())):
+        runner.choose_crop(crop_idx)
+        if not s.det_boxes:
+            continue
+
+        _run_without_psr_alignment_steps(runner)
+        if s.result_without_optimization_boxes is None:
+            continue
+
+        # create_result_without_optimization starts from s.det_boxes.copy(),
+        # so detector confidence scores (already filtered by SCORE_THRESHOLD)
+        # are preserved here.
+        for box in s.result_without_optimization_boxes:
+            preds.append(box.to_tablet(s.tablet))
+
+    if visualize and s.tablet is not None:
+        visualize_evaluation_fragment(
+            img=s.tablet.img,
+            fragment_id=fid,
+            preds=preds,
+            gts=s.gt_boxes,
+            iou_threshold=0.5,
+            class_agnostic=False,
+            output_dir=output_dir,
+        )
+    return preds
+
+
 def _predict_psr_crops(
     runner: Runner,
     context: CropContext,
@@ -663,18 +724,16 @@ def _predict_psr_crops(
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
+        _run_without_psr_alignment_steps(runner)
+        if not s.det_rows or not len(s.det_rows) or not s.matches or not s.aligned_boxes:
+            continue
+
         runner.run([
-            Step("Transform GT to crop", transform_gt_to_crop, vis_crop_ground_truth),
-            Step("Create box sets", create_box_sets, vis_box_sets),
-            Step("Detect rows", detect_rows, vis_detected_rows_info),
-            Step("Match rows", match_rows, vis_row_matches),
-            Step("Match signs", match_signs_in_rows, vis_sign_matches),
-            Step("Align text rows", align_text_rows, vis_aligned_rows),
             Step("Build sign match info", build_sign_match_info, vis_sign_match_info),
             Step("Create PSR optimizer", create_psr_optimizer, vis_psr_optimizer),
             Step("Optimize PSR", optimize_psr, vis_optimization),
         ])
-        if not s.det_rows or not len(s.det_rows) or not s.matches or not s.aligned_boxes:
+        if not s.final_boxes:
             continue
 
         for sb in s.final_boxes:
@@ -712,8 +771,8 @@ def run_predictions(
         psr_params: PSR optimizer hyperparameters (only used for PSR mode).
         verbose: Print progress messages.
         label: Label for progress output.
-        prediction_mode: How to produce predictions (PSR alignment or raw detection).
-        visualize: Save per-fragment visualizations (PSR mode only).
+        prediction_mode: How to produce predictions (PSR, without PSR, or raw detection).
+        visualize: Save per-fragment evaluation visualizations.
         output_dir: Directory for visualization outputs.
 
     Returns:
@@ -737,6 +796,10 @@ def run_predictions(
         s = context.state
         if prediction_mode == PredictionMode.DETECTION:
             all_preds = _predict_detection_crops(runner, context, fid, visualize, output_dir)
+        elif prediction_mode == PredictionMode.WITHOUT_PSR:
+            all_preds = _predict_without_psr_crops(
+                runner, context, fid, visualize, output_dir
+            )
         else:
             all_preds = _predict_psr_crops(runner, context, fid, visualize, output_dir)
 
@@ -833,8 +896,9 @@ def run_evaluation(
         visualize: Save per-fragment visualizations (PSR mode only).
         output_dir: Directory for outputs.
         prediction_mode: How to produce predictions.
-            PredictionMode.PSR       – full PSR alignment optimization (default)
-            PredictionMode.DETECTION – raw detection model output only
+            PredictionMode.PSR         – full PSR alignment optimization (default)
+            PredictionMode.WITHOUT_PSR – aligned/relabelled detections without PSR
+            PredictionMode.DETECTION   – raw detection model output only
 
     Returns:
         Dict with mAP, per-threshold results, per-class results, and per-fragment details.
@@ -954,7 +1018,7 @@ if __name__ == "__main__":
     )
     tablet_detector = TabletImageDetector(
         model_config=model_config,
-        score_threshold=SCORE_THRESHOLD,
+        default_score_threshold=SCORE_THRESHOLD,
         keep_crops=True,
         is_crop_itself=True,
     )
@@ -966,6 +1030,7 @@ if __name__ == "__main__":
         api_source=EBLAPISource(strip_subtablet_suffix=True),
         color_config=ColorConfig,
         output_dir=EVAL_OUTPUT_DIR,
+        img_idx=0,
         task_type="evaluation",
     )
 
@@ -974,16 +1039,18 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------------
     # Select prediction mode here:
-    #   PredictionMode.PSR       – full PSR alignment optimization (default)
-    #   PredictionMode.DETECTION – raw detection model output only
+    #   PredictionMode.PSR         – full PSR alignment optimization (default)
+    #   PredictionMode.WITHOUT_PSR – text-aligned labels, detection boxes/scores
+    #   PredictionMode.DETECTION   – raw detection model output only
     # ----------------------------------------------------------------
-    PREDICTION_MODE = PredictionMode.PSR
+    PREDICTION_MODE = PredictionMode.WITHOUT_PSR  
 
     # --- STEP 1: Full evaluation with default params ---
     print(f"\n{'='*60}")
-    print(f"STEP 1: Evaluation with default PSR parameters ({len(eval_fragments)} fragments)")
+    print(f"STEP 1: {PREDICTION_MODE.value} evaluation ({len(eval_fragments)} fragments)")
     print(f"  prediction_mode  = {PREDICTION_MODE}")
-    print(f"  num_iterations   = {DEFAULT_PSR_PARAMS['num_iterations']} (PSR mode only)")
+    if PREDICTION_MODE == PredictionMode.PSR:
+        print(f"  num_iterations   = {DEFAULT_PSR_PARAMS['num_iterations']}")
     print(f"{'='*60}")
 
     eval_result = run_evaluation(
@@ -991,7 +1058,7 @@ if __name__ == "__main__":
         fragment_ids=eval_fragments,
         psr_params=DEFAULT_PSR_PARAMS,
         verbose=True,
-        label="detection",
+        label=PREDICTION_MODE.value,
         visualize=True,
         output_dir=EVAL_OUTPUT_DIR,
         prediction_mode=PREDICTION_MODE,

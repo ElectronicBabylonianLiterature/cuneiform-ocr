@@ -25,7 +25,13 @@ class BboxVisualizer:
         self.color_func: Optional[Callable[[Box], tuple]] = None
         self.result = None  # Store last result for display
     
-    def draw_boxes(self, img: np.ndarray, boxes: Boxes, show_labels: bool = True) -> np.ndarray:
+    def draw_boxes(
+        self,
+        img: np.ndarray,
+        boxes: Boxes,
+        show_labels: bool = True,
+        show_scores: bool = False,
+    ) -> np.ndarray:
         """
         Draw bounding boxes on image.
         
@@ -33,6 +39,7 @@ class BboxVisualizer:
             img: Input image in BGR format
             boxes: List of Box objects
             show_labels: Whether to show sign name labels
+            show_scores: Whether to append the box score to labels
             
         Returns:
             Image with boxes drawn
@@ -61,6 +68,8 @@ class BboxVisualizer:
         for box in boxes:
             x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
             label = box.sign.name[:10]
+            if show_scores:
+                label += f" {box.score:.2f}"
             
             # Get box color
             # color = self.color_func(box) if self.color_func else self.default_color

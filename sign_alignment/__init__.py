@@ -21,7 +21,7 @@ from .sign import (
     CLASSES_ABZ,
 )
 
-from .box import Box, Boxes, boxes_in_crop
+from .box import Box, Boxes, SignCandidate, boxes_in_crop
 
 from .detector import (
     ModelConfig,
@@ -84,6 +84,7 @@ __all__ = [
     # Boxes
     'Box',
     'Boxes',
+    'SignCandidate',
     'boxes_in_crop',
     
     # Detection

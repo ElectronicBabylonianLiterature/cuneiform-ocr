@@ -161,8 +161,8 @@ class PointSetRegistrationOptimizer:
                 self.source_boxes_flat.append(sb)
                 self.row_indices.append(row_idx)
                 self.col_indices.append(col_idx)
-                cid = (self.classes_abz.index(sb.abz_name)
-                       if sb.abz_name in self.classes_abz else -1)
+                cid = (self.classes_abz.index(sb.sign.abz)
+                       if sb.sign.abz in self.classes_abz else -1)
                 self.class_ids_source.append(cid)
 
         self.M = len(self.source_boxes_flat)
