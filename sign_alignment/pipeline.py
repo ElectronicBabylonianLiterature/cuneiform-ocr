@@ -32,6 +32,7 @@ from data_processing.line_process import (
     match_rows_dp,
     match_signs_in_row_dp,
 )
+from data_processing.hough_row_detection import detect_hough_rows
 from sign_alignment.dift_align import (
     DiftAffineProbe,
     DiftRuntime,
@@ -137,14 +138,19 @@ class BoxRows:
         assignment_distance_factor: float = 0.24,
         min_peak_votes: float = 1.25,
         min_row_size: int = 2,
+        curve_search_angle_deg: float = 5.0,
+        curve_curvature_penalty: float = 1.0,
     ) -> "BoxRows":
-        """Group boxes around parallel row baselines using a Hough-style vote.
+        """Group boxes using 2-D Hough peaks and one fitted angle per row.
 
-        Every detection center has equal weight. First, a global row angle is
-        selected by finding the angle that makes the projected center points
-        concentrate most strongly. Peaks in the normal-coordinate projection
-        then define parallel row baselines. Boxes are assigned to their nearest
-        baseline and ordered along the detected row direction.
+        Every detection center has equal weight. Candidate baselines are local
+        maxima in the full ``(theta, rho)`` parameter space, rather than peaks
+        from a single global-angle slice. Candidate support points are assigned
+        disjointly and each row is robustly refitted. A robust low-curvature,
+        zero-average-slope angle curve is fitted through that first selection,
+        then the final selection is repeated inside its local angle window.
+        Both the Hough grid and every continuous refit are bounded by
+        ``angle_range_deg``.
         """
         if not boxes:
             return cls(boxes=boxes, rows=[])
@@ -154,131 +160,41 @@ class BoxRows:
             dtype=np.float64,
         )
         scale = float(np.median([box.height for box in boxes]))
-        rho_step = scale * rho_step_factor
-        rho_sigma = scale * rho_sigma_factor
-
-        angles_deg = np.arange(
-            -angle_range_deg,
-            angle_range_deg + angle_step_deg / 2,
-            angle_step_deg,
-        )
-        angle_scores = []
-        projected_by_angle = []
-        for angle_deg in angles_deg:
-            angle = np.deg2rad(angle_deg)
-            rhos = (
-                -centers[:, 0] * np.sin(angle)
-                + centers[:, 1] * np.cos(angle)
-            )
-            projected_by_angle.append(rhos)
-
-            pairwise_delta = (rhos[:, None] - rhos[None, :]) / rho_sigma
-            pairwise_votes = np.exp(-0.5 * pairwise_delta ** 2)
-            angle_scores.append(float((pairwise_votes.sum() - len(boxes)) / 2))
-
-        best_angle_idx = int(np.argmax(angle_scores))
-        best_angle_deg = float(angles_deg[best_angle_idx])
-        best_angle = np.deg2rad(best_angle_deg)
-        projected_rhos = projected_by_angle[best_angle_idx]
-
-        rho_grid = np.arange(
-            projected_rhos.min() - 2 * rho_sigma,
-            projected_rhos.max() + 2 * rho_sigma + rho_step,
-            rho_step,
-        )
-        normalized_delta = (
-            rho_grid[:, None] - projected_rhos[None, :]
-        ) / rho_sigma
-        accumulator = np.exp(-0.5 * normalized_delta ** 2).sum(axis=1)
-
-        all_projected_rhos = np.concatenate(projected_by_angle)
-        parameter_rho_grid = np.arange(
-            all_projected_rhos.min() - 2 * rho_sigma,
-            all_projected_rhos.max() + 2 * rho_sigma + rho_step,
-            rho_step,
-        )
-        parameter_space = []
-        for rhos in projected_by_angle:
-            normalized_delta = (
-                parameter_rho_grid[:, None] - rhos[None, :]
-            ) / rho_sigma
-            parameter_space.append(
-                np.exp(-0.5 * normalized_delta ** 2).sum(axis=1)
-            )
-        parameter_space = np.asarray(parameter_space).T
-
-        peak_indices = np.flatnonzero(
-            (accumulator[1:-1] >= accumulator[:-2])
-            & (accumulator[1:-1] > accumulator[2:])
-            & (accumulator[1:-1] >= min_peak_votes)
-        ) + 1
-        peak_indices = sorted(
-            peak_indices,
-            key=lambda idx: accumulator[idx],
-            reverse=True,
-        )
-
-        min_line_distance = scale * min_line_distance_factor
-        selected_rhos = []
-        for peak_idx in peak_indices:
-            rho = float(rho_grid[peak_idx])
-            if all(
-                abs(rho - selected) >= min_line_distance
-                for selected in selected_rhos
-            ):
-                selected_rhos.append(rho)
-        selected_rhos = np.asarray(sorted(selected_rhos), dtype=np.float64)
-
-        assignment_distance = scale * assignment_distance_factor
-        distances = np.abs(projected_rhos[:, None] - selected_rhos[None, :])
-        assignments = np.argmin(distances, axis=1)
-        assignments[distances.min(axis=1) > assignment_distance] = -1
-
-        for line_idx in range(len(selected_rhos)):
-            members = projected_rhos[assignments == line_idx]
-            if len(members):
-                selected_rhos[line_idx] = float(np.median(members))
-
-        distances = np.abs(projected_rhos[:, None] - selected_rhos[None, :])
-        assignments = np.argmin(distances, axis=1)
-        assignments[distances.min(axis=1) > assignment_distance] = -1
-
-        along_row = (
-            centers[:, 0] * np.cos(best_angle)
-            + centers[:, 1] * np.sin(best_angle)
-        )
-        detected_rows = []
-        assigned_indices = set()
-        for line_idx, rho in enumerate(selected_rhos):
-            indices = np.flatnonzero(assignments == line_idx).tolist()
-            if len(indices) < min_row_size:
-                continue
-            indices.sort(key=lambda idx: along_row[idx])
-            assigned_indices.update(indices)
-            detected_rows.append((
-                float(np.mean(centers[indices, 1])),
-                float(rho),
-                indices,
-            ))
-
-        detected_rows.sort(key=lambda item: item[0])
-        rows = [indices for _, _, indices in detected_rows]
-        rhos = [rho for _, rho, _ in detected_rows]
-        noise = sorted(
-            set(range(len(boxes))) - assigned_indices,
-            key=lambda idx: boxes[idx].cx,
+        detection = detect_hough_rows(
+            centers=centers,
+            scale=scale,
+            angle_range_deg=angle_range_deg,
+            angle_step_deg=angle_step_deg,
+            rho_step_factor=rho_step_factor,
+            rho_sigma_factor=rho_sigma_factor,
+            min_line_distance_factor=min_line_distance_factor,
+            assignment_distance_factor=assignment_distance_factor,
+            min_peak_votes=min_peak_votes,
+            min_row_size=min_row_size,
+            curve_search_angle_deg=curve_search_angle_deg,
+            curve_curvature_penalty=curve_curvature_penalty,
         )
         result = cls(
             boxes=boxes,
-            rows=rows,
-            noise=noise,
+            rows=detection.rows,
+            noise=detection.noise,
         )
-        result.hough_angle_deg = best_angle_deg
-        result.hough_rhos = rhos
-        result.hough_angles_deg = angles_deg
-        result.hough_rho_grid = parameter_rho_grid
-        result.hough_parameter_space = parameter_space
-        result.hough_angle_scores = np.asarray(angle_scores)
+        # hough_angle_deg is retained as a backward-compatible global
+        # diagnostic; selected baselines use hough_row_angles_deg instead.
+        result.hough_angle_deg = detection.global_angle_deg
+        result.hough_row_angles_deg = detection.row_angles_deg
+        result.hough_rhos = detection.row_rhos
+        result.hough_row_x_ranges = detection.row_x_ranges
+        result.hough_angles_deg = detection.angles_deg
+        result.hough_rho_grid = detection.rho_grid
+        result.hough_parameter_space = detection.parameter_space
+        result.hough_angle_scores = detection.angle_scores
+        result.hough_x_origin = detection.x_origin
+        result.hough_initial_row_angles_deg = detection.initial_row_angles_deg
+        result.hough_initial_row_rhos = detection.initial_row_rhos
+        result.hough_angle_curve_deg = detection.angle_curve_angles_deg
+        result.hough_angle_curve_inlier_mask = detection.angle_curve_inlier_mask
+        result.hough_curve_search_angle_deg = detection.curve_search_angle_deg
         return result
 
 
@@ -606,13 +522,47 @@ def vis_detected_rows_info(context: CropContext, vis: VisOptions) -> None:
         f"Average sign size: {s.detections.avg_size:.2f} px, "
         f"detected {len(s.det_rows)} rows, {len(s.det_boxes)} signs"
     )
+    row_angles = getattr(s.det_rows, "hough_row_angles_deg", np.asarray([]))
     if getattr(s.det_rows, "hough_angle_deg", None) is not None:
-        print(
-            f"  Hough angle: {s.det_rows.hough_angle_deg:.1f} deg, "
-            f"baselines: {len(s.det_rows.hough_rhos)}"
-        )
+        if len(row_angles):
+            initial_angles = getattr(
+                s.det_rows,
+                "hough_initial_row_angles_deg",
+                np.asarray([]),
+            )
+            curve_inliers = getattr(
+                s.det_rows,
+                "hough_angle_curve_inlier_mask",
+                np.asarray([], dtype=bool),
+            )
+            curve_outliers = (
+                int((~curve_inliers).sum())
+                if len(curve_inliers) == len(initial_angles)
+                else 0
+            )
+            print(
+                f"  Hough row angles: {row_angles.min():.1f} to "
+                f"{row_angles.max():.1f} deg, global score peak: "
+                f"{s.det_rows.hough_angle_deg:.1f} deg, "
+                f"baselines: {len(s.det_rows.hough_rhos)}"
+            )
+            print(
+                f"  Curve reselection: {len(initial_angles)} initial, "
+                f"{curve_outliers} robust-fit outliers, "
+                f"±{s.det_rows.hough_curve_search_angle_deg:.1f} deg window"
+            )
+        else:
+            print(
+                f"  Hough global score peak: "
+                f"{s.det_rows.hough_angle_deg:.1f} deg, baselines: 0"
+            )
     for row_idx, count in enumerate(s.det_rows.counts()):
-        print(f"  Row {row_idx}: {count} boxes")
+        angle_info = (
+            f", angle: {row_angles[row_idx]:.1f} deg"
+            if row_idx < len(row_angles)
+            else ""
+        )
+        print(f"  Row {row_idx}: {count} boxes{angle_info}")
     if s.det_rows.noise:
         print(f"  Noise: {len(s.det_rows.noise)} boxes")
 
@@ -691,20 +641,84 @@ def _render_hough_parameter_space(rows: BoxRows) -> np.ndarray:
         rows.hough_angle_deg,
         color="cyan",
         linewidth=1.5,
-        label=f"selected angle: {rows.hough_angle_deg:.1f} deg",
+        linestyle="--",
+        label=f"global score peak: {rows.hough_angle_deg:.1f} deg",
+    )
+    initial_angles = getattr(
+        rows,
+        "hough_initial_row_angles_deg",
+        np.asarray([]),
+    )
+    initial_rhos = getattr(
+        rows,
+        "hough_initial_row_rhos",
+        np.asarray([]),
+    )
+    curve_inliers = getattr(
+        rows,
+        "hough_angle_curve_inlier_mask",
+        np.ones(len(initial_angles), dtype=bool),
+    )
+    if len(initial_angles):
+        ax.scatter(
+            initial_angles,
+            initial_rhos,
+            facecolors="none",
+            edgecolors="deepskyblue",
+            marker="o",
+            s=52,
+            linewidths=1.3,
+            label="first-pass row baselines",
+        )
+        if len(curve_inliers) == len(initial_angles) and (~curve_inliers).any():
+            ax.scatter(
+                initial_angles[~curve_inliers],
+                initial_rhos[~curve_inliers],
+                edgecolors="orange",
+                marker="s",
+                facecolors="none",
+                s=64,
+                linewidths=1.5,
+                label="robust curve-fit outliers",
+            )
+    angle_curve = getattr(rows, "hough_angle_curve_deg", np.asarray([]))
+    if len(angle_curve) == len(rho_grid):
+        curve_window = rows.hough_curve_search_angle_deg
+        ax.fill_betweenx(
+            rho_grid,
+            np.maximum(angles[0], angle_curve - curve_window),
+            np.minimum(angles[-1], angle_curve + curve_window),
+            color="cyan",
+            alpha=0.10,
+            label=f"curve search window (±{curve_window:.1f} deg)",
+        )
+        ax.plot(
+            angle_curve,
+            rho_grid,
+            color="white",
+            linewidth=1.5,
+            label="zero-mean-slope quadratic angle curve",
+        )
+    row_angles = getattr(
+        rows,
+        "hough_row_angles_deg",
+        np.full(len(rows.hough_rhos), rows.hough_angle_deg),
     )
     ax.scatter(
-        np.full(len(rows.hough_rhos), rows.hough_angle_deg),
+        row_angles,
         rows.hough_rhos,
         color="lime",
         marker="x",
         s=45,
         linewidths=1.5,
-        label="selected row baselines",
+        label="final curve-window reselection",
     )
     ax.set_xlabel("row angle theta (degrees)")
-    ax.set_ylabel("normal coordinate rho (pixels)")
-    ax.set_title("Hough parameter space from detection-box centers")
+    x_origin = getattr(rows, "hough_x_origin", 0.0)
+    ax.set_ylabel(
+        f"normal coordinate rho (pixels; x centered at {x_origin:.1f})"
+    )
+    ax.set_title("Two-pass Hough row selection from detection-box centers")
     ax.legend(loc="upper right")
     fig.colorbar(image, ax=ax, label="equal-weight Gaussian votes")
     fig.tight_layout()
@@ -765,6 +779,7 @@ def vis_sign_matches(context: CropContext, vis: VisOptions) -> None:
     if not vis.info:
         return
     s = context.state
+    MAX_MATCHES_TO_DISPLAY = 20
     print("=== Within-Row Sign Matching ===")
     for text_row_idx, det_row_idx in s.matches:
         text = s.text_row_sequences[text_row_idx]
@@ -774,13 +789,13 @@ def vis_sign_matches(context: CropContext, vis: VisOptions) -> None:
             f"Text row {text_row_idx} -> Det row {det_row_idx}: "
             f"{len(text)} text, {len(detected)} det, {len(matches)} matched"
         )
-        for i, (text_idx, det_idx) in enumerate(matches[:5]):
+        for i, (text_idx, det_idx) in enumerate(matches[:MAX_MATCHES_TO_DISPLAY]):
             print(
                 f"  {i + 1}. Text[{text_idx}]={text[text_idx]} "
                 f"<-> Det[{det_idx}]={detected[det_idx]}"
             )
-        if len(matches) > 5:
-            print(f"  ... and {len(matches) - 5} more")
+        if len(matches) > MAX_MATCHES_TO_DISPLAY:
+            print(f"  ... and {len(matches) - MAX_MATCHES_TO_DISPLAY} more")
     print(
         "Total matched sign pairs: "
         f"{sum(map(len, s.row_sign_matches.values()))}"

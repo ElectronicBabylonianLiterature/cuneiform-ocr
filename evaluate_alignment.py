@@ -1,8 +1,7 @@
-"""
-Evaluation script for Cuneiform Signs Alignment (PSR method).
+"""Evaluation script for the available Cuneiform Signs Alignment modes.
 
 Computes object-detection-style metrics (mAP, IoU, Precision, Recall)
-by comparing PSR-optimized alignment bounding boxes against ground-truth annotations.
+by comparing each mode's bounding boxes against ground-truth annotations.
 
 Also includes a fast coordinate-wise hyperparameter sweep for the
 PointSetRegistrationOptimizer.
@@ -56,6 +55,7 @@ from sign_alignment.pipeline import (
     vis_sign_match_info,
     vis_sign_matches,
 )
+import pipeline_3_candidate_test as candidate_pipeline
 
 load_dotenv()
 
@@ -104,6 +104,7 @@ class PredictionMode(str, Enum):
     PSR = "psr"                      # Detection + text alignment + PSR optimization
     WITHOUT_PSR = "without_psr"      # Detection + text alignment, preserving detection geometry
     DETECTION = "detection"          # Raw detection model output only
+    DET_AS_CANDIDATES = "det_as_candidates"  # Position-first fixed-candidate attraction
 
 # Default prediction mode used by run_evaluation
 DEFAULT_PREDICTION_MODE = PredictionMode.WITHOUT_PSR
@@ -704,6 +705,66 @@ def _predict_without_psr_crops(
     return preds
 
 
+def _predict_det_as_candidates_crops(
+    runner: Runner,
+    context: CropContext,
+    fid: str,
+    visualize: bool = False,
+    output_dir: str = EVAL_OUTPUT_DIR,
+) -> List[Box]:
+    """Run the sign-alignment-3 fixed-candidate flow across all crops.
+
+    The alignment prefix is deliberately identical to WITHOUT_PSR and to the
+    candidate notebook.  Detector boxes are then treated as fixed candidates;
+    the filtered ``candidate_test_boxes`` are returned in full-image coordinates.
+    The shared module-level ``SCORE_THRESHOLD`` remains the only prediction
+    score threshold for this evaluation mode.
+    """
+
+    s = context.state
+    preds: List[Box] = []
+    candidate_config = candidate_pipeline.CandidateAttractionConfig(
+        temperatures=(2.0, 1.0, 0.5, 0.25),
+        steps_per_temperature=35,
+        learning_rate=0.04,
+        class_bonus=0.06,
+        objectness_bonus=0.10,
+        device="auto",
+    )
+
+    for crop_idx in range(len(context.tablet_detector.get_crop_tablets())):
+        runner.choose_crop(crop_idx)
+        if not s.det_boxes:
+            continue
+
+        _run_without_psr_alignment_steps(runner)
+        if s.aligned_rows is None or s.det_rows is None:
+            continue
+
+        candidate_pipeline.run_candidate_attraction(context, candidate_config)
+        if s.candidate_test_boxes is None:
+            continue
+
+        for box in s.candidate_test_boxes:
+            # Candidate construction and final assignment confidence deliberately
+            # share the detector's module-level threshold; there is no mode-local
+            # score cutoff.
+            if box.score >= SCORE_THRESHOLD:
+                preds.append(box.to_tablet(s.tablet))
+
+    if visualize and s.tablet is not None:
+        visualize_evaluation_fragment(
+            img=s.tablet.img,
+            fragment_id=fid,
+            preds=preds,
+            gts=s.gt_boxes,
+            iou_threshold=0.5,
+            class_agnostic=False,
+            output_dir=output_dir,
+        )
+    return preds
+
+
 def _predict_psr_crops(
     runner: Runner,
     context: CropContext,
@@ -771,7 +832,8 @@ def run_predictions(
         psr_params: PSR optimizer hyperparameters (only used for PSR mode).
         verbose: Print progress messages.
         label: Label for progress output.
-        prediction_mode: How to produce predictions (PSR, without PSR, or raw detection).
+        prediction_mode: How to produce predictions (PSR, without PSR,
+                         fixed-candidate attraction, or raw detection).
         visualize: Save per-fragment evaluation visualizations.
         output_dir: Directory for visualization outputs.
 
@@ -800,8 +862,14 @@ def run_predictions(
             all_preds = _predict_without_psr_crops(
                 runner, context, fid, visualize, output_dir
             )
-        else:
+        elif prediction_mode == PredictionMode.DET_AS_CANDIDATES:
+            all_preds = _predict_det_as_candidates_crops(
+                runner, context, fid, visualize, output_dir
+            )
+        elif prediction_mode == PredictionMode.PSR:
             all_preds = _predict_psr_crops(runner, context, fid, visualize, output_dir)
+        else:
+            raise ValueError(f"Unknown prediction mode: {prediction_mode}")
 
         if verbose:
             print(f"    GT={len(s.gt_boxes)}, Pred={len(all_preds)}")
@@ -893,11 +961,12 @@ def run_evaluation(
         psr_params: PSR optimizer hyperparameters (only used for PSR mode).
         verbose: Print progress messages.
         label: Label for progress/summary output.
-        visualize: Save per-fragment visualizations (PSR mode only).
+        visualize: Save per-fragment evaluation visualizations.
         output_dir: Directory for outputs.
         prediction_mode: How to produce predictions.
-            PredictionMode.PSR         – full PSR alignment optimization (default)
+            PredictionMode.PSR         – full PSR alignment optimization
             PredictionMode.WITHOUT_PSR – aligned/relabelled detections without PSR
+            PredictionMode.DET_AS_CANDIDATES – sign-alignment-3 candidate attraction
             PredictionMode.DETECTION   – raw detection model output only
 
     Returns:
@@ -1039,11 +1108,12 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------------
     # Select prediction mode here:
-    #   PredictionMode.PSR         – full PSR alignment optimization (default)
+    #   PredictionMode.PSR         – full PSR alignment optimization
     #   PredictionMode.WITHOUT_PSR – text-aligned labels, detection boxes/scores
+    #   PredictionMode.DET_AS_CANDIDATES – position-first fixed-candidate attraction
     #   PredictionMode.DETECTION   – raw detection model output only
     # ----------------------------------------------------------------
-    PREDICTION_MODE = PredictionMode.WITHOUT_PSR  
+    PREDICTION_MODE = PredictionMode.DET_AS_CANDIDATES
 
     # --- STEP 1: Full evaluation with default params ---
     print(f"\n{'='*60}")
