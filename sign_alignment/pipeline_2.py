@@ -1,29 +1,27 @@
-"""Experimental DIFT sliding-window coarse alignment.
+"""DIFT sliding-window extension for the base sign-alignment pipeline.
 
-This module leaves ``pipeline.py`` unchanged and only replaces its coarse
-text-row alignment step. Exact same-label detection matches remain anchors.
-Unmatched text signs are searched in fixed-size windows along the matched
-detection-row baseline.
+The extension replaces only ``pipeline.align_text_rows``.  It consumes the
+base row/sign matches, keeps exact same-label matches as anchors, and searches
+fixed windows for the remaining text signs.  All other steps continue to come
+from :mod:`sign_alignment.pipeline`.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
-import torch
+
+from data_processing.line_process import align_text_row_to_detection
 
 from . import pipeline as base
 from .box import Box, Boxes, SignCandidate
 from .dift_align import DiftMatchConfig, source_foreground_mask
 
 
-Runner = base.Runner
-Step = base.Step
-VisOptions = base.VisOptions
+RESULT_KEY = "feature_coarse"
 
 
 @dataclass
@@ -34,29 +32,20 @@ class FeatureCoarseAlignmentConfig:
     window_height: Optional[float] = None
     max_candidates_per_row: Optional[int] = None
     assignment_min_score: float = 0.0
-    progress_every: int = 10
-    print_match_timings: bool = True
     match: DiftMatchConfig = field(default_factory=DiftMatchConfig)
 
     def __post_init__(self) -> None:
         if self.step_px <= 0:
             raise ValueError("step_px must be positive")
-        if self.window_width is not None and self.window_width <= 0:
-            raise ValueError("window_width must be positive")
-        if self.window_height is not None and self.window_height <= 0:
-            raise ValueError("window_height must be positive")
-        if (
-            self.max_candidates_per_row is not None
-            and self.max_candidates_per_row <= 0
+        if self.search_margin_px < 0:
+            raise ValueError("search_margin_px must be non-negative")
+        for name, value in (
+            ("window_width", self.window_width),
+            ("window_height", self.window_height),
+            ("max_candidates_per_row", self.max_candidates_per_row),
         ):
-            raise ValueError("max_candidates_per_row must be positive")
-
-
-@dataclass
-class CropContext(base.CropContext):
-    feature_coarse_alignment: FeatureCoarseAlignmentConfig = field(
-        default_factory=FeatureCoarseAlignmentConfig
-    )
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive")
 
 
 @dataclass(frozen=True)
@@ -86,18 +75,6 @@ class FeatureSignAssignment:
     candidate_idx: Optional[int] = None
 
 
-@dataclass(frozen=True)
-class FeatureMatchTiming:
-    candidate_idx: int
-    text_idx: int
-    sign_name: str
-    elapsed_seconds: float
-    score: float
-    n_matches: int
-    n_inliers: int
-    message: str = ""
-
-
 @dataclass
 class FeatureScoreGrid:
     score: np.ndarray
@@ -121,321 +98,234 @@ class FeatureScoreGrid:
 
 
 @dataclass
-class FeatureRowTiming:
-    matches: List[FeatureMatchTiming] = field(default_factory=list)
-    logical_pairs: int = 0
-    crop_features: int = 0
-    crop_feature_seconds: float = 0.0
-
-
-@dataclass
 class FeatureRowAlignmentResult:
     text_row_idx: int
     det_row_idx: int
-    baseline: Tuple[float, float]
-    anchors: Dict[int, int]
-    unmatched_text_indices: List[int]
-    candidates: List[SlidingWindow]
+    anchors: dict[int, int]
+    unmatched_text_indices: list[int]
+    candidates: list[SlidingWindow]
     scores: FeatureScoreGrid
-    timing: FeatureRowTiming
-    assignments: List[FeatureSignAssignment]
-
-    @property
-    def score_matrix(self) -> np.ndarray:
-        return self.scores.score
+    assignments: list[FeatureSignAssignment]
 
 
 @dataclass
 class FeatureCoarseRun:
-    rows: Dict[int, FeatureRowAlignmentResult]
-    window_size: Tuple[int, int]
-    total_seconds: float
+    config: FeatureCoarseAlignmentConfig
+    rows: dict[int, FeatureRowAlignmentResult]
+    window_size: tuple[int, int]
 
     @property
-    def timing(self) -> Dict[str, object]:
-        match_seconds = [
-            item.elapsed_seconds
+    def assignments(self) -> list[FeatureSignAssignment]:
+        return [
+            assignment
             for row in self.rows.values()
-            for item in row.timing.matches
+            for assignment in row.assignments
         ]
-        computed_pairs = len(match_seconds)
-        logical_pairs = sum(row.timing.logical_pairs for row in self.rows.values())
-        total_match_seconds = float(sum(match_seconds))
-        return {
-            "logical_score_pair_count": logical_pairs,
-            "computed_pair_count": computed_pairs,
-            "cached_pair_count": logical_pairs - computed_pairs,
-            "match_total_seconds": total_match_seconds,
-            "match_mean_seconds": (
-                total_match_seconds / computed_pairs if computed_pairs else 0.0
-            ),
-            "match_min_seconds": min(match_seconds, default=0.0),
-            "match_max_seconds": max(match_seconds, default=0.0),
-            "crop_feature_count": sum(
-                row.timing.crop_features for row in self.rows.values()
-            ),
-            "crop_feature_total_seconds": float(sum(
-                row.timing.crop_feature_seconds for row in self.rows.values()
-            )),
-            "coarse_alignment_total_seconds": self.total_seconds,
-        }
 
 
-def align_text_rows_with_feature_search(context: CropContext) -> None:
-    """Coarsely align unmatched text signs using DIFT sliding-window scores."""
-    _FeatureCoarseAligner(context).run()
+def get_feature_coarse_run(
+    context: base.CropContext,
+    *,
+    required: bool = True,
+) -> Optional[FeatureCoarseRun]:
+    run = context.state.extras.get(RESULT_KEY)
+    if run is None and required:
+        raise RuntimeError("feature coarse alignment has not been run")
+    return run  # type: ignore[return-value]
+
+
+def align_text_rows_with_feature_search(
+    context: base.CropContext,
+    config: Optional[FeatureCoarseAlignmentConfig] = None,
+) -> FeatureCoarseRun:
+    """Replace the base coarse-alignment step with DIFT window search."""
+
+    run = _FeatureCoarseAligner(
+        context,
+        config or FeatureCoarseAlignmentConfig(),
+    ).run()
+    context.state.extras[RESULT_KEY] = run
+    return run
 
 
 class _FeatureCoarseAligner:
-    def __init__(self, context: CropContext):
+    def __init__(
+        self,
+        context: base.CropContext,
+        config: FeatureCoarseAlignmentConfig,
+    ) -> None:
+        if context.dift is None:
+            raise ValueError("CropContext.dift is required")
+        if context.dift.source is None:
+            raise ValueError("DiftRuntime.source must be set")
+
         self.context = context
         self.state = context.state
-        self.config = context.feature_coarse_alignment
+        self.config = config
         self.runtime = context.dift
-        self.source = self.runtime.source
-        if self.source is None:
-            raise ValueError("DiftRuntime.source must be set")
-        self.period = base._source_period(context)
-        self.window_width = int(round(
-            self.config.window_width
-            if self.config.window_width is not None
-            else self.state.detections.avg_width
-        ))
-        self.window_height = int(round(
-            self.config.window_height
-            if self.config.window_height is not None
-            else self.state.detections.avg_height
-        ))
+        self.source = context.dift.source
+        self.period = base.source_period(context)
+        self.window_width = _window_dimension(
+            config.window_width,
+            self.state.detections.avg_width,
+        )
+        self.window_height = _window_dimension(
+            config.window_height,
+            self.state.detections.avg_height,
+        )
 
-    def run(self) -> None:
-        _synchronize_cuda()
-        started = time.perf_counter()
-        s = self.state
-        det_rows = s.det_rows.as_dict()
-        text_rows = s.text_rows.as_dict()
-        aligned_boxes = Boxes(tablet=s.crop_tablet)
-        aligned_row_indices = [[] for _ in range(len(s.text_rows))]
-        results: Dict[int, FeatureRowAlignmentResult] = {}
+    def run(self) -> FeatureCoarseRun:
+        state = self.state
+        det_rows = state.det_rows.as_dict()
+        text_rows = state.text_rows.as_dict()
+        aligned_boxes = Boxes(tablet=state.crop_tablet)
+        aligned_indices = [[] for _ in range(len(state.text_rows))]
+        results = {}
 
-        for text_row_idx in sorted(s.row_sign_matches):
-            if text_row_idx not in s.text_to_det:
+        for text_row_idx in sorted(state.row_sign_matches):
+            det_row_idx = state.text_to_det.get(text_row_idx)
+            if det_row_idx is None:
                 continue
-            det_row_idx = s.text_to_det[text_row_idx]
-            text_boxes = text_rows[text_row_idx]
-            det_boxes = det_rows[det_row_idx]
-            result, row_boxes = self.align_row(
+            result, row_boxes = self._align_row(
                 text_row_idx,
                 det_row_idx,
-                text_boxes,
-                det_boxes,
+                text_rows[text_row_idx],
+                det_rows[det_row_idx],
             )
             results[text_row_idx] = result
             for box in row_boxes:
-                aligned_row_indices[text_row_idx].append(len(aligned_boxes))
+                aligned_indices[text_row_idx].append(len(aligned_boxes))
                 aligned_boxes.append(box)
 
-        _synchronize_cuda()
-        s.aligned_boxes = aligned_boxes
-        s.aligned_rows = base.BoxRows(aligned_boxes, aligned_row_indices)
-        s.feature_coarse = FeatureCoarseRun(
+        state.aligned_boxes = aligned_boxes
+        state.aligned_rows = base.BoxRows(aligned_boxes, aligned_indices)
+        return FeatureCoarseRun(
+            config=self.config,
             rows=results,
             window_size=(self.window_width, self.window_height),
-            total_seconds=time.perf_counter() - started,
         )
 
-    def align_row(
+    def _align_row(
         self,
         text_row_idx: int,
         det_row_idx: int,
-        text_boxes: List[Box],
-        det_boxes: List[Box],
-    ) -> Tuple[FeatureRowAlignmentResult, List[Box]]:
+        text_boxes: list[Box],
+        det_boxes: list[Box],
+    ) -> tuple[FeatureRowAlignmentResult, list[Box]]:
         sign_matches = self.state.row_sign_matches[text_row_idx]
         anchors = _exact_anchor_map(text_boxes, det_boxes, sign_matches)
         unmatched = [idx for idx in range(len(text_boxes)) if idx not in anchors]
-        baseline = _fit_row_baseline(det_boxes)
         expected_centers = _expected_text_centers(
             len(text_boxes),
             anchors,
             det_boxes,
-            float(self.window_width),
+            self.window_width,
         )
         candidates = _build_sliding_windows(
-            unmatched,
-            anchors,
-            {text_idx: det_boxes[det_idx] for text_idx, det_idx in anchors.items()},
-            expected_centers,
-            baseline,
-            self.state.crop_tablet.img.shape[:2],
-            (self.window_width, self.window_height),
-            self.config.step_px,
-            self.config.search_margin_px,
-            self.config.max_candidates_per_row,
+            unmatched_text_indices=unmatched,
+            anchors=anchors,
+            anchor_boxes={
+                text_idx: det_boxes[det_idx]
+                for text_idx, det_idx in anchors.items()
+            },
+            expected_centers=expected_centers,
+            baseline=_fit_row_baseline(det_boxes),
+            image_shape=self.state.crop_tablet.img.shape[:2],
+            window_size=(self.window_width, self.window_height),
+            step_px=self.config.step_px,
+            margin_px=self.config.search_margin_px,
+            max_candidates=self.config.max_candidates_per_row,
         )
-        print(
-            f"  [Feature coarse] text row {text_row_idx} -> det row {det_row_idx}: "
-            f"{len(anchors)} anchors, {len(unmatched)} unmatched signs, "
-            f"{len(candidates)} crop windows"
-        )
-
-        scores, timing = self.score_candidates(
-            text_boxes,
-            unmatched,
-            candidates,
-            progress_label=f"text row {text_row_idx}",
-        )
+        scores = self._score_candidates(text_boxes, unmatched, candidates)
         selected = _ordered_score_assignment(
             unmatched,
             candidates,
             scores.score,
             self.config.assignment_min_score,
         )
-        fallback_boxes = base.align_text_row_to_detection(
+        fallback_boxes = align_text_row_to_detection(
             text_boxes=text_boxes,
             det_boxes=det_boxes,
             matches=sign_matches,
-            avg_width=float(self.window_width),
-            avg_height=float(self.window_height),
+            avg_width=self.window_width,
+            avg_height=self.window_height,
         )
-        unmatched_rows = {
-            text_idx: matrix_row
-            for matrix_row, text_idx in enumerate(unmatched)
-        }
-        assignments: List[FeatureSignAssignment] = []
-        row_boxes: List[Box] = []
 
+        matrix_rows = {text_idx: row for row, text_idx in enumerate(unmatched)}
+        assignments = []
         for text_idx, text_box in enumerate(text_boxes):
             if text_idx in anchors:
-                det_box = det_boxes[anchors[text_idx]]
-                box = Box(
-                    x1=det_box.x1,
-                    y1=det_box.y1,
-                    x2=det_box.x2,
-                    y2=det_box.y2,
-                    candidates=[SignCandidate(
-                        sign=text_box.sign,
-                        score=det_box.score,
-                    )],
-                    tablet=text_box.tablet,
-                )
-                assignment = FeatureSignAssignment(
+                assignment = _anchor_assignment(
                     text_idx,
-                    text_box.sign_name,
-                    "anchor",
-                    box,
-                    score=1.0,
+                    text_box,
+                    det_boxes[anchors[text_idx]],
                 )
             elif text_idx in selected:
                 candidate_idx = selected[text_idx]
-                candidate = candidates[candidate_idx]
-                matrix_row = unmatched_rows[text_idx]
-                score = float(scores.score[matrix_row, candidate_idx])
-                box = Box(
-                    x1=candidate.x1,
-                    y1=candidate.y1,
-                    x2=candidate.x2,
-                    y2=candidate.y2,
-                    candidates=[SignCandidate(
-                        sign=text_box.sign,
-                        score=score,
-                    )],
-                    tablet=text_box.tablet,
-                )
-                assignment = FeatureSignAssignment(
+                assignment = _feature_assignment(
                     text_idx,
-                    text_box.sign_name,
-                    "feature",
-                    box,
-                    score=score,
-                    geometry=float(scores.geometry[matrix_row, candidate_idx]),
-                    support=float(scores.support[matrix_row, candidate_idx]),
-                    inlier_score=float(scores.inlier_score[matrix_row, candidate_idx]),
-                    n_matches=int(scores.matches[matrix_row, candidate_idx]),
-                    n_inliers=int(scores.inliers[matrix_row, candidate_idx]),
-                    candidate_idx=candidate_idx,
+                    text_box,
+                    candidate_idx,
+                    candidates[candidate_idx],
+                    scores,
+                    matrix_rows[text_idx],
                 )
             else:
-                box = fallback_boxes[text_idx]
                 assignment = FeatureSignAssignment(
-                    text_idx,
-                    text_box.sign_name,
-                    "fallback",
-                    box,
+                    text_idx=text_idx,
+                    sign_name=text_box.sign_name,
+                    source="fallback",
+                    box=fallback_boxes[text_idx],
                 )
             assignments.append(assignment)
-            row_boxes.append(box)
 
         return FeatureRowAlignmentResult(
             text_row_idx=text_row_idx,
             det_row_idx=det_row_idx,
-            baseline=baseline,
             anchors=anchors,
             unmatched_text_indices=unmatched,
             candidates=candidates,
             scores=scores,
-            timing=timing,
             assignments=assignments,
-        ), row_boxes
+        ), [assignment.box for assignment in assignments]
 
-    def score_candidates(
+    def _score_candidates(
         self,
-        text_boxes: List[Box],
-        unmatched: List[int],
-        candidates: List[SlidingWindow],
-        progress_label: str,
-    ) -> Tuple[FeatureScoreGrid, FeatureRowTiming]:
+        text_boxes: list[Box],
+        unmatched: list[int],
+        candidates: list[SlidingWindow],
+    ) -> FeatureScoreGrid:
         scores = FeatureScoreGrid.empty(len(unmatched), len(candidates))
-        timing = FeatureRowTiming()
         if not unmatched or not candidates:
-            return scores, timing
+            return scores
 
-        source_items = []
+        source_by_sign = {}
         for text_idx in unmatched:
             sign = text_boxes[text_idx].sign
-            source_img = self.source.get(sign.name, self.period)
-            source_feature = self.runtime.get_sign_feature(sign, self.period)
-            source_items.append((source_img, source_feature))
-        available = sum(
-            source_img is not None and source_feature is not None
-            for source_img, source_feature in source_items
-        )
-        timing.logical_pairs = available * len(candidates)
-        if not available:
-            return scores, timing
+            if sign.name not in source_by_sign:
+                source_by_sign[sign.name] = (
+                    self.source.get(sign.name, self.period),
+                    self.runtime.get_sign_feature(sign, self.period),
+                )
 
         for candidate_idx, candidate in enumerate(candidates):
-            crop_box = Box(
-                x1=candidate.x1,
-                y1=candidate.y1,
-                x2=candidate.x2,
-                y2=candidate.y2,
-                candidates=[SignCandidate(
-                    sign=text_boxes[unmatched[0]].sign,
-                    score=1.0,
-                )],
-                tablet=self.state.crop_tablet,
-            )
-            crop = crop_box.crop_image()
-            _synchronize_cuda()
-            started = time.perf_counter()
-            crop_features = self.runtime.featurize_image(crop)
-            _synchronize_cuda()
-            timing.crop_feature_seconds += time.perf_counter() - started
-            timing.crop_features += 1
-
+            crop = _window_box(
+                candidate,
+                text_boxes[unmatched[0]],
+                self.state.crop_tablet,
+            ).crop_image()
+            crop_feature = self.runtime.featurize_image(crop)
             matches_by_sign = {}
+
             for matrix_row, text_idx in enumerate(unmatched):
-                source_img, source_feature = source_items[matrix_row]
+                sign_name = text_boxes[text_idx].sign_name
+                source_img, source_feature = source_by_sign[sign_name]
                 if source_img is None or source_feature is None:
                     continue
-                sign_name = text_boxes[text_idx].sign_name
-                result = matches_by_sign.get(sign_name)
-                if result is None:
-                    _synchronize_cuda()
-                    started = time.perf_counter()
-                    result = self.runtime.match(
+                if sign_name not in matches_by_sign:
+                    matches_by_sign[sign_name] = self.runtime.match(
                         source_feature,
-                        crop_features,
+                        crop_feature,
                         source_img.shape[:2],
                         crop.shape[:2],
                         self.config.match,
@@ -444,47 +334,93 @@ class _FeatureCoarseAligner:
                             source_feature.shape[-2:],
                         ),
                     )
-                    _synchronize_cuda()
-                    matches_by_sign[sign_name] = result
-                    timing.matches.append(FeatureMatchTiming(
-                        candidate_idx=candidate_idx,
-                        text_idx=text_idx,
-                        sign_name=sign_name,
-                        elapsed_seconds=time.perf_counter() - started,
-                        score=result.coarse_score,
-                        n_matches=result.n_matches,
-                        n_inliers=result.n_inliers,
-                        message=result.message,
-                    ))
-
+                result = matches_by_sign[sign_name]
                 scores.score[matrix_row, candidate_idx] = result.coarse_score
                 scores.geometry[matrix_row, candidate_idx] = result.geometry_score
                 scores.support[matrix_row, candidate_idx] = result.support_score
                 scores.inlier_score[matrix_row, candidate_idx] = result.inlier_score
                 scores.matches[matrix_row, candidate_idx] = result.n_matches
                 scores.inliers[matrix_row, candidate_idx] = result.n_inliers
+        return scores
 
-            completed = candidate_idx + 1
-            if (
-                self.config.progress_every > 0
-                and (
-                    completed % self.config.progress_every == 0
-                    or completed == len(candidates)
-                )
-            ):
-                print(
-                    f"    [Feature coarse] {progress_label}: "
-                    f"scored {completed}/{len(candidates)} windows"
-                )
 
-        return scores, timing
+def _window_dimension(configured: Optional[float], fallback: float) -> int:
+    return max(1, int(round(fallback if configured is None else configured)))
+
+
+def _window_box(
+    window: SlidingWindow,
+    text_box: Box,
+    tablet,
+) -> Box:
+    return Box(
+        x1=window.x1,
+        y1=window.y1,
+        x2=window.x2,
+        y2=window.y2,
+        candidates=[SignCandidate(sign=text_box.sign, score=1.0)],
+        tablet=tablet,
+    )
+
+
+def _anchor_assignment(
+    text_idx: int,
+    text_box: Box,
+    det_box: Box,
+) -> FeatureSignAssignment:
+    box = Box(
+        x1=det_box.x1,
+        y1=det_box.y1,
+        x2=det_box.x2,
+        y2=det_box.y2,
+        candidates=[SignCandidate(sign=text_box.sign, score=det_box.score)],
+        tablet=text_box.tablet,
+    )
+    return FeatureSignAssignment(
+        text_idx=text_idx,
+        sign_name=text_box.sign_name,
+        source="anchor",
+        box=box,
+        score=1.0,
+    )
+
+
+def _feature_assignment(
+    text_idx: int,
+    text_box: Box,
+    candidate_idx: int,
+    candidate: SlidingWindow,
+    scores: FeatureScoreGrid,
+    matrix_row: int,
+) -> FeatureSignAssignment:
+    score = float(scores.score[matrix_row, candidate_idx])
+    return FeatureSignAssignment(
+        text_idx=text_idx,
+        sign_name=text_box.sign_name,
+        source="feature",
+        box=Box(
+            x1=candidate.x1,
+            y1=candidate.y1,
+            x2=candidate.x2,
+            y2=candidate.y2,
+            candidates=[SignCandidate(sign=text_box.sign, score=score)],
+            tablet=text_box.tablet,
+        ),
+        score=score,
+        geometry=float(scores.geometry[matrix_row, candidate_idx]),
+        support=float(scores.support[matrix_row, candidate_idx]),
+        inlier_score=float(scores.inlier_score[matrix_row, candidate_idx]),
+        n_matches=int(scores.matches[matrix_row, candidate_idx]),
+        n_inliers=int(scores.inliers[matrix_row, candidate_idx]),
+        candidate_idx=candidate_idx,
+    )
 
 
 def _exact_anchor_map(
-    text_boxes: List[Box],
-    det_boxes: List[Box],
-    sign_matches: List[Tuple[int, int]],
-) -> Dict[int, int]:
+    text_boxes: list[Box],
+    det_boxes: list[Box],
+    sign_matches: list[tuple[int, int]],
+) -> dict[int, int]:
     return {
         text_idx: det_idx
         for text_idx, det_idx in sign_matches
@@ -492,7 +428,7 @@ def _exact_anchor_map(
     }
 
 
-def _fit_row_baseline(det_boxes: List[Box]) -> Tuple[float, float]:
+def _fit_row_baseline(det_boxes: list[Box]) -> tuple[float, float]:
     if len(det_boxes) >= 2:
         xs = np.asarray([box.cx for box in det_boxes], dtype=np.float64)
         ys = np.asarray([box.cy for box in det_boxes], dtype=np.float64)
@@ -504,19 +440,16 @@ def _fit_row_baseline(det_boxes: List[Box]) -> Tuple[float, float]:
 
 def _expected_text_centers(
     num_text: int,
-    anchors: Dict[int, int],
-    det_boxes: List[Box],
+    anchors: dict[int, int],
+    det_boxes: list[Box],
     avg_width: float,
 ) -> np.ndarray:
     indices = np.arange(num_text, dtype=np.float64)
     anchor_items = sorted(anchors.items())
     if len(anchor_items) >= 2:
-        text_idx = np.asarray([item[0] for item in anchor_items], dtype=np.float64)
-        det_x = np.asarray(
-            [det_boxes[item[1]].cx for item in anchor_items],
-            dtype=np.float64,
-        )
-        slope, intercept = np.polyfit(text_idx, det_x, 1)
+        text_indices = np.asarray([item[0] for item in anchor_items])
+        detection_x = np.asarray([det_boxes[item[1]].cx for item in anchor_items])
+        slope, intercept = np.polyfit(text_indices, detection_x, 1)
         return slope * indices + intercept
 
     spacing = _estimated_detection_spacing(det_boxes, avg_width)
@@ -524,15 +457,11 @@ def _expected_text_centers(
         text_idx, det_idx = anchor_items[0]
         return det_boxes[det_idx].cx + (indices - text_idx) * spacing
 
-    det_center = float(np.mean([box.cx for box in det_boxes]))
-    text_center = (num_text - 1) / 2.0
-    return det_center + (indices - text_center) * spacing
+    detection_center = float(np.mean([box.cx for box in det_boxes]))
+    return detection_center + (indices - (num_text - 1) / 2.0) * spacing
 
 
-def _estimated_detection_spacing(
-    det_boxes: List[Box],
-    fallback: float,
-) -> float:
+def _estimated_detection_spacing(det_boxes: list[Box], fallback: float) -> float:
     centers = np.sort(np.asarray([box.cx for box in det_boxes], dtype=np.float64))
     gaps = np.diff(centers)
     gaps = gaps[gaps > 1e-6]
@@ -540,64 +469,52 @@ def _estimated_detection_spacing(
 
 
 def _build_sliding_windows(
-    unmatched_text_indices: List[int],
-    anchors: Dict[int, int],
-    anchor_boxes: Dict[int, Box],
+    unmatched_text_indices: list[int],
+    anchors: dict[int, int],
+    anchor_boxes: dict[int, Box],
     expected_centers: np.ndarray,
-    baseline: Tuple[float, float],
-    image_shape: Tuple[int, int],
-    window_size: Tuple[int, int],
+    baseline: tuple[float, float],
+    image_shape: tuple[int, int],
+    window_size: tuple[int, int],
     step_px: float,
     margin_px: float,
     max_candidates: Optional[int],
-) -> List[SlidingWindow]:
+) -> list[SlidingWindow]:
     if not unmatched_text_indices:
         return []
 
     image_h, image_w = image_shape
     window_w, window_h = window_size
-    min_cx = window_w / 2.0
-    max_cx = image_w - window_w / 2.0
-    min_cy = window_h / 2.0
-    max_cy = image_h - window_h / 2.0
+    min_cx, max_cx = window_w / 2.0, image_w - window_w / 2.0
+    min_cy, max_cy = window_h / 2.0, image_h - window_h / 2.0
     if max_cx < min_cx or max_cy < min_cy:
         return []
 
     slope, intercept = baseline
-    windows: List[SlidingWindow] = []
-    runs = _contiguous_runs(unmatched_text_indices)
-    for text_start, text_end in runs:
-        left_anchor_idx = text_start - 1 if text_start - 1 in anchors else None
-        right_anchor_idx = text_end + 1 if text_end + 1 in anchors else None
+    windows = []
+    for text_start, text_end in _contiguous_runs(unmatched_text_indices):
+        start_x = float(expected_centers[text_start:text_end + 1].min() - margin_px)
+        end_x = float(expected_centers[text_start:text_end + 1].max() + margin_px)
+        if text_start - 1 in anchors:
+            start_x = max(
+                start_x,
+                anchor_boxes[text_start - 1].cx + step_px / 2.0,
+            )
+        if text_end + 1 in anchors:
+            end_x = min(
+                end_x,
+                anchor_boxes[text_end + 1].cx - step_px / 2.0,
+            )
 
-        start_x = float(
-            np.min(expected_centers[text_start:text_end + 1]) - margin_px
-        )
-        if left_anchor_idx is not None:
-            left_box = anchor_boxes[left_anchor_idx]
-            start_x = max(start_x, float(left_box.cx + step_px / 2.0))
-
-        end_x = float(
-            np.max(expected_centers[text_start:text_end + 1]) + margin_px
-        )
-        if right_anchor_idx is not None:
-            right_box = anchor_boxes[right_anchor_idx]
-            end_x = min(end_x, float(right_box.cx - step_px / 2.0))
-
-        start_x = max(min_cx, start_x)
-        end_x = min(max_cx, end_x)
-        positions = _sample_interval(
-            start_x,
-            end_x,
+        for cx in _sample_interval(
+            max(min_cx, start_x),
+            min(max_cx, end_x),
             step_px,
             origin=float(expected_centers[text_start]),
-        )
-        for cx in positions:
+        ):
             cy = float(np.clip(slope * cx + intercept, min_cy, max_cy))
-            x1 = int(round(cx - window_w / 2.0))
-            y1 = int(round(cy - window_h / 2.0))
-            x1 = min(max(0, x1), image_w - window_w)
-            y1 = min(max(0, y1), image_h - window_h)
+            x1 = min(max(0, int(round(cx - window_w / 2.0))), image_w - window_w)
+            y1 = min(max(0, int(round(cy - window_h / 2.0))), image_h - window_h)
             windows.append(SlidingWindow(
                 x1=x1,
                 y1=y1,
@@ -609,322 +526,185 @@ def _build_sliding_windows(
                 text_end=text_end,
             ))
 
-    deduplicated = {
-        (window.x1, window.y1, window.x2, window.y2,
-         window.text_start, window.text_end): window
-        for window in windows
+    unique = {
+        (w.x1, w.y1, w.x2, w.y2, w.text_start, w.text_end): w
+        for w in windows
     }
-    windows = sorted(
-        deduplicated.values(),
-        key=lambda window: (window.cx, window.cy),
-    )
+    windows = sorted(unique.values(), key=lambda window: (window.cx, window.cy))
     if max_candidates is not None and len(windows) > max_candidates:
-        keep = np.linspace(
-            0, len(windows) - 1, max_candidates, dtype=np.int64
-        )
+        keep = np.linspace(0, len(windows) - 1, max_candidates, dtype=np.int64)
         windows = [windows[idx] for idx in keep]
     return windows
 
 
-def _contiguous_runs(indices: List[int]) -> List[Tuple[int, int]]:
+def _contiguous_runs(indices: list[int]) -> list[tuple[int, int]]:
     if not indices:
         return []
-    runs: List[Tuple[int, int]] = []
+    runs = []
     start = previous = indices[0]
     for value in indices[1:]:
         if value != previous + 1:
             runs.append((start, previous))
             start = value
         previous = value
-    runs.append((start, previous))
-    return runs
+    return runs + [(start, previous)]
 
 
 def _sample_interval(
     start: float,
     end: float,
     step: float,
-    origin: Optional[float] = None,
-) -> List[float]:
+    origin: float,
+) -> list[float]:
     if end < start:
         return []
-    if origin is None:
-        origin = start
-    first_k = int(np.ceil((start - origin) / step))
-    last_k = int(np.floor((end - origin) / step))
-    if first_k > last_k:
+    first = int(np.ceil((start - origin) / step))
+    last = int(np.floor((end - origin) / step))
+    if first > last:
         return [(start + end) / 2.0]
-    return [
-        float(origin + k * step)
-        for k in range(first_k, last_k + 1)
-    ]
-
-
-def _synchronize_cuda() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    return [float(origin + idx * step) for idx in range(first, last + 1)]
 
 
 def _ordered_score_assignment(
-    text_indices: List[int],
-    candidates: List[SlidingWindow],
+    text_indices: list[int],
+    candidates: list[SlidingWindow],
     score_matrix: np.ndarray,
     min_score: float,
-) -> Dict[int, int]:
-    """Maximize assignment count, then score, preserving left-to-right order."""
-    num_text = len(text_indices)
-    num_candidates = len(candidates)
-    if num_text == 0 or num_candidates == 0:
+) -> dict[int, int]:
+    """Maximize assignment count, then score, from left to right."""
+
+    text_count, candidate_count = len(text_indices), len(candidates)
+    if not text_count or not candidate_count:
         return {}
 
-    dp_score = np.full(
-        (num_text + 1, num_candidates + 1), -np.inf, dtype=np.float64
-    )
-    dp_count = np.full(
-        (num_text + 1, num_candidates + 1), -1, dtype=np.int32
-    )
-    back: Dict[Tuple[int, int], Tuple[int, int, str]] = {}
-    dp_score[0, 0] = 0.0
-    dp_count[0, 0] = 0
+    scores = np.full((text_count + 1, candidate_count + 1), -np.inf)
+    counts = np.full((text_count + 1, candidate_count + 1), -1, dtype=np.int32)
+    back = {}
+    scores[0, 0], counts[0, 0] = 0.0, 0
 
-    for i in range(num_text + 1):
-        for j in range(num_candidates + 1):
-            if not np.isfinite(dp_score[i, j]):
+    def update(source, target, score_delta, count_delta, action):
+        source_i, source_j = source
+        target_i, target_j = target
+        score = scores[source_i, source_j] + score_delta
+        count = counts[source_i, source_j] + count_delta
+        if (
+            count > counts[target_i, target_j]
+            or (
+                count == counts[target_i, target_j]
+                and score > scores[target_i, target_j] + 1e-12
+            )
+        ):
+            scores[target_i, target_j] = score
+            counts[target_i, target_j] = count
+            back[target] = (*source, action)
+
+    for i in range(text_count + 1):
+        for j in range(candidate_count + 1):
+            if not np.isfinite(scores[i, j]):
                 continue
-            if i < num_text:
-                _update_dp(
-                    dp_score, dp_count, back,
-                    source=(i, j), target=(i + 1, j),
-                    score_delta=0.0, count_delta=0, action="skip_text",
-                )
-            if j < num_candidates:
-                _update_dp(
-                    dp_score, dp_count, back,
-                    source=(i, j), target=(i, j + 1),
-                    score_delta=0.0, count_delta=0, action="skip_candidate",
-                )
-            if i < num_text and j < num_candidates:
+            if i < text_count:
+                update((i, j), (i + 1, j), 0.0, 0, "skip_text")
+            if j < candidate_count:
+                update((i, j), (i, j + 1), 0.0, 0, "skip_candidate")
+            if i < text_count and j < candidate_count:
                 text_idx = text_indices[i]
                 candidate = candidates[j]
                 score = float(score_matrix[i, j])
-                allowed = (
+                if (
                     candidate.text_start <= text_idx <= candidate.text_end
                     and score > min_score
-                )
-                if allowed:
-                    _update_dp(
-                        dp_score, dp_count, back,
-                        source=(i, j), target=(i + 1, j + 1),
-                        score_delta=score, count_delta=1, action="assign",
-                    )
+                ):
+                    update((i, j), (i + 1, j + 1), score, 1, "assign")
 
-    selected: Dict[int, int] = {}
-    i, j = num_text, num_candidates
-    while (i, j) != (0, 0):
-        previous = back.get((i, j))
-        if previous is None:
-            break
-        prev_i, prev_j, action = previous
+    selected = {}
+    position = (text_count, candidate_count)
+    while position != (0, 0) and position in back:
+        previous_i, previous_j, action = back[position]
         if action == "assign":
-            selected[text_indices[prev_i]] = prev_j
-        i, j = prev_i, prev_j
+            selected[text_indices[previous_i]] = previous_j
+        position = previous_i, previous_j
     return selected
 
 
-def _update_dp(
-    dp_score: np.ndarray,
-    dp_count: np.ndarray,
-    back: Dict[Tuple[int, int], Tuple[int, int, str]],
-    source: Tuple[int, int],
-    target: Tuple[int, int],
-    score_delta: float,
-    count_delta: int,
-    action: str,
-) -> None:
-    source_i, source_j = source
-    target_i, target_j = target
-    score = dp_score[source_i, source_j] + score_delta
-    count = dp_count[source_i, source_j] + count_delta
-    old_score = dp_score[target_i, target_j]
-    old_count = dp_count[target_i, target_j]
-    more_assignments = count > old_count
-    tied_but_better = count == old_count and score > old_score + 1e-12
-    if more_assignments or tied_but_better:
-        dp_score[target_i, target_j] = score
-        dp_count[target_i, target_j] = count
-        back[(target_i, target_j)] = (source_i, source_j, action)
-
-
 def vis_feature_coarse_alignment(
-    context: CropContext,
-    vis: VisOptions,
+    context: base.CropContext,
+    vis: base.VisOptions,
 ) -> None:
-    s = context.state
-    run: Optional[FeatureCoarseRun] = s.feature_coarse
-    row_results = run.rows if run else {}
-    if not row_results:
+    run = get_feature_coarse_run(context, required=False)
+    if run is None or not run.rows:
         if vis.info:
-            print("=== Feature coarse alignment: no row results ===")
-            if run:
-                print(
-                    f"whole coarse step={run.total_seconds:.3f}s"
-                )
+            print("=== DIFT coarse alignment: no matched rows ===")
         return
 
-    overlay = _render_feature_coarse_overlay(context, row_results)
+    overlay = _render_overlay(context, run)
     if vis.info:
-        config = context.feature_coarse_alignment
-        print("=== Experimental Feature Coarse Alignment ===")
+        counts = {source: 0 for source in ("anchor", "feature", "fallback")}
+        for assignment in run.assignments:
+            counts[assignment.source] += 1
+        print("=== DIFT Sliding-Window Coarse Alignment ===")
         print(
-            f"score = sqrt(relaxed IoU * angle) * support; step="
-            f"{config.step_px:.0f}px; "
-            f"window={run.window_size[0]}x{run.window_size[1]}"
-        )
-        for text_row_idx, result in sorted(row_results.items()):
-            feature_assignments = [
-                item for item in result.assignments if item.source == "feature"
-            ]
-            fallback_assignments = [
-                item for item in result.assignments if item.source == "fallback"
-            ]
-            print(
-                f"  Text row {text_row_idx} -> Det row {result.det_row_idx}: "
-                f"anchors={len(result.anchors)}, "
-                f"unmatched={len(result.unmatched_text_indices)}, "
-                f"windows={len(result.candidates)}, "
-                f"feature={len(feature_assignments)}, "
-                f"fallback={len(fallback_assignments)}"
-            )
-            row_match_seconds = sum(
-                timing.elapsed_seconds for timing in result.timing.matches
-            )
-            row_computed_count = len(result.timing.matches)
-            row_match_mean = (
-                row_match_seconds / row_computed_count
-                if row_computed_count
-                else 0.0
-            )
-            print(
-                f"    timing: logical pairs="
-                f"{result.timing.logical_pairs}, "
-                f"computed pairs={row_computed_count}, "
-                f"match total={row_match_seconds:.3f}s, "
-                f"match mean={row_match_mean:.3f}s, "
-                f"crop features={result.timing.crop_features} in "
-                f"{result.timing.crop_feature_seconds:.3f}s"
-            )
-            if config.print_match_timings:
-                for timing in result.timing.matches:
-                    candidate = result.candidates[timing.candidate_idx]
-                    status = timing.message or "ok"
-                    print(
-                        f"      pair crop[{timing.candidate_idx}] "
-                        f"({candidate.x1},{candidate.y1},"
-                        f"{candidate.x2},{candidate.y2}) x "
-                        f"text[{timing.text_idx}] {timing.sign_name}: "
-                        f"{timing.elapsed_seconds * 1000.0:.2f} ms, "
-                        f"score={timing.score:.3f}, "
-                        f"inliers={timing.n_inliers}/{timing.n_matches}, "
-                        f"{status}"
-                    )
-            for item in feature_assignments:
-                print(
-                    f"    text[{item.text_idx}] {item.sign_name}: "
-                    f"score={item.score:.3f} "
-                    f"(geometry={item.geometry:.3f}, "
-                    f"support={item.support:.3f}, "
-                    f"inlier_score={item.inlier_score:.3f}, "
-                    f"inliers={item.n_inliers}/{item.n_matches})"
-                )
-        timing_summary = run.timing
-        print("=== Feature Coarse Timing Summary ===")
-        print(
-            f"logical score pairs="
-            f"{timing_summary['logical_score_pair_count']}, "
-            f"computed pairs={timing_summary['computed_pair_count']}, "
-            f"cache reuses={timing_summary['cached_pair_count']}"
+            f"  window={run.window_size[0]}x{run.window_size[1]}, "
+            f"step={run.config.step_px:g}px, rows={len(run.rows)}"
         )
         print(
-            f"match total={timing_summary['match_total_seconds']:.3f}s, "
-            f"mean={timing_summary['match_mean_seconds'] * 1000.0:.2f}ms, "
-            f"min={timing_summary['match_min_seconds'] * 1000.0:.2f}ms, "
-            f"max={timing_summary['match_max_seconds'] * 1000.0:.2f}ms"
+            f"  anchors={counts['anchor']}, feature={counts['feature']}, "
+            f"fallback={counts['fallback']}"
         )
-        print(
-            f"crop feature extraction: "
-            f"{timing_summary['crop_feature_count']} crops in "
-            f"{timing_summary['crop_feature_total_seconds']:.3f}s; "
-            f"whole coarse step="
-            f"{timing_summary['coarse_alignment_total_seconds']:.3f}s"
-        )
-
     if vis.save:
         cv2.imwrite(
-            base._out(context, "feature_coarse_alignment.jpg"),
+            base.output_path(context, "feature_coarse_alignment.jpg"),
             overlay,
             [cv2.IMWRITE_JPEG_QUALITY, 92],
         )
     if vis.display:
-        base._display_bgr(
-            overlay,
-            "Experimental DIFT sliding-window coarse alignment",
-        )
-    if vis.display or vis.save:
-        _plot_score_matrices(context, row_results, vis)
+        base._display_bgr(overlay, "DIFT sliding-window coarse alignment")
 
 
-def _render_feature_coarse_overlay(
-    context: CropContext,
-    row_results: Dict[int, FeatureRowAlignmentResult],
+def _render_overlay(
+    context: base.CropContext,
+    run: FeatureCoarseRun,
 ) -> np.ndarray:
-    overlay = _to_bgr(context.state.crop_tablet.img).copy()
-    for text_row_idx, result in sorted(row_results.items()):
-        for candidate in result.candidates:
+    image = _to_bgr(context.state.crop_tablet.img).copy()
+    for row_result in run.rows.values():
+        for candidate in row_result.candidates:
             cv2.rectangle(
-                overlay,
+                image,
                 (candidate.x1, candidate.y1),
                 (candidate.x2, candidate.y2),
                 (100, 100, 100),
                 1,
                 cv2.LINE_AA,
             )
-        for assignment in result.assignments:
+        for assignment in row_result.assignments:
             color = {
                 "anchor": (80, 220, 80),
                 "feature": (0, 165, 255),
                 "fallback": (255, 220, 0),
             }[assignment.source]
             box = assignment.box
-            p1 = (int(round(box.x1)), int(round(box.y1)))
-            p2 = (int(round(box.x2)), int(round(box.y2)))
-            cv2.rectangle(overlay, p1, p2, color, 2, cv2.LINE_AA)
-            label = (
-                f"R{text_row_idx}:{assignment.sign_name} "
-                f"{assignment.score:.2f}"
-                if assignment.source == "feature"
-                else f"R{text_row_idx}:{assignment.sign_name} "
-                     f"{assignment.source[0].upper()}"
-            )
-            _draw_label(overlay, label, p1, color)
-    return overlay
+            p1 = int(round(box.x1)), int(round(box.y1))
+            p2 = int(round(box.x2)), int(round(box.y2))
+            cv2.rectangle(image, p1, p2, color, 2, cv2.LINE_AA)
+            label = f"{assignment.sign_name}:{assignment.source[0].upper()}"
+            if assignment.source == "feature":
+                label += f" {assignment.score:.2f}"
+            _draw_label(image, label, p1, color)
+    return image
 
 
-def _draw_label(
-    image: np.ndarray,
-    text: str,
-    origin: Tuple[int, int],
-    color: Tuple[int, int, int],
-) -> None:
-    x = max(0, origin[0])
-    y = max(12, origin[1] - 4)
-    cv2.putText(
-        image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-        0.38, (0, 0, 0), 2, cv2.LINE_AA,
-    )
-    cv2.putText(
-        image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-        0.38, color, 1, cv2.LINE_AA,
-    )
+def _draw_label(image, label, origin, color) -> None:
+    x, y = max(0, origin[0]), max(12, origin[1] - 4)
+    for thickness, text_color in ((2, (0, 0, 0)), (1, color)):
+        cv2.putText(
+            image,
+            label,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            text_color,
+            thickness,
+            cv2.LINE_AA,
+        )
 
 
 def _to_bgr(image: np.ndarray) -> np.ndarray:
@@ -933,61 +713,3 @@ def _to_bgr(image: np.ndarray) -> np.ndarray:
     if image.shape[2] == 4:
         return cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_RGBA2BGR)
     return image.astype(np.uint8)
-
-
-def _plot_score_matrices(
-    context: CropContext,
-    row_results: Dict[int, FeatureRowAlignmentResult],
-    vis: VisOptions,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    results = [
-        result for result in row_results.values()
-        if result.score_matrix.size
-    ]
-    if not results:
-        return
-    fig, axes = plt.subplots(
-        len(results),
-        1,
-        figsize=(max(10, max(len(r.candidates) for r in results) * 0.45),
-                 max(3, len(results) * 3.2)),
-        squeeze=False,
-        constrained_layout=True,
-    )
-    for axis, result in zip(axes[:, 0], results):
-        heat = axis.imshow(
-            result.score_matrix,
-            aspect="auto",
-            interpolation="nearest",
-            vmin=0.0,
-            vmax=1.0,
-            cmap="viridis",
-        )
-        signs = [
-            result.assignments[text_idx].sign_name
-            for text_idx in result.unmatched_text_indices
-        ]
-        axis.set_yticks(range(len(signs)), signs)
-        x_labels = [f"{candidate.cx:.0f}" for candidate in result.candidates]
-        stride = max(1, len(x_labels) // 20)
-        ticks = list(range(0, len(x_labels), stride))
-        axis.set_xticks(ticks, [x_labels[idx] for idx in ticks], rotation=45)
-        axis.set_xlabel("candidate center x")
-        axis.set_ylabel("unmatched text sign")
-        axis.set_title(
-            f"Text row {result.text_row_idx} -> "
-            f"Det row {result.det_row_idx}: relaxed IoU + angle geometry"
-        )
-        fig.colorbar(heat, ax=axis, fraction=0.025, pad=0.02)
-
-    if vis.save:
-        fig.savefig(
-            base._out(context, "feature_coarse_scores.png"),
-            dpi=150,
-        )
-    if vis.display:
-        plt.show()
-    else:
-        plt.close(fig)

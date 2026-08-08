@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 import os
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -15,7 +17,6 @@ from sign_alignment.data_source import (
     SignTextParser,
 )
 from sign_alignment.box import Box, Boxes, SignCandidate, boxes_in_crop
-from sign_alignment.sign import SignResolver
 from sign_alignment.tablet import SubTablet, Tablet
 from sign_alignment.visualizer import (
     BboxVisualizer,
@@ -28,7 +29,6 @@ from sign_alignment.psr_optimizer import PointSetRegistrationOptimizer
 from data_processing.line_process import (
     align_text_row_to_detection,
     create_row_mapping,
-    detect_rows_dbscan,
     match_rows_dp,
     match_signs_in_row_dp,
 )
@@ -39,16 +39,10 @@ from sign_alignment.dift_align import (
     SignOverlay,
     build_dift_affine_probe,
     collect_detected_source_feature_rows,
-    render_dift_crop_warp,
     render_dift_affine_probe,
-    render_dift_feature_matches,
     render_source_feature_grid,
     render_source_sign_overlay,
-    source_foreground_mask,
 )
-
-if TYPE_CHECKING:
-    from sign_alignment.pipeline_2 import FeatureCoarseRun
 
 
 @dataclass
@@ -79,34 +73,6 @@ class BoxRows:
             rows.append(row)
             offset += len(line)
         return cls(boxes=boxes, rows=rows)
-
-    @classmethod
-    def detect(
-        cls,
-        boxes: Boxes,
-        eps: float = 0.6,
-        min_samples: int = 1,
-        lambda_weight: float = 0.05,
-        avg_width: Optional[float] = None,
-        avg_height: Optional[float] = None,
-    ) -> "BoxRows":
-        labels, _ = detect_rows_dbscan(
-            boxes=boxes,
-            eps=eps,
-            min_samples=min_samples,
-            lambda_weight=lambda_weight,
-            avg_width=boxes.avg_width if avg_width is None else avg_width,
-            avg_height=boxes.avg_height if avg_height is None else avg_height,
-        )
-        grouped: dict[int, list[int]] = {}
-        noise = []
-        for idx, label in enumerate(labels):
-            if label == -1:
-                noise.append(idx)
-            else:
-                grouped.setdefault(label, []).append(idx)
-        rows = [sorted(grouped[k], key=lambda i: boxes[i].cx) for k in sorted(grouped)]
-        return cls(boxes=boxes, rows=rows, noise=sorted(noise, key=lambda i: boxes[i].cx))
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -254,22 +220,10 @@ class SampleState:
     source_period: Optional[str] = None
     dift_affine_probe: Optional[DiftAffineProbe] = None
     source_overlay: Optional[SignOverlay] = None
-    feature_coarse: Optional["FeatureCoarseRun"] = None
-    dift_sampling_scores: Optional[list] = None
-    dift_sampling_score_image: Optional[np.ndarray] = None
-    dift_sampling_semantic_image: Optional[np.ndarray] = None
-    dift_sampling_global_similarity_image: Optional[np.ndarray] = None
-    dift_sampling_sim_withoutbg_image: Optional[np.ndarray] = None
-    dift_sampling_foreground_mask: Optional[np.ndarray] = None
-    dift_sampling_foreground_mask_image: Optional[np.ndarray] = None
-    dift_sampling_inlier_score_image: Optional[np.ndarray] = None
-    dift_sampling_certainty_image: Optional[np.ndarray] = None
-    dift_sampling_bending_energy_image: Optional[np.ndarray] = None
-    dift_sampling_jacobian_fold_image: Optional[np.ndarray] = None
-    dift_sampling_local_distortion_image: Optional[np.ndarray] = None
-    dift_sampling_scale_image: Optional[np.ndarray] = None
-    dift_sampling_affine_angle_image: Optional[np.ndarray] = None
-    dift_sampling_affine_iou_image: Optional[np.ndarray] = None
+
+    # Extension pipelines keep isolated results here.  The base state has no
+    # dependency on extension-specific result classes.
+    extras: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -301,19 +255,25 @@ class Step:
     visualize: Optional[VisFn] = None
 
 
-def _out(context: CropContext, suffix: str) -> str:
+def output_path(context: CropContext, suffix: str) -> str:
     return os.path.join(
         context.output_dir,
         f"{context.task_type}_{context.state.fragment_id}_{suffix}",
     )
 
 
-def _source_period(context: CropContext) -> str:
+_out = output_path  # Backward-compatible alias for existing callers.
+
+
+def source_period(context: CropContext) -> str:
     period = context.state.source_period
     if period is None:
         period = context.state.fragment_data["script"]["period"]
         context.state.source_period = period
     return period
+
+
+_source_period = source_period  # Backward-compatible alias for existing callers.
 
 
 def gt_boxes_for_visualization(
@@ -401,8 +361,11 @@ def vis_loaded_data(context: CropContext, vis: VisOptions) -> None:
 def detect_signs(context: CropContext) -> None:
     s = context.state
     s.detections = context.tablet_detector.detect(s.tablet)
+    _select_crop(context, context.img_idx)
+
+
+def _select_crop(context: CropContext, img_idx: int) -> None:
     crop_tablets = context.tablet_detector.get_crop_tablets()
-    img_idx = context.img_idx
     if not crop_tablets:
         raise RuntimeError("detector produced no cropped images")
     if not 0 <= img_idx < len(crop_tablets):
@@ -410,8 +373,9 @@ def detect_signs(context: CropContext) -> None:
             f"crop index {img_idx} is out of range after detection; "
             f"available crop indices are 0..{len(crop_tablets) - 1}"
         )
-    s.crop_tablet = crop_tablets[img_idx]
-    s.det_boxes = context.tablet_detector.get_crop_boxes()[img_idx]
+    context.img_idx = img_idx
+    context.state.crop_tablet = crop_tablets[img_idx]
+    context.state.det_boxes = context.tablet_detector.get_crop_boxes()[img_idx]
 
 
 def vis_detections(context: CropContext, vis: VisOptions) -> None:
@@ -501,16 +465,7 @@ def vis_box_sets(context: CropContext, vis: VisOptions) -> None:
 
 
 def detect_rows(context: CropContext) -> None:
-    s = context.state
-    # s.det_rows = BoxRows.detect(
-    #     s.det_boxes,
-    #     eps=0.4,
-    #     min_samples=1,
-    #     lambda_weight=0.007,
-    #     avg_width=s.detections.avg_width,
-    #     avg_height=s.detections.avg_height,
-    # )
-    s.det_rows = BoxRows.detect_using_hough(s.det_boxes)
+    context.state.det_rows = BoxRows.detect_using_hough(context.state.det_boxes)
 
 
 def vis_detected_rows_info(context: CropContext, vis: VisOptions) -> None:
@@ -1377,599 +1332,11 @@ def vis_source_signs(context: CropContext, vis: VisOptions) -> None:
         )
 
 
-def _render_source_foreground_mask(
-    source_img: np.ndarray,
-    foreground_mask: np.ndarray,
-) -> np.ndarray:
-    source = np.asarray(source_img)
-    if source.ndim == 2:
-        source_bgr = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_GRAY2BGR)
-    elif source.ndim == 3 and source.shape[2] == 1:
-        source_bgr = cv2.cvtColor(
-            source[:, :, 0].astype(np.uint8),
-            cv2.COLOR_GRAY2BGR,
-        )
-    elif source.ndim == 3 and source.shape[2] == 4:
-        source_bgr = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_BGRA2BGR)
-    elif source.ndim == 3 and source.shape[2] == 3:
-        source_bgr = source.astype(np.uint8).copy()
-    else:
-        raise ValueError(f"Unsupported source image shape: {source.shape}")
-
-    h, w = source_bgr.shape[:2]
-    mask = np.asarray(foreground_mask, dtype=bool)
-    mask_img = cv2.resize(
-        mask.astype(np.uint8) * 255,
-        (w, h),
-        interpolation=cv2.INTER_NEAREST,
-    )
-    mask_bgr = cv2.cvtColor(mask_img, cv2.COLOR_GRAY2BGR)
-
-    overlay = source_bgr.copy()
-    foreground = mask_img.astype(bool)
-    overlay[foreground] = (
-        overlay[foreground].astype(np.float32) * 0.35
-        + np.array([0, 180, 0], dtype=np.float32) * 0.65
-    ).astype(np.uint8)
-
-    panels = [
-        ("source", source_bgr),
-        ("foreground mask", mask_bgr),
-        ("mask overlay", overlay),
-    ]
-    header_h = 30
-    gap = 6
-    canvas = np.full(
-        (h + header_h, len(panels) * w + (len(panels) - 1) * gap, 3),
-        35,
-        dtype=np.uint8,
-    )
-    for idx, (label, image) in enumerate(panels):
-        x0 = idx * (w + gap)
-        cv2.putText(
-            canvas,
-            label,
-            (x0 + 6, 21),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (230, 230, 230),
-            1,
-            cv2.LINE_AA,
-        )
-        canvas[header_h:, x0:x0 + w] = image
-    return canvas
-
-
-def vis_dift_score_on_whole_tablet(context: CropContext, vis: VisOptions) -> None:
-    """Score DIFT matches on a simple crop-tablet sampling grid."""
-    s = context.state
-    first_cx, first_cy = 200, 200
-    step_x, step_y = 100, 100
-    last_cx_dist = 200
-    last_cy_dist = 200
-    height, width = s.crop_tablet.img.shape[:2]
-    x_coords = range(first_cx, width - last_cx_dist, step_x)
-    y_coords = range(first_cy, height - last_cy_dist, step_y)
-
-    box_width = s.detections.avg_width
-    box_height = s.detections.avg_height
-    chosen_draw_box_ix = 0
-    chosen_draw_box_iy = 0
-    sign_names = ["AN", "TUR", "DA", "A", "I"]
-    first_sign = SignResolver.from_name(sign_names[0])
-    source = context.dift.source
-    if source is None:
-        raise ValueError("DiftRuntime.source must be set")
-    period = _source_period(context)
-
-    point_vis = s.crop_tablet.img.copy()
-    for iy, cy in enumerate(y_coords):
-        for ix, cx in enumerate(x_coords):
-            if ix == chosen_draw_box_ix and iy == chosen_draw_box_iy:
-                box = Box.from_center(cx=cx, cy=cy, width=box_width, height=box_height, sign=first_sign, tablet=s.crop_tablet)
-                x1, y1, x2, y2 = box.crop_bounds()
-                cv2.rectangle(point_vis, (x1, y1), (x2 - 1, y2 - 1), (0, 255, 255), 2, cv2.LINE_AA)
-            cv2.circle(point_vis, (cx, cy), 15, (255, 255, 255), -1, cv2.LINE_AA)
-            cv2.circle(point_vis, (cx, cy), 9, (0, 0, 255), -1, cv2.LINE_AA)
-            cv2.putText(point_vis, f"{iy},{ix}", (cx + 16, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-    from tqdm.auto import tqdm
-    points = [(iy, ix, cy, cx) for iy, cy in enumerate(y_coords) for ix, cx in enumerate(x_coords)]
-    sign_runs = []
-    for sign_name in sign_names:
-        sign = SignResolver.from_name(sign_name)
-        source_img = source.get(sign.name, period)
-        source_feature = context.dift.get_sign_feature(sign, period)
-        if source_img is None or source_feature is None:
-            raise KeyError(f"no source image/feature for sign {sign_name!r}")
-        foreground_mask = source_foreground_mask(
-            source_img,
-            source_feature.shape[-2:],
-        )
-        foreground_mask_vis = _render_source_foreground_mask(
-            source_img,
-            foreground_mask,
-        )
-        shape = (len(y_coords), len(x_coords))
-        sign_runs.append({
-            "sign_name": sign_name,
-            "source_img": source_img,
-            "source_feature": source_feature,
-            "foreground_mask": foreground_mask,
-            "foreground_mask_vis": foreground_mask_vis,
-            "coarse_grid": np.zeros(shape, dtype=np.float32),
-            "affine_angle_grid": np.zeros(shape, dtype=np.float32),
-            "affine_iou_grid": np.zeros(shape, dtype=np.float32),
-            "inlier_score_grid": np.zeros(shape, dtype=np.float32),
-            "semantic_grid": np.zeros(shape, dtype=np.float32),
-            "global_similarity_grid": np.zeros(shape, dtype=np.float32),
-            "sim_withoutbg_grid": np.zeros(shape, dtype=np.float32),
-            "certainty_grid": np.zeros(shape, dtype=np.float32),
-            "bending_energy_grid": np.zeros(shape, dtype=np.float32),
-            "jacobian_fold_grid": np.zeros(shape, dtype=np.float32),
-            "local_distortion_grid": np.zeros(shape, dtype=np.float32),
-            "scale_grid": np.zeros(shape, dtype=np.float32),
-            "score_rows": [],
-        })
-
-    for iy, ix, cy, cx in tqdm(points, desc=f"DIFT scores x{len(sign_runs)} signs", disable=not vis.info):
-        box = Box.from_center(cx=cx, cy=cy, width=box_width, height=box_height, sign=first_sign, tablet=s.crop_tablet)
-        x1, y1, x2, y2 = box.crop_bounds()
-        crop = box.crop_image()
-        crop_feature = context.dift.featurize_image(crop)
-        for run in sign_runs:
-            result = context.dift.match(
-                run["source_feature"],
-                crop_feature,
-                run["source_img"].shape[:2],
-                crop.shape[:2],
-                context.dift.config.match,
-                src_foreground_mask=run["foreground_mask"],
-            )
-            run["coarse_grid"][iy, ix] = result.coarse_score
-            run["affine_angle_grid"][iy, ix] = result.affine_angle_score
-            run["affine_iou_grid"][iy, ix] = result.affine_iou
-            run["inlier_score_grid"][iy, ix] = result.inlier_score
-            run["semantic_grid"][iy, ix] = result.semantic_score
-            run["global_similarity_grid"][iy, ix] = result.global_similarity_score
-            run["sim_withoutbg_grid"][iy, ix] = result.sim_withoutbg
-            run["certainty_grid"][iy, ix] = result.certainty_score
-            run["bending_energy_grid"][iy, ix] = result.bending_energy_score
-            run["jacobian_fold_grid"][iy, ix] = result.jacobian_fold_score
-            run["local_distortion_grid"][iy, ix] = result.local_distortion_score
-            run["scale_grid"][iy, ix] = result.scale_score
-            run["score_rows"].append({
-                "sign": run["sign_name"],
-                "ix": ix,
-                "iy": iy,
-                "center": (cx, cy),
-                "bounds": (x1, y1, x2, y2),
-                "score": result.score,
-                "semantic": result.semantic_score,
-                "global_similarity": result.global_similarity_score,
-                "sim_withoutbg": result.sim_withoutbg,
-                "affine_iou": result.affine_iou,
-                "affine_angle_score": result.affine_angle_score,
-                "geometry": result.geometry_score,
-                "support": result.support_score,
-                "coarse": result.coarse_score,
-                "inlier_score": result.inlier_score,
-                "certainty_score": result.certainty_score,
-                "bending_energy_score": result.bending_energy_score,
-                "jacobian_fold_score": result.jacobian_fold_score,
-                "local_distortion_score": result.local_distortion_score,
-                "scale_score": result.scale_score,
-                "n_matches": result.n_matches,
-                "n_inliers": result.n_inliers,
-                "message": result.message,
-            })
-
-    cell_size = 80
-    axis_top, axis_left = 50, 60
-
-    def make_heatmap(grid):
-        heat = cv2.applyColorMap((np.clip(grid, 0.0, 1.0) * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        heat = cv2.resize(heat, (len(x_coords) * cell_size, len(y_coords) * cell_size), interpolation=cv2.INTER_NEAREST)
-        heat_axes = np.full((heat.shape[0] + axis_top, heat.shape[1] + axis_left, 3), 255, dtype=np.uint8)
-        heat_axes[axis_top:, axis_left:] = heat
-        for ix in range(len(x_coords)):
-            cv2.putText(heat_axes, str(ix), (axis_left + ix * cell_size + 28, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0))
-        for iy in range(len(y_coords)):
-            cv2.putText(heat_axes, str(iy), (15, axis_top + iy * cell_size + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0))
-        legend = np.full((heat_axes.shape[0], 120, 3), 255, dtype=np.uint8)
-        bar_h = max(1, heat_axes.shape[0] - 50)
-        bar = cv2.applyColorMap(np.linspace(255, 0, bar_h, dtype=np.uint8)[:, None], cv2.COLORMAP_JET)
-        legend[25:25 + bar_h, 20:50] = np.repeat(bar, 30, axis=1)
-        cv2.putText(legend, "1.0", (60, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0))
-        cv2.putText(legend, "0.0", (60, 25 + bar_h), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0))
-        return np.hstack([heat_axes, legend])
-
-    def safe_sign_name(name: str) -> str:
-        safe = "".join(
-            ch if ch.isalnum() or ch in ".@+-" else "_"
-            for ch in name
-        ).strip("_")
-        return safe or "sign"
-
-    for sign_idx, run in enumerate(sign_runs):
-        sign_name = run["sign_name"]
-        score_vis = make_heatmap(run["coarse_grid"])
-        affine_angle_vis = make_heatmap(run["affine_angle_grid"])
-        affine_iou_vis = make_heatmap(run["affine_iou_grid"])
-        inlier_score_vis = make_heatmap(run["inlier_score_grid"])
-        semantic_vis = make_heatmap(run["semantic_grid"])
-        global_similarity_vis = make_heatmap(run["global_similarity_grid"])
-        sim_withoutbg_vis = make_heatmap(run["sim_withoutbg_grid"])
-        certainty_vis = make_heatmap(run["certainty_grid"])
-        bending_energy_vis = make_heatmap(run["bending_energy_grid"])
-        jacobian_fold_vis = make_heatmap(run["jacobian_fold_grid"])
-        local_distortion_vis = make_heatmap(run["local_distortion_grid"])
-        scale_vis = make_heatmap(run["scale_grid"])
-
-        if sign_idx == 0:
-            s.dift_sampling_scores = run["score_rows"]
-            s.dift_sampling_foreground_mask = run["foreground_mask"]
-            s.dift_sampling_foreground_mask_image = run["foreground_mask_vis"]
-            s.dift_sampling_score_image = score_vis
-            s.dift_sampling_affine_angle_image = affine_angle_vis
-            s.dift_sampling_affine_iou_image = affine_iou_vis
-            s.dift_sampling_inlier_score_image = inlier_score_vis
-            s.dift_sampling_semantic_image = semantic_vis
-            s.dift_sampling_global_similarity_image = global_similarity_vis
-            s.dift_sampling_sim_withoutbg_image = sim_withoutbg_vis
-            s.dift_sampling_certainty_image = certainty_vis
-            s.dift_sampling_bending_energy_image = bending_energy_vis
-            s.dift_sampling_jacobian_fold_image = jacobian_fold_vis
-            s.dift_sampling_local_distortion_image = local_distortion_vis
-            s.dift_sampling_scale_image = scale_vis
-
-        if vis.display and sign_idx == 0:
-            _display_bgr(run["foreground_mask_vis"], f"DIFT source foreground mask ({sign_name})")
-            _display_bgr(point_vis, f"DIFT sampling points and boxes on crop tablet ({sign_name})")
-            _display_bgr(score_vis, f"DIFT coarse scores ({sign_name}, relaxed IoU + angle)")
-            _display_bgr(affine_angle_vis, f"DIFT affine rectangle-angle scores ({sign_name})")
-            _display_bgr(affine_iou_vis, f"DIFT raw affine IoU ({sign_name})")
-            _display_bgr(inlier_score_vis, f"DIFT inlier scores ({sign_name}, old coarse score)")
-            _display_bgr(semantic_vis, f"DIFT semantic scores ({sign_name})")
-            _display_bgr(global_similarity_vis, f"DIFT global similarity ({sign_name})")
-            _display_bgr(sim_withoutbg_vis, f"DIFT sim_withoutbg ({sign_name})")
-            _display_bgr(certainty_vis, f"DIFT dense certainty scores ({sign_name})")
-            _display_bgr(bending_energy_vis, f"DIFT bending energy scores ({sign_name})")
-            _display_bgr(jacobian_fold_vis, f"DIFT Jacobian non-fold scores ({sign_name})")
-            _display_bgr(local_distortion_vis, f"DIFT local distortion scores ({sign_name})")
-            _display_bgr(scale_vis, f"DIFT scale consistency scores ({sign_name})")
-        if vis.save:
-            sign_part = safe_sign_name(sign_name)
-            cv2.imwrite(
-                _out(context, f"dift_sampling_{sign_part}_source_foreground_mask.jpg"),
-                run["foreground_mask_vis"],
-                [cv2.IMWRITE_JPEG_QUALITY, 90],
-            )
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_coarse_scores.jpg"), score_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_affine_angle_scores.jpg"), affine_angle_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_affine_iou.jpg"), affine_iou_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_inlier_scores.jpg"), inlier_score_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_semantic_scores.jpg"), semantic_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_global_similarity.jpg"), global_similarity_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_sim_withoutbg.jpg"), sim_withoutbg_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_certainty_scores.jpg"), certainty_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_bending_energy_scores.jpg"), bending_energy_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_jacobian_fold_scores.jpg"), jacobian_fold_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_local_distortion_scores.jpg"), local_distortion_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            cv2.imwrite(_out(context, f"dift_sampling_{sign_part}_scale_scores.jpg"), scale_vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
-
-
-def vis_manual_dift_crop_match(
-    context: CropContext,
-    vis: VisOptions,
-) -> None:
-    """Create notebook controls for manual crop-to-source DIFT matching."""
-    s = context.state
-    if not vis.display:
-        if vis.info:
-            print("=== Manual DIFT match requires VisOptions(display=True) ===")
-        return
-
-    import ipywidgets as widgets
-    from IPython.display import clear_output, display
-
-    sign_names = sorted({
-        box.sign_name
-        for boxes in (s.det_boxes, s.text_boxes)
-        if boxes
-        for box in boxes
-    })
-    if not sign_names:
-        print("=== Manual DIFT match skipped: no source signs are available ===")
-        return
-
-    default_box, default_sign = _manual_dift_match_defaults(
-        s, sign_names
-    )
-    x1_default, y1_default, x2_default, y2_default = default_box.crop_bounds()
-    width_default = x2_default - x1_default
-    height_default = y2_default - y1_default
-    img_h, img_w = s.crop_tablet.img.shape[:2]
-    field_layout = widgets.Layout(width="155px")
-    field_style = {"description_width": "48px"}
-    x1_input = widgets.BoundedIntText(
-        value=x1_default,
-        min=0,
-        max=max(0, img_w - 1),
-        description="x1",
-        layout=field_layout,
-        style=field_style,
-    )
-    y1_input = widgets.BoundedIntText(
-        value=y1_default,
-        min=0,
-        max=max(0, img_h - 1),
-        description="y1",
-        layout=field_layout,
-        style=field_style,
-    )
-    width_input = widgets.BoundedIntText(
-        value=width_default,
-        min=1,
-        max=max(1, img_w),
-        description="width",
-        layout=field_layout,
-        style=field_style,
-    )
-    height_input = widgets.BoundedIntText(
-        value=height_default,
-        min=1,
-        max=max(1, img_h),
-        description="height",
-        layout=field_layout,
-        style=field_style,
-    )
-    sign_input = widgets.Combobox(
-        options=sign_names,
-        value=default_sign,
-        description="sign",
-        placeholder="source sign name",
-        layout=widgets.Layout(width="420px"),
-        style={"description_width": "42px"},
-    )
-    compare_button = widgets.Button(
-        description="Compare crop",
-        button_style="primary",
-        tooltip="Compute the crop feature and compare it with the source feature",
-    )
-    output = widgets.Output()
-
-    if vis.info:
-        print("=== Manual DIFT Crop Match ===")
-        print(
-            "score = semantic * sqrt(coarse), coarse = "
-            "sqrt(min(1, affine IoU / 0.7) * angle) * support; "
-            "this is an uncalibrated diagnostic score, not a probability."
-        )
-        print(
-            "sim_withoutbg uses only non-white prototype foreground features "
-            "for global similarity."
-        )
-        print(
-            f"Subtablet coordinate range: x=[0, {img_w}], y=[0, {img_h}]"
-        )
-
-    def compare_crop(_button) -> None:
-        compare_button.disabled = True
-        try:
-            with output:
-                clear_output(wait=True)
-                x1 = x1_input.value
-                y1 = y1_input.value
-                x2 = x1 + width_input.value
-                y2 = y1 + height_input.value
-                sign_name = sign_input.value
-                box = Box(
-                    x1=x1,
-                    y1=y1,
-                    x2=x2,
-                    y2=y2,
-                    candidates=[SignCandidate(
-                        sign=SignResolver.from_name(sign_name),
-                        score=1.0,
-                    )],
-                    tablet=s.crop_tablet,
-                )
-                crop = box.crop_image()
-                source = context.dift.source
-                if source is None:
-                    raise ValueError("DiftRuntime.source must be set")
-                period = _source_period(context)
-                source_img = source.get(box.sign_name, period)
-                source_feature = context.dift.get_sign_feature(box.sign, period)
-                if source_img is None or source_feature is None:
-                    raise KeyError(f"no source image/feature for sign {sign_name!r}")
-                crop_feature = context.dift.featurize_image(crop)
-                result = context.dift.match(
-                    source_feature,
-                    crop_feature,
-                    source_img.shape[:2],
-                    crop.shape[:2],
-                    context.dift.config.match,
-                    src_foreground_mask=source_foreground_mask(
-                        source_img,
-                        source_feature.shape[-2:],
-                    ),
-                )
-                print(
-                    f"score={result.score:.4f}  "
-                    f"coarse={result.coarse_score:.4f}  "
-                    f"inlier_score={result.inlier_score:.4f}  "
-                    f"semantic={result.semantic_score:.4f}  "
-                    f"geometry={result.geometry_score:.4f}  "
-                    f"support={result.support_score:.4f}"
-                )
-                print(
-                    f"affine_iou={result.affine_iou:.4f}  "
-                    f"affine_angle_score={result.affine_angle_score:.4f}"
-                )
-                print(
-                    f"global_similarity={result.global_similarity_score:.4f}  "
-                    f"sim_withoutbg={result.sim_withoutbg:.4f}"
-                )
-                print(
-                    f"certainty={result.certainty_score:.4f}  "
-                    f"bending={result.bending_energy_score:.4f}  "
-                    f"non_fold={result.jacobian_fold_score:.4f}  "
-                    f"distortion={result.local_distortion_score:.4f}  "
-                    f"scale={result.scale_score:.4f}"
-                )
-                print(
-                    f"mutual matches={result.n_matches}, "
-                    f"RANSAC inliers={result.n_inliers}, "
-                    f"mean inlier cosine={result.mean_inlier_similarity:.4f}"
-                )
-                if result.message:
-                    print(f"status: {result.message}")
-                figure = _manual_dift_match_figure(
-                    context,
-                    box,
-                    source_img,
-                    crop,
-                    result,
-                )
-                display(figure)
-                import matplotlib.pyplot as plt
-                plt.close(figure)
-        finally:
-            compare_button.disabled = False
-
-    compare_button.on_click(compare_crop)
-    controls = widgets.VBox([
-        widgets.HBox([x1_input, y1_input, width_input, height_input]),
-        widgets.HBox([sign_input, compare_button]),
-        output,
-    ])
-    display(controls)
-    compare_crop(None)
-
-
-def _manual_dift_match_defaults(
-    state: SampleState,
-    sign_names: list[str],
-) -> tuple[Box, str]:
-    img_h, img_w = state.crop_tablet.img.shape[:2]
-    available = set(sign_names)
-    if state.det_boxes:
-        candidates = [
-            box for box in state.det_boxes if box.sign_name in available
-        ]
-        if candidates:
-            box = candidates[10]
-            return box.copy(), box.sign_name
-
-    x1 = img_w // 4
-    x2 = max(x1 + 1, img_w * 3 // 4)
-    y1 = img_h // 4
-    y2 = max(y1 + 1, img_h * 3 // 4)
-    sign = SignResolver.from_name(sign_names[0])
-    box = Box(
-        x1=x1,
-        y1=y1,
-        x2=min(x2, img_w),
-        y2=min(y2, img_h),
-        candidates=[SignCandidate(sign=sign, score=1.0)],
-        tablet=state.crop_tablet,
-    )
-    return box, sign_names[0]
-
-
-def _manual_dift_match_figure(
-    context: CropContext,
-    box: Box,
-    source_img: np.ndarray,
-    crop_img: np.ndarray,
-    result,
-):
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
-
-    config = context.dift.config
-    matches = render_dift_feature_matches(
-        source_img,
-        crop_img,
-        result,
-        thumb=config.manual_match_thumb,
-        max_lines=config.manual_match_max_lines,
-    )
-    warp = render_dift_crop_warp(source_img, crop_img, result)
-
-    fig = plt.figure(figsize=(18, 10), constrained_layout=True)
-    grid = fig.add_gridspec(2, 3, height_ratios=(1.0, 1.15))
-    overview_ax = fig.add_subplot(grid[0, 0])
-    source_ax = fig.add_subplot(grid[0, 1])
-    crop_ax = fig.add_subplot(grid[0, 2])
-    matches_ax = fig.add_subplot(grid[1, :2])
-    warp_ax = fig.add_subplot(grid[1, 2])
-
-    _imshow_notebook(overview_ax, context.state.crop_tablet.img)
-    x1, y1, x2, y2 = box.crop_bounds()
-    overview_ax.add_patch(Rectangle(
-        (x1, y1),
-        x2 - x1,
-        y2 - y1,
-        fill=False,
-        edgecolor="yellow",
-        linewidth=2,
-    ))
-    overview_ax.set_title(
-        f"Subtablet crop: x1={x1}, y1={y1}, "
-        f"w={x2 - x1}, h={y2 - y1} (x2={x2}, y2={y2})"
-    )
-    _imshow_notebook(source_ax, source_img)
-    source_ax.set_title("Source sign")
-    _imshow_notebook(crop_ax, crop_img)
-    crop_ax.set_title("Selected crop")
-    _imshow_notebook(matches_ax, matches)
-    matches_ax.set_title("DIFT mutual matches and affine-RANSAC inliers")
-    _imshow_notebook(warp_ax, warp)
-    warp_ax.set_title("Warped source overlay")
-
-    for axis in (
-        overview_ax,
-        source_ax,
-        crop_ax,
-        matches_ax,
-        warp_ax,
-    ):
-        axis.axis("off")
-    fig.suptitle(
-        (
-            f"Manual DIFT match score: {result.score:.3f}  "
-            f"coarse: {result.coarse_score:.3f}  "
-            f"inlier: {result.inlier_score:.3f}  "
-            f"sim_withoutbg: {result.sim_withoutbg:.3f}\n"
-            f"geometry: {result.geometry_score:.3f}  "
-            f"affine IoU: {result.affine_iou:.3f}  "
-            f"affine angle score: {result.affine_angle_score:.3f}\n"
-            f"certainty: {result.certainty_score:.3f}  "
-            f"bending: {result.bending_energy_score:.3f}  "
-            f"non-fold: {result.jacobian_fold_score:.3f}  "
-            f"distortion: {result.local_distortion_score:.3f}  "
-            f"scale: {result.scale_score:.3f}"
-        ),
-        fontsize=15,
-    )
-    return fig
-
-
-def _imshow_notebook(axis, image: np.ndarray) -> None:
-    if image.ndim == 2:
-        axis.imshow(image, cmap="gray")
-    else:
-        axis.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-
-
 class Runner:
     def __init__(
         self,
         context: CropContext,
-        vis: VisOptions = None,
+        vis: Optional[VisOptions] = None,
     ):
         self.context = context
         self.vis = vis or VisOptions()
@@ -1986,22 +1353,18 @@ class Runner:
             if step.visualize:
                 step.visualize(self.context, self.vis)
 
-    def choose_sample(self, idx = 0, name=""):
+    def choose_sample(self, idx: int = 0, name: str = "") -> None:
         if name:
             idx = self._fragments.index(name)
         fragment_id = self._fragments[idx]
         print(f"Processing sample: {fragment_id}")
-        self.context.state = SampleState(fragments=self._fragments, fragment_id=fragment_id)
+        self.context.state = SampleState(
+            fragments=self._fragments,
+            fragment_id=fragment_id,
+        )
 
-    def choose_crop(self, crop_idx: int):
+    def choose_crop(self, crop_idx: int) -> None:
         self.context.img_idx = crop_idx
-        crop_tablets = self.context.tablet_detector.get_crop_tablets()
-        if not crop_tablets or self.context.state.detections is None:
+        if self.context.state.detections is None:
             return
-        if crop_idx < 0 or crop_idx >= len(crop_tablets):
-            raise IndexError(
-                f"crop index {crop_idx} is out of range; "
-                f"available crop indices are 0..{len(crop_tablets) - 1}"
-            )
-        self.context.state.crop_tablet = crop_tablets[crop_idx]
-        self.context.state.det_boxes = self.context.tablet_detector.get_crop_boxes()[crop_idx]
+        _select_crop(self.context, crop_idx)

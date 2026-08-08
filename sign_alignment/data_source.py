@@ -517,6 +517,12 @@ class SignTextParser:
 
             line_signs = []
             for token in line['content']:
+                if token.get('type', '') == 'LineBreak':
+                    if line_signs:
+                        result_lines.append(line_signs)
+                        line_signs = []
+                    continue
+
                 sign_tuples = SignTextParser._extract_signs_from_token(
                     token, filter_broken
                 )
