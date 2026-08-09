@@ -29,6 +29,7 @@ from sign_alignment import (
 )
 from sign_alignment.visualizer import ColorConfig
 from sign_alignment.pipeline import (
+    CandidateAttractionConfig,
     CropContext, Runner, SampleState, Step, VisOptions,
     align_text_rows,
     build_sign_match_info,
@@ -41,6 +42,7 @@ from sign_alignment.pipeline import (
     match_rows,
     match_signs_in_rows,
     optimize_psr,
+    run_candidate_attraction,
     transform_gt_to_crop,
     vis_aligned_rows,
     vis_box_sets,
@@ -55,7 +57,6 @@ from sign_alignment.pipeline import (
     vis_sign_match_info,
     vis_sign_matches,
 )
-import pipeline_3_candidate_test as candidate_pipeline
 
 load_dotenv()
 
@@ -723,7 +724,7 @@ def _predict_det_as_candidates_crops(
 
     s = context.state
     preds: List[Box] = []
-    candidate_config = candidate_pipeline.CandidateAttractionConfig(
+    candidate_config = CandidateAttractionConfig(
         temperatures=(2.0, 1.0, 0.5, 0.25),
         steps_per_temperature=35,
         learning_rate=0.04,
@@ -741,7 +742,7 @@ def _predict_det_as_candidates_crops(
         if s.aligned_rows is None or s.det_rows is None:
             continue
 
-        candidate_pipeline.run_candidate_attraction(context, candidate_config)
+        run_candidate_attraction(context, candidate_config)
         if s.candidate_test_boxes is None:
             continue
 
