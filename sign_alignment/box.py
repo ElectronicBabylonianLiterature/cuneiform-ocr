@@ -196,6 +196,14 @@ class Boxes(list):
     def to_tablet(self, tablet: Tablet) -> "Boxes":
         return Boxes((box.to_tablet(tablet) for box in self), tablet=tablet)
 
+    def __repr__(self):
+        boxes_repr = repr([box.sign_name for box in self])
+        return (
+            f"{type(self).__name__}("
+            f"lenth = {len(self)}\n"
+            f"{boxes_repr})"
+        )
+
     @classmethod
     def from_text_lines(
         cls,

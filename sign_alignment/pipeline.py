@@ -100,6 +100,18 @@ class BoxRows:
     def counts(self) -> list[int]:
         return [len(row) for row in self.rows]
 
+    def with_boxes(self, boxes: Boxes) -> "BoxRows":
+        """Reuse this topology with an index-compatible box collection."""
+        if len(boxes) != len(self.boxes):
+            raise ValueError(
+                "replacement boxes must have the same length as the row source"
+            )
+        return BoxRows(
+            boxes=boxes,
+            rows=[row.copy() for row in self.rows],
+            noise=self.noise.copy(),
+        )
+
     def __repr__(self):
         boxes_repr = repr([box.sign_name for box in self.boxes])
         return (
@@ -184,63 +196,71 @@ class BoxRows:
 
 @dataclass
 class SampleState:
-    """All intermediate results for a single fragment."""
+    """Source data, current-crop state, and results for one fragment."""
 
-    fragments: list = None
-    fragment_id: str = None
-    fragment_data: dict = None
+    fragment_id: Optional[str] = None
+    fragment_data: Optional[dict] = None
 
-    # full-image data
-    tablet: Optional[Tablet] = None
-    gt_boxes: Optional[Boxes] = None
+    # Full-image source data. These do not change during crop optimization.
+    full_tablet: Optional[Tablet] = None
+    full_gt_boxes: Optional[Boxes] = None
+    full_detections: Optional[Boxes] = None
 
-    # Text lines parsed from API
+    # Text parsed from the API. These do not change during crop optimization.
     text_lines: Optional[list] = None
     text_lines_unfiltered: Optional[list] = None
 
-    # Full-image detections
-    detections: Optional[Boxes] = None
-
-    # chosen crop of the tablet
-    crop_tablet: Optional[SubTablet] = None
+    # Selected-crop source data. Unqualified names use crop coordinates.
+    tablet: Optional[SubTablet] = None
     det_boxes: Optional[Boxes] = None
-    gt_boxes_crop: Optional[Boxes] = None
+    gt_boxes: Optional[Boxes] = None
 
-    # Box collections in the selected crop coordinate frame
+    # Fixed text and candidate collections for the selected crop.
     text_boxes: Optional[Boxes] = None
+    text_rows: Optional[BoxRows] = None
+    candidate_boxes: Optional[Boxes] = None
+    candidate_rows: Optional[BoxRows] = None
+
+    # Re-entrant optimization state. The two mappings preserve candidate
+    # provenance while optimize rows change topology between iterations.
+    optimization_iteration: int = 0
+    optimize_boxes: Optional[Boxes] = None
+    optimize_rows: Optional[BoxRows] = None
+    optimize_to_candidate: dict[int, int] = field(default_factory=dict)
+    optimize_row_to_candidate: dict[int, int] = field(default_factory=dict)
+
+    # Intermediate results for the current matching/alignment iteration.
+    optimize_row_sequences: Optional[list] = None
+    text_row_sequences: Optional[list] = None
+    matches: Optional[list] = None
+    text_to_optimize: Optional[dict] = None
+    optimize_to_text: Optional[dict] = None
+    row_sign_matches: Optional[dict] = None
+    row_anchor_matches: Optional[dict] = None
     aligned_boxes: Optional[Boxes] = None
+    aligned_rows: Optional[BoxRows] = None
+
+    # Stable computed results for the selected crop.
     result_without_optimization_boxes: Optional[Boxes] = None
     result_without_optimization_relabelled: int = 0
     result_without_optimization_changed: int = 0
-    final_boxes: Optional[Boxes] = None
 
-    # row matching
-    det_rows: Optional[BoxRows] = None
-    text_rows: Optional[BoxRows] = None
-    aligned_rows: Optional[BoxRows] = None
-    det_row_sequences: Optional[list] = None
-    text_row_sequences: Optional[list] = None
-    matches: Optional[list] = None
-    text_to_det: Optional[dict] = None
-    det_to_text: Optional[dict] = None
-
-    # sign-level matching
-    row_sign_matches: Optional[dict] = None
-
-    # sign-match info for visualisation
+    # Derived visualization/diagnostic data for the current iteration.
     text_sign_match_info: Optional[dict] = None
-    det_sign_match_info: Optional[dict] = None
-    det_row_vis_image: Optional[np.ndarray] = None
+    optimize_sign_match_info: Optional[dict] = None
+    optimize_row_vis_image: Optional[np.ndarray] = None
 
-    # PSR optimizer
-    optimizer: Optional[PointSetRegistrationOptimizer] = None
+    # Optional PSR/DIFT state.
+    psr_optimizer: Optional[PointSetRegistrationOptimizer] = None
 
     source_period: Optional[str] = None
     dift_affine_probe: Optional[DiftAffineProbe] = None
     source_overlay: Optional[SignOverlay] = None
 
-    # Extension pipelines keep isolated results here.  The base state has no
-    # dependency on extension-specific result classes.
+    # Current candidate-attraction result; replaced after every iteration.
+    candidate_run: Optional["CandidateAttractionRun"] = None
+
+    # Less central extension pipelines keep isolated results here.
     extras: dict[str, object] = field(default_factory=dict)
 
 
@@ -274,9 +294,19 @@ class Step:
 
 
 def output_path(context: CropContext, suffix: str) -> str:
-    return os.path.join(
+    iteration = context.state.optimization_iteration
+    iteration_suffix = f"_iter{iteration:03d}" if iteration > 0 else ""
+    fragment_dir = os.path.join(
         context.output_dir,
-        f"{context.task_type}_{context.state.fragment_id}_{suffix}",
+        context.state.fragment_id,
+    )
+    os.makedirs(fragment_dir, exist_ok=True)
+    return os.path.join(
+        fragment_dir,
+        (
+            f"{context.task_type}_{context.state.fragment_id}"
+            f"{iteration_suffix}_{suffix}"
+        ),
     )
 
 
@@ -338,8 +368,11 @@ def load_data(context: CropContext) -> None:
     img = context.local_source.load_image(s.fragment_id)
     if img is None:
         raise ValueError(f"No image found for sample {s.fragment_id}")
-    s.tablet = Tablet(img=img, name=s.fragment_id)
-    s.gt_boxes = context.local_source.load_annotation(s.fragment_id, s.tablet)
+    s.full_tablet = Tablet(img=img, name=s.fragment_id)
+    s.full_gt_boxes = context.local_source.load_annotation(
+        s.fragment_id,
+        s.full_tablet,
+    )
 
     s.fragment_data = context.api_source.get_fragment_data(s.fragment_id)
     if s.fragment_data is None:
@@ -353,14 +386,14 @@ def load_data(context: CropContext) -> None:
 
 def vis_loaded_data(context: CropContext, vis: VisOptions) -> None:
     s = context.state
-    visual_gt_boxes = gt_boxes_for_visualization(context, s.gt_boxes)
+    visual_gt_boxes = gt_boxes_for_visualization(context, s.full_gt_boxes)
     gt_vis = BboxVisualizer(context.color_config.GT_COLOR.value)
-    gt_vis.draw_boxes(s.tablet.img.copy(), visual_gt_boxes)
+    gt_vis.draw_boxes(s.full_tablet.img.copy(), visual_gt_boxes)
 
     if vis.info:
         total_text = sum(map(len, s.text_lines))
         total_unfiltered = sum(map(len, s.text_lines_unfiltered))
-        hidden_gt_count = len(s.gt_boxes or []) - len(visual_gt_boxes)
+        hidden_gt_count = len(s.full_gt_boxes or []) - len(visual_gt_boxes)
         print(f"Ground truth sign boxes: {len(visual_gt_boxes)}")
         if hidden_gt_count:
             print(f"  Non-sign GT boxes hidden: {hidden_gt_count}")
@@ -383,7 +416,7 @@ def vis_loaded_data(context: CropContext, vis: VisOptions) -> None:
 
 def detect_signs(context: CropContext) -> None:
     s = context.state
-    s.detections = context.tablet_detector.detect(s.tablet)
+    s.full_detections = context.tablet_detector.detect(s.full_tablet)
     _select_crop(context, context.img_idx)
 
 
@@ -397,22 +430,63 @@ def _select_crop(context: CropContext, img_idx: int) -> None:
             f"available crop indices are 0..{len(crop_tablets) - 1}"
         )
     context.img_idx = img_idx
-    context.state.crop_tablet = crop_tablets[img_idx]
-    context.state.det_boxes = context.tablet_detector.get_crop_boxes()[img_idx]
+    s = context.state
+    s.tablet = crop_tablets[img_idx]
+    s.det_boxes = context.tablet_detector.get_crop_boxes()[img_idx]
+
+    # A new crop starts with two isolated copies of the detector output: the
+    # fixed candidate pool and the mutable optimization state.
+    s.candidate_boxes = s.det_boxes.copy()
+    s.optimize_boxes = s.det_boxes.copy()
+
+    # Invalidate every crop-local or iteration-local value. Full-image source
+    # data and parsed text remain valid.
+    s.gt_boxes = None
+    s.text_boxes = None
+    s.text_rows = None
+    s.candidate_rows = None
+    s.optimization_iteration = 0
+    s.optimize_rows = None
+    s.optimize_to_candidate = {}
+    s.optimize_row_to_candidate = {}
+    s.optimize_row_sequences = None
+    s.text_row_sequences = None
+    s.matches = None
+    s.text_to_optimize = None
+    s.optimize_to_text = None
+    s.row_sign_matches = None
+    s.row_anchor_matches = None
+    s.aligned_boxes = None
+    s.aligned_rows = None
+    s.result_without_optimization_boxes = None
+    s.result_without_optimization_relabelled = 0
+    s.result_without_optimization_changed = 0
+    s.text_sign_match_info = None
+    s.optimize_sign_match_info = None
+    s.optimize_row_vis_image = None
+    s.psr_optimizer = None
+    s.dift_affine_probe = None
+    s.source_overlay = None
+    s.candidate_run = None
+    s.extras.clear()
 
 
 def vis_detections(context: CropContext, vis: VisOptions) -> None:
     s = context.state
     color = context.color_config.DET_COLOR.value
     full_vis = BboxVisualizer(color=color)
-    full_vis.draw_boxes(s.tablet.img.copy(), s.detections, show_scores=True)
+    full_vis.draw_boxes(
+        s.full_tablet.img.copy(),
+        s.full_detections,
+        show_scores=True,
+    )
     crop_vis = BboxVisualizer(color=color)
-    crop_vis.draw_boxes(s.crop_tablet.img.copy(), s.det_boxes, show_scores=True)
+    crop_vis.draw_boxes(s.tablet.img.copy(), s.det_boxes, show_scores=True)
     if vis.info:
 
-        x, y = s.crop_tablet.offset_in_parent
-        h, w = s.crop_tablet.shape
-        print(f"Total detections (full image): {len(s.detections)}")
+        x, y = s.tablet.offset_in_parent
+        h, w = s.tablet.shape
+        print(f"Total detections (full image): {len(s.full_detections)}")
         print(f"Sub-image detections: {len(s.det_boxes)}")
         print(
             f"Crop info (img_idx={context.img_idx}): "
@@ -427,28 +501,28 @@ def vis_detections(context: CropContext, vis: VisOptions) -> None:
 
 def transform_gt_to_crop(context: CropContext) -> None:
     s = context.state
-    s.gt_boxes_crop = boxes_in_crop(s.gt_boxes, s.crop_tablet)
+    s.gt_boxes = boxes_in_crop(s.full_gt_boxes, s.tablet)
 
 
 def vis_crop_ground_truth(context: CropContext, vis: VisOptions) -> None:
     s = context.state
+    visual_full_gt_boxes = gt_boxes_for_visualization(context, s.full_gt_boxes)
     visual_gt_boxes = gt_boxes_for_visualization(context, s.gt_boxes)
-    visual_gt_boxes_crop = gt_boxes_for_visualization(context, s.gt_boxes_crop)
     if vis.info:
-        print(f"GT sign boxes (full image): {len(visual_gt_boxes)}")
-        print(f"GT sign boxes (sub-image):  {len(visual_gt_boxes_crop)}")
-        hidden_gt_count = len(s.gt_boxes or []) - len(visual_gt_boxes)
-        hidden_gt_crop_count = len(s.gt_boxes_crop or []) - len(visual_gt_boxes_crop)
-        if hidden_gt_count or hidden_gt_crop_count:
+        print(f"GT sign boxes (full image): {len(visual_full_gt_boxes)}")
+        print(f"GT sign boxes (sub-image):  {len(visual_gt_boxes)}")
+        hidden_full_count = len(s.full_gt_boxes or []) - len(visual_full_gt_boxes)
+        hidden_count = len(s.gt_boxes or []) - len(visual_gt_boxes)
+        if hidden_full_count or hidden_count:
             print(
                 "Non-sign GT boxes hidden "
-                f"(full/sub-image): {hidden_gt_count}/{hidden_gt_crop_count}"
+                f"(full/sub-image): {hidden_full_count}/{hidden_count}"
             )
-    if not visual_gt_boxes_crop:
+    if not visual_gt_boxes:
         return
 
     gt_vis = BboxVisualizer(color=context.color_config.GT_COLOR.value)
-    gt_vis.draw_boxes(s.crop_tablet.img.copy(), visual_gt_boxes_crop)
+    gt_vis.draw_boxes(s.tablet.img.copy(), visual_gt_boxes)
     if vis.save:
         gt_vis.save(_out(context, "sub_image_gt.jpg"))
     if vis.display:
@@ -459,21 +533,21 @@ def vis_detection_statistics(context: CropContext, vis: VisOptions) -> None:
     if not vis.info:
         return
     s = context.state
-    print(f"Full image shape: {s.tablet.img.shape}")
-    print(f"Sub-image shape:  {s.crop_tablet.img.shape}")
-    print(f"Average detected sign  width: {s.detections.avg_width:.2f}")
-    print(f"Average detected sign height: {s.detections.avg_height:.2f}")
+    print(f"Full image shape: {s.full_tablet.img.shape}")
+    print(f"Sub-image shape:  {s.tablet.img.shape}")
+    print(f"Average detected sign  width: {s.full_detections.avg_width:.2f}")
+    print(f"Average detected sign height: {s.full_detections.avg_height:.2f}")
 
 
 def create_box_sets(context: CropContext) -> None:
     s = context.state
     s.text_boxes = Boxes.from_text_lines(
         text_lines=s.text_lines,
-        avg_width=s.detections.avg_width,
-        avg_height=s.detections.avg_height,
+        avg_width=s.full_detections.avg_width,
+        avg_height=s.full_detections.avg_height,
         target_boxes=s.det_boxes,
         align_to_detection_centroid=True,
-        tablet=s.crop_tablet,
+        tablet=s.tablet,
     )
     s.text_rows = BoxRows.from_text_lines(s.text_boxes, s.text_lines)
 
@@ -482,34 +556,63 @@ def vis_box_sets(context: CropContext, vis: VisOptions) -> None:
     if not vis.info:
         return
     s = context.state
-    print(s.crop_tablet.info)
+    print(s.tablet.info)
     print(s.text_boxes.info("text"))
     print(f"Text rows: {len(s.text_rows)}, signs: {len(s.text_boxes)}")
 
 
 def detect_rows(context: CropContext) -> None:
-    context.state.det_rows = BoxRows.detect_using_hough(context.state.det_boxes)
+    s = context.state
+    if s.candidate_boxes is None or s.optimize_boxes is None:
+        raise RuntimeError("detect_rows requires a selected crop")
+    s.candidate_rows = BoxRows.detect_using_hough(s.candidate_boxes)
+    s.optimize_rows = s.candidate_rows.with_boxes(s.optimize_boxes)
+    s.optimize_to_candidate = {
+        box_idx: box_idx for box_idx in range(len(s.optimize_boxes))
+    }
+    s.optimize_row_to_candidate = {
+        row_idx: row_idx for row_idx in range(len(s.candidate_rows))
+    }
 
 
 def vis_detected_rows_info(context: CropContext, vis: VisOptions) -> None:
-    if not vis.info:
+    if vis.info:
+        _print_detected_rows_info(context)
+
+    rows = context.state.candidate_rows
+    if (
+        not (vis.display or vis.save)
+        or getattr(rows, "hough_parameter_space", None) is None
+    ):
         return
+
+    image = _render_hough_parameter_space(rows)
+    if vis.display:
+        _display_bgr(image, "Hough parameter space")
+    if vis.save:
+        path = _out(context, "hough_parameter_space.jpg")
+        cv2.imwrite(path, image)
+        if vis.info:
+            print(f"✓ Saved to: {os.path.abspath(path)}")
+
+
+def _print_detected_rows_info(context: CropContext) -> None:
     s = context.state
     print("=== Row Detection Results ===")
     print(
-        f"Average sign size: {s.detections.avg_size:.2f} px, "
-        f"detected {len(s.det_rows)} rows, {len(s.det_boxes)} signs"
+        f"Average sign size: {s.full_detections.avg_size:.2f} px, "
+        f"detected {len(s.candidate_rows)} rows, {len(s.candidate_boxes)} signs"
     )
-    row_angles = getattr(s.det_rows, "hough_row_angles_deg", np.asarray([]))
-    if getattr(s.det_rows, "hough_angle_deg", None) is not None:
+    row_angles = getattr(s.candidate_rows, "hough_row_angles_deg", np.asarray([]))
+    if getattr(s.candidate_rows, "hough_angle_deg", None) is not None:
         if len(row_angles):
             initial_angles = getattr(
-                s.det_rows,
+                s.candidate_rows,
                 "hough_initial_row_angles_deg",
                 np.asarray([]),
             )
             curve_inliers = getattr(
-                s.det_rows,
+                s.candidate_rows,
                 "hough_angle_curve_inlier_mask",
                 np.asarray([], dtype=bool),
             )
@@ -521,28 +624,28 @@ def vis_detected_rows_info(context: CropContext, vis: VisOptions) -> None:
             print(
                 f"  Hough row angles: {row_angles.min():.1f} to "
                 f"{row_angles.max():.1f} deg, global score peak: "
-                f"{s.det_rows.hough_angle_deg:.1f} deg, "
-                f"baselines: {len(s.det_rows.hough_rhos)}"
+                f"{s.candidate_rows.hough_angle_deg:.1f} deg, "
+                f"baselines: {len(s.candidate_rows.hough_rhos)}"
             )
             print(
                 f"  Curve reselection: {len(initial_angles)} initial, "
                 f"{curve_outliers} robust-fit outliers, "
-                f"±{s.det_rows.hough_curve_search_angle_deg:.1f} deg window"
+                f"±{s.candidate_rows.hough_curve_search_angle_deg:.1f} deg window"
             )
         else:
             print(
                 f"  Hough global score peak: "
-                f"{s.det_rows.hough_angle_deg:.1f} deg, baselines: 0"
+                f"{s.candidate_rows.hough_angle_deg:.1f} deg, baselines: 0"
             )
-    for row_idx, count in enumerate(s.det_rows.counts()):
+    for row_idx, count in enumerate(s.candidate_rows.counts()):
         angle_info = (
             f", angle: {row_angles[row_idx]:.1f} deg"
             if row_idx < len(row_angles)
             else ""
         )
         print(f"  Row {row_idx}: {count} boxes{angle_info}")
-    if s.det_rows.noise:
-        print(f"  Noise: {len(s.det_rows.noise)} boxes")
+    if s.candidate_rows.noise:
+        print(f"  Noise: {len(s.candidate_rows.noise)} boxes")
 
     print("\n=== Text Box Row Info ===")
     print(f"Rows: {len(s.text_rows)}, signs: {len(s.text_boxes)}")
@@ -552,10 +655,12 @@ def vis_detected_rows_info(context: CropContext, vis: VisOptions) -> None:
 
 def match_rows(context: CropContext) -> None:
     s = context.state
-    s.det_row_sequences = s.det_rows.sign_sequences()
+    if s.optimize_rows is None or s.text_rows is None:
+        raise RuntimeError("match_rows requires initialized optimize and text rows")
+    s.optimize_row_sequences = s.optimize_rows.sign_sequences()
     s.text_row_sequences = s.text_rows.sign_sequences()
     s.matches, _ = match_rows_dp(
-        detection_rows=s.det_row_sequences,
+        detection_rows=s.optimize_row_sequences,
         text_rows=s.text_row_sequences,
         skip_text_penalty=0.5,
         skip_det_penalty=1,
@@ -563,8 +668,23 @@ def match_rows(context: CropContext) -> None:
         small_det_threshold=1,
         similarity_method="jaccard",
     )
-    s.text_to_det, s.det_to_text = create_row_mapping(
-        s.matches, len(s.text_row_sequences), len(s.det_row_sequences))
+    s.text_to_optimize, s.optimize_to_text = create_row_mapping(
+        s.matches,
+        len(s.text_row_sequences),
+        len(s.optimize_row_sequences),
+    )
+
+    # Everything below row matching belongs to this iteration and must not be
+    # reused by diagnostics or later steps after the matching input changes.
+    s.row_sign_matches = None
+    s.row_anchor_matches = None
+    s.aligned_boxes = None
+    s.aligned_rows = None
+    s.text_sign_match_info = None
+    s.optimize_sign_match_info = None
+    s.optimize_row_vis_image = None
+    s.psr_optimizer = None
+    s.candidate_run = None
 
 
 def vis_row_matches(context: CropContext, vis: VisOptions) -> None:
@@ -573,23 +693,23 @@ def vis_row_matches(context: CropContext, vis: VisOptions) -> None:
     s = context.state
     print("=== Row Matching ===")
     print(
-        f"Detection rows: {len(s.det_row_sequences)}, "
+        f"Optimize rows: {len(s.optimize_row_sequences)}, "
         f"Text rows: {len(s.text_row_sequences)}, Matched: {len(s.matches)}"
     )
-    for text_idx, det_idx in s.matches:
+    for text_idx, optimize_idx in s.matches:
         text = s.text_row_sequences[text_idx]
-        detected = s.det_row_sequences[det_idx]
+        optimized = s.optimize_row_sequences[optimize_idx]
         print(
             f"  Text row {text_idx} ({len(text)} signs) -> "
-            f"Det row {det_idx} ({len(detected)} signs)"
+            f"Optimize row {optimize_idx} ({len(optimized)} signs)"
         )
         print(f"    Text: {' '.join(text[:5])}{'...' if len(text) > 5 else ''}")
         print(
-            f"    Det:  {' '.join(detected[:5])}"
-            f"{'...' if len(detected) > 5 else ''}"
+            f"    Optimize:  {' '.join(optimized[:5])}"
+            f"{'...' if len(optimized) > 5 else ''}"
         )
-    print(f"Text->Det: {s.text_to_det}")
-    print(f"Det->Text: {s.det_to_text}")
+    print(f"Text->Optimize: {s.text_to_optimize}")
+    print(f"Optimize->Text: {s.optimize_to_text}")
 
 
 def _render_hough_parameter_space(rows: BoxRows) -> np.ndarray:
@@ -691,6 +811,18 @@ def _render_hough_parameter_space(rows: BoxRows) -> np.ndarray:
         linewidths=1.5,
         label="final curve-window reselection",
     )
+    for row_idx, (angle, rho) in enumerate(
+        zip(row_angles, rows.hough_rhos),
+        start=1,
+    ):
+        ax.annotate(
+            f"O{row_idx}",
+            (angle, rho),
+            xytext=(5, 5),
+            textcoords="offset points",
+            color="lime",
+            fontsize=8,
+        )
     ax.set_xlabel("row angle theta (degrees)")
     x_origin = getattr(rows, "hough_x_origin", 0.0)
     ax.set_ylabel(
@@ -707,50 +839,94 @@ def _render_hough_parameter_space(rows: BoxRows) -> np.ndarray:
     return result
 
 
-def vis_detection_rows(context: CropContext, vis: VisOptions) -> None:
+def vis_optimize_rows(context: CropContext, vis: VisOptions) -> None:
     s = context.state
     row_vis = BboxVisualizer(color=(255, 0, 0))
     row_vis.draw_rows(
-        s.crop_tablet.img.copy(),
-        s.det_rows.as_lists(),
+        s.tablet.img.copy(),
+        s.optimize_rows.as_lists(),
         show_labels=True,
         show_row_numbers=True,
-        row_mapping=s.det_to_text,
-        row_label_prefix="D",
+        row_mapping=s.optimize_to_text,
+        row_label_prefix="O",
         mapped_label_prefix="R",
         line_thickness=2,
         marker_size=5,
     )
-    s.det_row_vis_image = row_vis.result
-    s.hough_parameter_space_image = _render_hough_parameter_space(s.det_rows)
+    s.optimize_row_vis_image = row_vis.result
     if vis.info:
-        print("Detection rows: D# on left margin, matched rows show D#->R#")
+        print("Optimize rows: O# on left margin, matched rows show O#->R#")
     if vis.display:
         row_vis.display_result(vis_opt="draw")
-        _display_bgr(
-            s.hough_parameter_space_image,
-            "Hough parameter space",
-        )
     if vis.save:
-        row_vis.save(_out(context, "detection_rows.jpg"))
-        hough_path = _out(context, "hough_parameter_space.jpg")
-        cv2.imwrite(hough_path, s.hough_parameter_space_image)
-        if vis.info:
-            print(f"✓ Saved to: {os.path.abspath(hough_path)}")
+        row_vis.save(_out(context, "optimize_rows.jpg"))
+
+
+vis_detection_rows = vis_optimize_rows  # Backward-compatible function alias.
+
+
+def _candidate_ref_for_optimize_sign(
+    state: SampleState,
+    optimize_row_idx: int,
+    optimize_sign_idx: int,
+) -> Optional[tuple[int, int, int]]:
+    """Return (candidate row, global box, local box) for an optimize sign."""
+    if state.optimize_rows is None or state.candidate_rows is None:
+        raise RuntimeError("candidate and optimize rows must be initialized")
+    try:
+        optimize_box_idx = state.optimize_rows.rows[optimize_row_idx][optimize_sign_idx]
+    except IndexError as error:
+        raise RuntimeError("optimize sign index is inconsistent with its rows") from error
+
+    candidate_box_idx = state.optimize_to_candidate.get(optimize_box_idx)
+    if candidate_box_idx is None:
+        return None
+
+    candidate_row_idx = state.optimize_row_to_candidate.get(optimize_row_idx)
+    if candidate_row_idx is None:
+        raise RuntimeError(
+            f"optimize row {optimize_row_idx} has no fixed-candidate provenance"
+        )
+    try:
+        candidate_sign_idx = state.candidate_rows.rows[candidate_row_idx].index(
+            candidate_box_idx
+        )
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(
+            "optimize sign points outside its fixed candidate row"
+        ) from error
+    return candidate_row_idx, candidate_box_idx, candidate_sign_idx
 
 
 def match_signs_in_rows(context: CropContext) -> None:
     s = context.state
     s.row_sign_matches = {}
-    for text_row_idx, det_row_idx in s.matches:
+    s.row_anchor_matches = {}
+    for text_row_idx, optimize_row_idx in s.matches:
         matches, _ = match_signs_in_row_dp(
-            detection_signs=s.det_row_sequences[det_row_idx],
+            detection_signs=s.optimize_row_sequences[optimize_row_idx],
             text_signs=s.text_row_sequences[text_row_idx],
             skip_text_penalty=0.5,
             skip_det_penalty=2.0,
             mismatch_cost=0.9,
         )
         s.row_sign_matches[text_row_idx] = matches
+        anchors = []
+        for text_idx, optimize_idx in matches:
+            candidate_ref = _candidate_ref_for_optimize_sign(
+                s,
+                optimize_row_idx,
+                optimize_idx,
+            )
+            if candidate_ref is None:
+                continue
+            _, candidate_box_idx, _ = candidate_ref
+            if (
+                s.text_row_sequences[text_row_idx][text_idx]
+                == s.candidate_boxes[candidate_box_idx].sign_name
+            ):
+                anchors.append((text_idx, optimize_idx))
+        s.row_anchor_matches[text_row_idx] = anchors
 
 
 def vis_sign_matches(context: CropContext, vis: VisOptions) -> None:
@@ -759,18 +935,20 @@ def vis_sign_matches(context: CropContext, vis: VisOptions) -> None:
     s = context.state
     MAX_MATCHES_TO_DISPLAY = 20
     print("=== Within-Row Sign Matching ===")
-    for text_row_idx, det_row_idx in s.matches:
+    for text_row_idx, optimize_row_idx in s.matches:
         text = s.text_row_sequences[text_row_idx]
-        detected = s.det_row_sequences[det_row_idx]
+        optimized = s.optimize_row_sequences[optimize_row_idx]
         matches = s.row_sign_matches[text_row_idx]
+        anchors = s.row_anchor_matches[text_row_idx]
         print(
-            f"Text row {text_row_idx} -> Det row {det_row_idx}: "
-            f"{len(text)} text, {len(detected)} det, {len(matches)} matched"
+            f"Text row {text_row_idx} -> Optimize row {optimize_row_idx}: "
+            f"{len(text)} text, {len(optimized)} optimize, "
+            f"{len(matches)} matched, {len(anchors)} candidate-backed anchors"
         )
-        for i, (text_idx, det_idx) in enumerate(matches[:MAX_MATCHES_TO_DISPLAY]):
+        for i, (text_idx, optimize_idx) in enumerate(matches[:MAX_MATCHES_TO_DISPLAY]):
             print(
                 f"  {i + 1}. Text[{text_idx}]={text[text_idx]} "
-                f"<-> Det[{det_idx}]={detected[det_idx]}"
+                f"<-> Optimize[{optimize_idx}]={optimized[optimize_idx]}"
             )
         if len(matches) > MAX_MATCHES_TO_DISPLAY:
             print(f"  ... and {len(matches) - MAX_MATCHES_TO_DISPLAY} more")
@@ -782,26 +960,26 @@ def vis_sign_matches(context: CropContext, vis: VisOptions) -> None:
 
 def align_text_rows(context: CropContext) -> None:
     s = context.state
-    det_rows = s.det_rows.as_dict()
+    optimize_rows = s.optimize_rows.as_dict()
     text_rows = s.text_rows.as_dict()
-    aligned_boxes = Boxes(tablet=s.crop_tablet)
+    aligned_boxes = Boxes(tablet=s.tablet)
     aligned_row_indices = [[] for _ in range(len(s.text_rows))]
 
     for text_row_idx in sorted(s.row_sign_matches):
-        if text_row_idx not in s.text_to_det:
+        if text_row_idx not in s.text_to_optimize:
             continue
-        det_row_idx = s.text_to_det[text_row_idx]
+        optimize_row_idx = s.text_to_optimize[text_row_idx]
         text_row_boxes = text_rows.get(text_row_idx, [])
-        det_row_boxes = det_rows.get(det_row_idx, [])
-        if not text_row_boxes or not det_row_boxes:
+        optimize_row_boxes = optimize_rows.get(optimize_row_idx, [])
+        if not text_row_boxes or not optimize_row_boxes:
             continue
 
         row_boxes = align_text_row_to_detection(
             text_boxes=text_row_boxes,
-            det_boxes=det_row_boxes,
-            matches=s.row_sign_matches[text_row_idx],
-            avg_width=s.detections.avg_width,
-            avg_height=s.detections.avg_height,
+            det_boxes=optimize_row_boxes,
+            matches=s.row_anchor_matches[text_row_idx],
+            avg_width=s.full_detections.avg_width,
+            avg_height=s.full_detections.avg_height,
             min_width_ratio=2 / 3,
             max_width_ratio=4 / 3,
         )
@@ -908,7 +1086,8 @@ class PhysicalCandidate:
 @dataclass
 class CandidateTextAssignment:
     text_row_idx: int
-    det_row_idx: int
+    optimize_row_idx: int
+    candidate_row_idx: int
     text_idx: int
     sign_name: str
     input_status: str
@@ -928,22 +1107,25 @@ class CandidateTextAssignment:
 @dataclass
 class CandidateRowResult:
     text_row_idx: int
-    det_row_idx: int
+    optimize_row_idx: int
+    candidate_row_idx: int
     candidates: list[PhysicalCandidate]
     assignments: list[CandidateTextAssignment]
 
 
 @dataclass
 class CandidateAttractionRun:
+    iteration: int
     config: CandidateAttractionConfig
     boxes: Boxes
     rows: BoxRows
     row_results: dict[int, CandidateRowResult]
+    input_optimize_rows: BoxRows
+    input_text_to_optimize: dict[int, int]
+    input_optimize_to_text: dict[int, int]
+    candidate_to_text: dict[int, int]
     text_sign_match_info: Optional[dict] = None
-    det_sign_match_info: Optional[dict] = None
-
-
-CANDIDATE_RESULT_KEY = "candidate_attraction"
+    candidate_sign_match_info: Optional[dict] = None
 
 
 def _resolve_device(device: str) -> torch.device:
@@ -1285,26 +1467,63 @@ def _copy_candidate_geometry(candidate: PhysicalCandidate, text_box: Box, score:
     )
 
 
+def _candidate_provenance_det_idx(
+    candidate: PhysicalCandidate,
+    sign_name: str,
+    candidate_boxes: list[Box],
+) -> int:
+    """Choose the raw candidate that carries label evidence for the next pass."""
+    matching_members = [
+        det_idx
+        for det_idx in candidate.member_det_indices
+        if candidate_boxes[det_idx].sign_name == sign_name
+    ]
+    if matching_members:
+        return max(matching_members, key=lambda idx: candidate_boxes[idx].score)
+    return candidate.representative_det_idx
+
+
 def _optimize_row(
     context: CropContext,
     text_row_idx: int,
-    det_row_idx: int,
+    optimize_row_idx: int,
+    candidate_row_idx: int,
     config: CandidateAttractionConfig,
     device: torch.device,
 ) -> CandidateRowResult:
     state = context.state
     text_boxes = list(state.aligned_rows.row_boxes(text_row_idx))
-    det_boxes = list(state.det_rows.row_boxes(det_row_idx))
+    candidate_boxes = list(state.candidate_rows.row_boxes(candidate_row_idx))
     sign_pairs = list((state.row_sign_matches or {}).get(text_row_idx, []))
 
+    # Sign matches index the mutable optimize row. Resolve them through flat
+    # provenance before using them in the fixed candidate row.
+    candidate_pair_by_text = {}
+    for text_idx, optimize_idx in sign_pairs:
+        candidate_ref = _candidate_ref_for_optimize_sign(
+            state,
+            optimize_row_idx,
+            optimize_idx,
+        )
+        if candidate_ref is None:
+            continue
+        ref_row_idx, _, candidate_idx = candidate_ref
+        if ref_row_idx != candidate_row_idx:
+            raise RuntimeError("optimize sign resolved to a different candidate row")
+        candidate_pair_by_text[text_idx] = candidate_idx
+
+    anchor_text_indices = {
+        text_idx
+        for text_idx, _ in (state.row_anchor_matches or {}).get(text_row_idx, [])
+    }
     exact_pairs = {
-        text_idx: det_idx
-        for text_idx, det_idx in sign_pairs
-        if text_boxes[text_idx].sign_name == det_boxes[det_idx].sign_name
+        text_idx: candidate_idx
+        for text_idx, candidate_idx in candidate_pair_by_text.items()
+        if text_idx in anchor_text_indices
     }
     protected_det_indices = set(exact_pairs.values())
     candidates, det_to_candidate = _build_physical_candidates(
-        det_boxes, protected_det_indices, config
+        candidate_boxes, protected_det_indices, config
     )
     anchor_candidates = {
         text_idx: det_to_candidate[det_idx]
@@ -1322,12 +1541,11 @@ def _optimize_row(
         if text_idx not in anchor_candidates
     ]
 
-    matched_pair_by_text = {text_idx: det_idx for text_idx, det_idx in sign_pairs}
-    diff_text_indices = set(matched_pair_by_text) - set(exact_pairs)
+    diff_text_indices = set(candidate_pair_by_text) - set(exact_pairs)
     basis = _make_row_basis(
-        det_boxes,
-        fallback_width=state.detections.avg_width,
-        fallback_height=state.detections.avg_height,
+        candidate_boxes,
+        fallback_width=state.full_detections.avg_width,
+        fallback_height=state.full_detections.avg_height,
     )
     initial_parameters_np = _encode_boxes(text_boxes, basis)
     candidate_parameters_np = _encode_boxes([c.box for c in free_candidates], basis)
@@ -1356,7 +1574,7 @@ def _optimize_row(
         sign_name = text_boxes[text_idx].sign_name
         for candidate_idx, candidate in enumerate(free_candidates):
             class_support_np[free_idx, candidate_idx] = candidate.label_scores.get(sign_name, 0.0)
-        original_det_idx = matched_pair_by_text.get(text_idx)
+        original_det_idx = candidate_pair_by_text.get(text_idx)
         if original_det_idx is not None:
             global_candidate_idx = det_to_candidate[original_det_idx]
             free_candidate_idx = candidate_global_to_free.get(global_candidate_idx)
@@ -1404,8 +1622,13 @@ def _optimize_row(
             for text_idx in free_text_indices
         ], device=device)
         baseline_v = (
-            torch.median(torch.as_tensor(_encode_boxes(det_boxes, basis)[:, 1], device=device))
-            if det_boxes else initial_free[:, 1].median()
+            torch.median(
+                torch.as_tensor(
+                    _encode_boxes(candidate_boxes, basis)[:, 1],
+                    device=device,
+                )
+            )
+            if candidate_boxes else initial_free[:, 1].median()
         )
 
         def assemble_all() -> torch.Tensor:
@@ -1511,7 +1734,8 @@ def _optimize_row(
             final_box = _copy_candidate_geometry(candidate, text_box, score=1.0)
             assignment = CandidateTextAssignment(
                 text_row_idx=text_row_idx,
-                det_row_idx=det_row_idx,
+                optimize_row_idx=optimize_row_idx,
+                candidate_row_idx=candidate_row_idx,
                 text_idx=text_idx,
                 sign_name=text_box.sign_name,
                 input_status="fully_matched",
@@ -1540,7 +1764,8 @@ def _optimize_row(
                 )
                 assignment = CandidateTextAssignment(
                     text_row_idx=text_row_idx,
-                    det_row_idx=det_row_idx,
+                    optimize_row_idx=optimize_row_idx,
+                    candidate_row_idx=candidate_row_idx,
                     text_idx=text_idx,
                     sign_name=text_box.sign_name,
                     input_status=input_status,
@@ -1563,7 +1788,8 @@ def _optimize_row(
                 final_box = _copy_candidate_geometry(candidate, text_box, score=probability)
                 assignment = CandidateTextAssignment(
                     text_row_idx=text_row_idx,
-                    det_row_idx=det_row_idx,
+                    optimize_row_idx=optimize_row_idx,
+                    candidate_row_idx=candidate_row_idx,
                     text_idx=text_idx,
                     sign_name=text_box.sign_name,
                     input_status=input_status,
@@ -1583,7 +1809,8 @@ def _optimize_row(
 
     return CandidateRowResult(
         text_row_idx=text_row_idx,
-        det_row_idx=det_row_idx,
+        optimize_row_idx=optimize_row_idx,
+        candidate_row_idx=candidate_row_idx,
         candidates=candidates,
         assignments=assignments,
     )
@@ -1594,58 +1821,101 @@ def get_candidate_run(
     *,
     required: bool = True,
 ) -> Optional[CandidateAttractionRun]:
-    run = context.state.extras.get(CANDIDATE_RESULT_KEY)
+    run = context.state.candidate_run
     if run is None and required:
         raise RuntimeError("candidate attraction has not been run")
-    return run  # type: ignore[return-value]
+    return run
 
 
 def run_candidate_attraction(
     context: CropContext,
     config: Optional[CandidateAttractionConfig] = None,
 ) -> CandidateAttractionRun:
-    """Run candidate attraction without overwriting base alignment fields."""
+    """Attract the current optimize state to the fixed candidate pool."""
 
     state = context.state
-    if state.aligned_rows is None or state.det_rows is None:
+    if (
+        state.aligned_rows is None
+        or state.optimize_rows is None
+        or state.candidate_rows is None
+    ):
         raise RuntimeError(
             "run_candidate_attraction requires the pipeline through align_text_rows"
         )
     config = config or CandidateAttractionConfig()
     device = _resolve_device(config.device)
 
-    output_boxes = Boxes(tablet=state.crop_tablet)
+    input_optimize_rows = state.optimize_rows
+    input_text_to_optimize = dict(state.text_to_optimize or {})
+    input_optimize_to_text = dict(state.optimize_to_text or {})
+
+    output_boxes = Boxes(tablet=state.tablet)
     output_row_indices = [[] for _ in range(len(state.text_rows))]
+    output_to_candidate: dict[int, int] = {}
+    output_row_to_candidate: dict[int, int] = {}
     row_results: dict[int, CandidateRowResult] = {}
-    for text_row_idx, det_row_idx in state.matches or []:
+    for text_row_idx, optimize_row_idx in state.matches or []:
         if not state.aligned_rows.row_boxes(text_row_idx):
             continue
+        candidate_row_idx = state.optimize_row_to_candidate.get(optimize_row_idx)
+        if candidate_row_idx is None:
+            raise RuntimeError(
+                f"optimize row {optimize_row_idx} has no fixed candidate row"
+            )
         result = _optimize_row(
             context,
             text_row_idx=text_row_idx,
-            det_row_idx=det_row_idx,
+            optimize_row_idx=optimize_row_idx,
+            candidate_row_idx=candidate_row_idx,
             config=config,
             device=device,
         )
         row_results[text_row_idx] = result
+        output_row_to_candidate[text_row_idx] = candidate_row_idx
+        candidate_row_boxes = list(
+            state.candidate_rows.row_boxes(candidate_row_idx)
+        )
         for assignment in result.assignments:
             if not assignment.included_in_result:
                 continue
-            output_row_indices[text_row_idx].append(len(output_boxes))
+            output_idx = len(output_boxes)
+            output_row_indices[text_row_idx].append(output_idx)
             output_boxes.append(assignment.final_box)
+            if assignment.candidate_idx is not None:
+                candidate = result.candidates[assignment.candidate_idx]
+                candidate_local_idx = _candidate_provenance_det_idx(
+                    candidate,
+                    assignment.sign_name,
+                    candidate_row_boxes,
+                )
+                output_to_candidate[output_idx] = state.candidate_rows.rows[
+                    candidate_row_idx
+                ][candidate_local_idx]
 
     output_rows = BoxRows(output_boxes, output_row_indices)
+    candidate_to_text = {
+        candidate_row_idx: text_row_idx
+        for text_row_idx, candidate_row_idx in output_row_to_candidate.items()
+    }
     run = CandidateAttractionRun(
+        iteration=state.optimization_iteration,
         config=config,
         boxes=output_boxes,
         rows=output_rows,
         row_results=row_results,
+        input_optimize_rows=input_optimize_rows,
+        input_text_to_optimize=input_text_to_optimize,
+        input_optimize_to_text=input_optimize_to_text,
+        candidate_to_text=candidate_to_text,
     )
-    state.extras[CANDIDATE_RESULT_KEY] = run
-    # Keep the evaluation script's established state contract unchanged.
-    state.candidate_test_boxes = run.boxes
-    state.candidate_test_rows = run.rows
-    state.candidate_test_run = run
+
+    # Commit the complete next-iteration state together so boxes, topology, and
+    # candidate provenance can never refer to different iterations.
+    state.candidate_run = run
+    state.optimize_boxes = output_boxes
+    state.optimize_rows = output_rows
+    state.optimize_to_candidate = output_to_candidate
+    state.optimize_row_to_candidate = output_row_to_candidate
     return run
 
 
@@ -1660,7 +1930,8 @@ def candidate_attraction_records(context: CropContext) -> list[dict]:
             # Tablet/image, which should never be deep-copied for a small table.
             record = {
                 "text_row_idx": assignment.text_row_idx,
-                "det_row_idx": assignment.det_row_idx,
+                "optimize_row_idx": assignment.optimize_row_idx,
+                "candidate_row_idx": assignment.candidate_row_idx,
                 "text_idx": assignment.text_idx,
                 "sign_name": assignment.sign_name,
                 "input_status": assignment.input_status,
@@ -1694,9 +1965,9 @@ def build_candidate_sign_match_info(context: CropContext) -> None:
     state = context.state
     run = get_candidate_run(context)
     text_info = {}
-    det_info = {
+    candidate_info = {
         (row_idx, col_idx): {"status": "unmatched", "text_sign_name": None}
-        for row_idx, row in enumerate(state.det_rows.as_lists())
+        for row_idx, row in enumerate(state.candidate_rows.as_lists())
         for col_idx, _ in enumerate(row)
     }
 
@@ -1720,7 +1991,7 @@ def build_candidate_sign_match_info(context: CropContext) -> None:
                 candidate = row_result.candidates[assignment.candidate_idx]
                 det_sign_name = candidate.box.sign_name
                 for det_idx in candidate.member_det_indices:
-                    det_info[(row_result.det_row_idx, det_idx)] = {
+                    candidate_info[(row_result.candidate_row_idx, det_idx)] = {
                         "status": status,
                         "text_sign_name": assignment.sign_name,
                     }
@@ -1730,7 +2001,7 @@ def build_candidate_sign_match_info(context: CropContext) -> None:
             }
 
     run.text_sign_match_info = text_info
-    run.det_sign_match_info = det_info
+    run.candidate_sign_match_info = candidate_info
 
 
 def vis_candidate_alignment_diagnostic(context: CropContext, vis: VisOptions) -> None:
@@ -1740,31 +2011,37 @@ def vis_candidate_alignment_diagnostic(context: CropContext, vis: VisOptions) ->
     run = get_candidate_run(context)
     if run.text_sign_match_info is None:
         build_candidate_sign_match_info(context)
-    if state.text_sign_match_info is None or state.det_sign_match_info is None:
-        state.text_sign_match_info, state.det_sign_match_info = build_sign_match_info_data(
+    if (
+        state.text_sign_match_info is None
+        or state.optimize_sign_match_info is None
+    ):
+        (
+            state.text_sign_match_info,
+            state.optimize_sign_match_info,
+        ) = build_sign_match_info_data(
             row_sign_matches=state.row_sign_matches,
-            text_to_det=state.text_to_det,
-            det_rows=state.det_rows.as_lists(),
+            text_to_det=run.input_text_to_optimize,
+            det_rows=run.input_optimize_rows.as_lists(),
             aligned_rows=state.aligned_rows.as_lists(),
         )
 
     coarse = BboxVisualizer()
     coarse.draw_alignment_diagnostic(
-        img=state.crop_tablet.img.copy(),
-        det_rows=state.det_rows.as_lists(),
+        img=state.tablet.img.copy(),
+        det_rows=run.input_optimize_rows.as_lists(),
         aligned_rows=state.aligned_rows.as_lists(),
-        det_sign_match_info=state.det_sign_match_info,
+        det_sign_match_info=state.optimize_sign_match_info,
         text_sign_match_info=state.text_sign_match_info,
-        det_to_text=state.det_to_text,
+        det_to_text=run.input_optimize_to_text,
     )
     final = BboxVisualizer()
     final.draw_alignment_diagnostic(
-        img=state.crop_tablet.img.copy(),
-        det_rows=state.det_rows.as_lists(),
+        img=state.tablet.img.copy(),
+        det_rows=state.candidate_rows.as_lists(),
         aligned_rows=run.rows.as_lists(),
-        det_sign_match_info=run.det_sign_match_info,
+        det_sign_match_info=run.candidate_sign_match_info,
         text_sign_match_info=run.text_sign_match_info,
-        det_to_text=state.det_to_text,
+        det_to_text=run.candidate_to_text,
     )
     comparison = CompositeVisualizer()
     comparison.compose(
@@ -1800,23 +2077,23 @@ def vis_candidate_results_comparison(context: CropContext, vis: VisOptions) -> N
     """Mirror the original PSR 2x2 comparison for the candidate experiment."""
 
     state = context.state
-    image = state.crop_tablet.img
-    final_boxes = get_candidate_run(context).boxes
+    image = state.tablet.img
+    result_boxes = get_candidate_run(context).boxes
 
     before = BboxVisualizer(color=NULL_COLOR)
     before.draw_boxes(image.copy(), state.aligned_boxes)
     after = BboxVisualizer(color=CANDIDATE_MATCH_COLOR)
-    after.draw_boxes(image.copy(), final_boxes)
+    after.draw_boxes(image.copy(), result_boxes)
     det_base = BboxVisualizer(color=FIXED_CANDIDATE_COLOR)
-    det_base.draw_boxes(image.copy(), state.det_boxes)
+    det_base.draw_boxes(image.copy(), state.candidate_boxes)
     det_overlay = BboxVisualizer(color=CANDIDATE_MATCH_COLOR)
-    det_overlay.draw_boxes(det_base.result, final_boxes)
+    det_overlay.draw_boxes(det_base.result, result_boxes)
     gt_base = BboxVisualizer(color=GT_COLOR)
     gt_base.draw_boxes(
-        image.copy(), gt_boxes_for_visualization(context, state.gt_boxes_crop)
+        image.copy(), gt_boxes_for_visualization(context, state.gt_boxes)
     )
     gt_overlay = BboxVisualizer(color=CANDIDATE_MATCH_COLOR)
-    gt_overlay.draw_boxes(gt_base.result, final_boxes)
+    gt_overlay.draw_boxes(gt_base.result, result_boxes)
 
     comparison = CompositeVisualizer()
     comparison.compose(
@@ -1824,7 +2101,7 @@ def vis_candidate_results_comparison(context: CropContext, vis: VisOptions) -> N
         layout=(2, 2),
         titles=[
             f"Before: coarse aligned ({len(state.aligned_boxes)} signs)",
-            f"After: candidate result ({len(final_boxes)} signs)",
+            f"After: candidate result ({len(result_boxes)} signs)",
             "Detection (red) + candidate result (yellow)",
             "GT (green) + candidate result (yellow)",
         ],
@@ -1849,7 +2126,7 @@ def vis_candidate_attraction(context: CropContext, vis: VisOptions) -> None:
 
     state = context.state
     run = get_candidate_run(context)
-    image = state.crop_tablet.img.copy()
+    image = state.tablet.img.copy()
 
     # All fixed physical candidates: red, thin.
     for row_result in run.row_results.values():
@@ -1932,19 +2209,28 @@ def vis_candidate_attraction(context: CropContext, vis: VisOptions) -> None:
 def create_result_without_optimization(context: CropContext) -> None:
     """Relabel copied detection boxes using the aligned text correspondences."""
     s = context.state
+    if s.result_without_optimization_boxes is not None:
+        return
     result_boxes = s.det_boxes.copy()
     relabelled = 0
     changed = 0
 
     for text_row_idx, matches in s.row_sign_matches.items():
-        if text_row_idx not in s.text_to_det:
+        if text_row_idx not in s.text_to_optimize:
             continue
-        det_row_idx = s.text_to_det[text_row_idx]
+        optimize_row_idx = s.text_to_optimize[text_row_idx]
         aligned_row = s.aligned_rows.row_boxes(text_row_idx)
-        det_row_indices = s.det_rows.rows[det_row_idx]
 
-        for text_idx, det_idx in matches:
-            result_box = result_boxes[det_row_indices[det_idx]]
+        for text_idx, optimize_idx in matches:
+            candidate_ref = _candidate_ref_for_optimize_sign(
+                s,
+                optimize_row_idx,
+                optimize_idx,
+            )
+            if candidate_ref is None:
+                continue
+            _, candidate_box_idx, _ = candidate_ref
+            result_box = result_boxes[candidate_box_idx]
             aligned_box = aligned_row[text_idx]
             relabelled += 1
             if result_box.sign_name != aligned_box.sign_name:
@@ -1962,9 +2248,9 @@ def vis_result_without_optimization(
     vis: VisOptions,
 ) -> None:
     s = context.state
-    image = s.crop_tablet.img
+    image = s.tablet.img
     result_boxes = s.result_without_optimization_boxes
-    visual_gt_boxes = gt_boxes_for_visualization(context, s.gt_boxes_crop)
+    visual_gt_boxes = gt_boxes_for_visualization(context, s.gt_boxes)
 
     detection_vis = BboxVisualizer(color=(255, 0, 0))
     detection_vis.draw_boxes(image.copy(), s.det_boxes)
@@ -2016,10 +2302,13 @@ def vis_result_without_optimization(
 
 def build_sign_match_info(context: CropContext) -> None:
     s = context.state
-    s.text_sign_match_info, s.det_sign_match_info = build_sign_match_info_data(
+    (
+        s.text_sign_match_info,
+        s.optimize_sign_match_info,
+    ) = build_sign_match_info_data(
         row_sign_matches=s.row_sign_matches,
-        text_to_det=s.text_to_det,
-        det_rows=s.det_rows.as_lists(),
+        text_to_det=s.text_to_optimize,
+        det_rows=s.optimize_rows.as_lists(),
         aligned_rows=s.aligned_rows.as_lists(),
     )
 
@@ -2027,42 +2316,44 @@ def vis_sign_match_info(context: CropContext, vis: VisOptions) -> None:
     s = context.state
     if vis.info:
         text_statuses = [value["status"] for value in s.text_sign_match_info.values()]
-        det_statuses = [value["status"] for value in s.det_sign_match_info.values()]
+        optimize_statuses = [
+            value["status"] for value in s.optimize_sign_match_info.values()
+        ]
         print("=== Sign Match Info ===")
         print(f"  Matched, same label:  {text_statuses.count('same')}")
         print(f"  Matched, diff label:  {text_statuses.count('diff')}")
         print(f"  Unmatched text signs: {text_statuses.count('unmatched')}")
-        print(f"  Unmatched det signs:  {det_statuses.count('unmatched')}")
+        print(f"  Unmatched optimize signs:  {optimize_statuses.count('unmatched')}")
 
     text_row_vis = BboxVisualizer()
     text_row_vis.draw_text_mapping(
         img=None,
         rows=s.text_rows.as_lists(),
-        row_mapping=s.text_to_det,
+        row_mapping=s.text_to_optimize,
         sign_match_info=s.text_sign_match_info,
-        mapped_label_prefix="D",
+        mapped_label_prefix="O",
         line_thickness=2,
         marker_size=5,
     )
     diagnostic_vis = BboxVisualizer()
     diagnostic_vis.draw_alignment_diagnostic(
-        img=s.crop_tablet.img.copy(),
-        det_rows=s.det_rows.as_lists(),
+        img=s.tablet.img.copy(),
+        det_rows=s.optimize_rows.as_lists(),
         aligned_rows=s.aligned_rows.as_lists(),
-        det_sign_match_info=s.det_sign_match_info,
+        det_sign_match_info=s.optimize_sign_match_info,
         text_sign_match_info=s.text_sign_match_info,
-        det_to_text=s.det_to_text,
+        det_to_text=s.optimize_to_text,
         line_thickness=2,
         marker_size=5,
     )
 
     rows_vis = CompositeVisualizer()
-    if s.det_row_vis_image is not None:
+    if s.optimize_row_vis_image is not None:
         rows_vis.compose(
-            images=[s.det_row_vis_image, text_row_vis.result],
+            images=[s.optimize_row_vis_image, text_row_vis.result],
             layout=(1, 2),
             titles=[
-                f"Detection Rows ({len(s.det_row_sequences)} rows)",
+                f"Optimize Rows ({len(s.optimize_row_sequences)} rows)",
                 f"Text Mapping ({len(s.text_row_sequences)} rows, "
                 f"{len(s.matches)} matched)",
             ],
@@ -2073,7 +2364,7 @@ def vis_sign_match_info(context: CropContext, vis: VisOptions) -> None:
         diagnostic_vis.display_result(vis_opt="draw")
     if vis.save:
         text_row_vis.save(_out(context, "text_rows_mapped.jpg"))
-        if s.det_row_vis_image is not None:
+        if s.optimize_row_vis_image is not None:
             rows_vis.save(_out(context, "rows_side_by_side.jpg"))
         diagnostic_vis.save(_out(context, "alignment_diagnostic.jpg"))
 
@@ -2081,11 +2372,14 @@ def vis_offset_analysis(context: CropContext, vis: VisOptions) -> None:
     if not vis.info:
         return
     s = context.state
-    det_rows = s.det_rows.as_dict()
+    optimize_rows = s.optimize_rows.as_dict()
     match_pairs = {
-        (text_row_idx, text_idx): (s.text_to_det[text_row_idx], det_idx)
+        (text_row_idx, text_idx): (
+            s.text_to_optimize[text_row_idx],
+            optimize_idx,
+        )
         for text_row_idx, matches in s.row_sign_matches.items()
-        for text_idx, det_idx in matches
+        for text_idx, optimize_idx in matches
     }
     offsets = {"cx": [], "cy": [], "w": [], "h": []}
     for text_row_idx, row in enumerate(s.aligned_rows.as_lists()):
@@ -2093,17 +2387,17 @@ def vis_offset_analysis(context: CropContext, vis: VisOptions) -> None:
             match = match_pairs.get((text_row_idx, text_col_idx))
             if match is None:
                 continue
-            det_row_idx, det_sign_idx = match
-            det_box = det_rows[det_row_idx][det_sign_idx]
-            offsets["cx"].append(box.cx - det_box.cx)
-            offsets["cy"].append(box.cy - det_box.cy)
-            offsets["w"].append(box.width - det_box.width)
-            offsets["h"].append(box.height - det_box.height)
+            optimize_row_idx, optimize_sign_idx = match
+            optimize_box = optimize_rows[optimize_row_idx][optimize_sign_idx]
+            offsets["cx"].append(box.cx - optimize_box.cx)
+            offsets["cy"].append(box.cy - optimize_box.cy)
+            offsets["w"].append(box.width - optimize_box.width)
+            offsets["h"].append(box.height - optimize_box.height)
 
     if not offsets["cx"]:
         print("No matched pairs found for offset analysis.")
         return
-    print("=== Position Offset Analysis (coarse-aligned vs detection) ===")
+    print("=== Position Offset Analysis (coarse-aligned vs optimize input) ===")
     for key, label in [("cx", "cx"), ("cy", "cy"), ("w", "w "), ("h", "h ")]:
         values = np.array(offsets[key])
         print(
@@ -2115,13 +2409,54 @@ def vis_offset_analysis(context: CropContext, vis: VisOptions) -> None:
 # Part 3 (supplement): PSR optimization
 # =============================================================================
 
+PSR_LINEAGE_KEY = "psr_lineage"
+
+
+def _aligned_candidate_lineage(
+    state: SampleState,
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Map text-topology aligned output back to the fixed candidates."""
+    box_mapping: dict[int, int] = {}
+    row_mapping: dict[int, int] = {}
+    for text_row_idx, aligned_indices in enumerate(state.aligned_rows.rows):
+        if not aligned_indices:
+            continue
+        optimize_row_idx = (state.text_to_optimize or {}).get(text_row_idx)
+        if optimize_row_idx is None:
+            continue
+        candidate_row_idx = state.optimize_row_to_candidate.get(optimize_row_idx)
+        if candidate_row_idx is not None:
+            row_mapping[text_row_idx] = candidate_row_idx
+
+        optimize_by_text = {
+            text_idx: optimize_idx
+            for text_idx, optimize_idx in (state.row_sign_matches or {}).get(
+                text_row_idx,
+                [],
+            )
+        }
+        for text_idx, aligned_box_idx in enumerate(aligned_indices):
+            optimize_idx = optimize_by_text.get(text_idx)
+            if optimize_idx is None:
+                continue
+            candidate_ref = _candidate_ref_for_optimize_sign(
+                state,
+                optimize_row_idx,
+                optimize_idx,
+            )
+            if candidate_ref is not None:
+                box_mapping[aligned_box_idx] = candidate_ref[1]
+    return box_mapping, row_mapping
+
+
 def create_psr_optimizer(context: CropContext) -> None:
     s = context.state
     params = context.psr_params or {}
-    s.optimizer = PointSetRegistrationOptimizer(
+    s.extras[PSR_LINEAGE_KEY] = _aligned_candidate_lineage(s)
+    s.psr_optimizer = PointSetRegistrationOptimizer(
         source_rows=s.aligned_rows.as_lists(),
-        target_detections=s.det_boxes,
-        sigma=s.detections.avg_width * params.get("sigma_factor", 1.5),
+        target_detections=s.candidate_boxes,
+        sigma=s.full_detections.avg_width * params.get("sigma_factor", 1.5),
         w_noise=params.get("w_noise", 0.1),
         lambda_data=params.get("lambda_data", 2.0),
         lambda_anchor=params.get("lambda_anchor", 0.01),
@@ -2133,12 +2468,12 @@ def create_psr_optimizer(context: CropContext) -> None:
         rows_threshold_ratio_close=params.get("rows_threshold_ratio_close", 2 / 3),
         rows_plateau_far=params.get("rows_plateau_far", 0.5),
         rows_plateau_close=params.get("rows_plateau_close", 1.0),
-        contour_mask=s.crop_tablet.mask,
+        contour_mask=s.tablet.mask,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
 def vis_psr_optimizer(context: CropContext, vis: VisOptions) -> None:
-    optimizer = context.state.optimizer
+    optimizer = context.state.psr_optimizer
     if vis.info:
         print("=== PSR Optimizer ===")
         print(
@@ -2172,18 +2507,29 @@ def _optimize_psr(context: CropContext, stop_at_probe: bool = False) -> None:
     s = context.state
     params = context.psr_params or {}
     target = _optimization_target(context, stop_at_probe)
-    iterations = max(0, target - len(s.optimizer.loss_history))
+    iterations = max(0, target - len(s.psr_optimizer.loss_history))
     if iterations <= 0:
-        s.final_boxes = s.optimizer.get_optimized_boxes()
-        return
-    s.final_boxes = s.optimizer.optimize(
-        num_iterations=iterations,
-        lr=params.get("lr", 1.0),
-        sigma_anneal=params.get("sigma_anneal", True),
-        sigma_final=None,
-        verbose=True,
-        log_every=20,
-    )
+        optimized_boxes = s.psr_optimizer.get_optimized_boxes()
+    else:
+        optimized_boxes = s.psr_optimizer.optimize(
+            num_iterations=iterations,
+            lr=params.get("lr", 1.0),
+            sigma_anneal=params.get("sigma_anneal", True),
+            sigma_final=None,
+            verbose=True,
+            log_every=20,
+        )
+
+    s.optimize_boxes = optimized_boxes
+    if (
+        isinstance(optimized_boxes, Boxes)
+        and s.aligned_rows is not None
+        and len(optimized_boxes) == len(s.aligned_rows.boxes)
+    ):
+        box_mapping, row_mapping = s.extras.get(PSR_LINEAGE_KEY, ({}, {}))
+        s.optimize_rows = s.aligned_rows.with_boxes(optimized_boxes)
+        s.optimize_to_candidate = dict(box_mapping)
+        s.optimize_row_to_candidate = dict(row_mapping)
 
 def optimize_psr(context: CropContext) -> None:
     _optimize_psr(context)
@@ -2192,33 +2538,33 @@ def vis_optimization(context: CropContext, vis: VisOptions) -> None:
     if vis.info:
         print(
             f"=== Optimization Complete: "
-            f"{len(context.state.final_boxes)} signs ==="
+            f"{len(context.state.optimize_boxes)} signs ==="
         )
 
 def vis_loss_history(context: CropContext, vis: VisOptions) -> None:
     if vis.display or vis.save:
-        context.state.optimizer.plot_loss_history()
+        context.state.psr_optimizer.plot_loss_history()
 
 def vis_results_comparison(context: CropContext, vis: VisOptions) -> None:
     s = context.state
-    image = s.crop_tablet.img
+    image = s.tablet.img
     before_vis = BboxVisualizer(color=(0, 255, 255))
     before_vis.draw_boxes(image.copy(), s.aligned_boxes)
     after_vis = BboxVisualizer(color=(255, 255, 0))
-    after_vis.draw_boxes(image.copy(), s.final_boxes)
+    after_vis.draw_boxes(image.copy(), s.optimize_boxes)
 
     det_base = BboxVisualizer(color=(255, 0, 0))
     det_base.draw_boxes(image.copy(), s.det_boxes)
     det_overlay = BboxVisualizer(color=(255, 255, 0))
-    det_overlay.draw_boxes(det_base.result, s.final_boxes)
+    det_overlay.draw_boxes(det_base.result, s.optimize_boxes)
 
     gt_base = BboxVisualizer(color=(0, 255, 0))
     gt_base.draw_boxes(
         image.copy(),
-        gt_boxes_for_visualization(context, s.gt_boxes_crop),
+        gt_boxes_for_visualization(context, s.gt_boxes),
     )
     gt_overlay = BboxVisualizer(color=(255, 255, 0))
-    gt_overlay.draw_boxes(gt_base.result, s.final_boxes)
+    gt_overlay.draw_boxes(gt_base.result, s.optimize_boxes)
 
     comparison = CompositeVisualizer()
     comparison.compose(
@@ -2231,7 +2577,7 @@ def vis_results_comparison(context: CropContext, vis: VisOptions) -> None:
         layout=(2, 2),
         titles=[
             f"Before PSR: Coarse Aligned ({len(s.aligned_boxes)} signs)",
-            f"After PSR: Final Optimized ({len(s.final_boxes)} signs)",
+            f"After PSR: Final Optimized ({len(s.optimize_boxes)} signs)",
             "Overlay: Detection (red) + Final (yellow)",
             "Overlay: GT (green) + Final (yellow)",
         ],
@@ -2252,7 +2598,7 @@ def vis_parameter_changes(context: CropContext, vis: VisOptions) -> None:
     if not vis.info:
         return
     s = context.state
-    changes = s.optimizer.get_param_changes()
+    changes = s.psr_optimizer.get_param_changes()
     print("=== Parameter Changes (Coarse -> Final) ===")
     for i, label in enumerate(["cx", "cy", "w ", "h "]):
         values = changes[:, i]
@@ -2265,7 +2611,7 @@ def vis_parameter_changes(context: CropContext, vis: VisOptions) -> None:
     print(f"\n=== First {count} Signs: Coarse -> Final ===")
     for i in range(count):
         before = s.aligned_boxes[i]
-        after = s.final_boxes[i]
+        after = s.optimize_boxes[i]
         print(f"  {i + 1}. {before.sign_name}:")
         print(
             f"      Coarse: cx={before.cx:.1f}, cy={before.cy:.1f}, "
@@ -2315,7 +2661,7 @@ def vis_source_signs(context: CropContext, vis: VisOptions) -> None:
         )
 
     rows, missing, total = collect_detected_source_feature_rows(
-        s.det_boxes,
+        s.candidate_boxes,
         context.dift,
         period,
         max_signs=context.dift.config.feature_viz_max_signs,
@@ -2340,8 +2686,8 @@ def vis_source_signs(context: CropContext, vis: VisOptions) -> None:
 def create_source_sign_overlay(context: CropContext) -> None:
     s = context.state
     image, stats = render_source_sign_overlay(
-        image=s.crop_tablet.img,
-        boxes=s.optimizer.get_optimized_boxes(),
+        image=s.tablet.img,
+        boxes=s.psr_optimizer.get_optimized_boxes(),
         runtime=context.dift,
         period=_source_period(context),
         max_boxes=context.dift.config.source_overlay_max_boxes,
@@ -2349,7 +2695,7 @@ def create_source_sign_overlay(context: CropContext) -> None:
         draw_labels=False,
     )
     s.source_overlay = SignOverlay(
-        iteration=len(s.optimizer.loss_history),
+        iteration=len(s.psr_optimizer.loss_history),
         image=image,
         stats=stats,
     )
@@ -2391,9 +2737,9 @@ def vis_source_sign_overlay(
 
 def run_dift_affine_probe(context: CropContext) -> None:
     s = context.state
-    boxes = s.optimizer.get_optimized_boxes()
+    boxes = s.psr_optimizer.get_optimized_boxes()
     s.dift_affine_probe = DiftAffineProbe(
-        iteration=len(s.optimizer.loss_history),
+        iteration=len(s.psr_optimizer.loss_history),
         boxes=boxes,
         results=build_dift_affine_probe(
             boxes,
@@ -2417,7 +2763,7 @@ def vis_dift_affine_probe(context: CropContext, vis: VisOptions) -> None:
         )
 
     overlay, grid = render_dift_affine_probe(
-        image=s.crop_tablet.img,
+        image=s.tablet.img,
         boxes=probe.boxes,
         results=probe.results,
         iteration=probe.iteration,
@@ -2520,7 +2866,7 @@ class FeatureScoreGrid:
 @dataclass
 class FeatureRowAlignmentResult:
     text_row_idx: int
-    det_row_idx: int
+    optimize_row_idx: int
     anchors: dict[int, int]
     unmatched_text_indices: list[int]
     candidates: list[SlidingWindow]
@@ -2587,30 +2933,30 @@ class _FeatureCoarseAligner:
         self.period = source_period(context)
         self.window_width = _window_dimension(
             config.window_width,
-            self.state.detections.avg_width,
+            self.state.full_detections.avg_width,
         )
         self.window_height = _window_dimension(
             config.window_height,
-            self.state.detections.avg_height,
+            self.state.full_detections.avg_height,
         )
 
     def run(self) -> FeatureCoarseRun:
         state = self.state
-        det_rows = state.det_rows.as_dict()
+        optimize_rows = state.optimize_rows.as_dict()
         text_rows = state.text_rows.as_dict()
-        aligned_boxes = Boxes(tablet=state.crop_tablet)
+        aligned_boxes = Boxes(tablet=state.tablet)
         aligned_indices = [[] for _ in range(len(state.text_rows))]
         results = {}
 
         for text_row_idx in sorted(state.row_sign_matches):
-            det_row_idx = state.text_to_det.get(text_row_idx)
-            if det_row_idx is None:
+            optimize_row_idx = state.text_to_optimize.get(text_row_idx)
+            if optimize_row_idx is None:
                 continue
             result, row_boxes = self._align_row(
                 text_row_idx,
-                det_row_idx,
+                optimize_row_idx,
                 text_rows[text_row_idx],
-                det_rows[det_row_idx],
+                optimize_rows[optimize_row_idx],
             )
             results[text_row_idx] = result
             for box in row_boxes:
@@ -2628,11 +2974,11 @@ class _FeatureCoarseAligner:
     def _align_row(
         self,
         text_row_idx: int,
-        det_row_idx: int,
+        optimize_row_idx: int,
         text_boxes: list[Box],
         det_boxes: list[Box],
     ) -> tuple[FeatureRowAlignmentResult, list[Box]]:
-        sign_matches = self.state.row_sign_matches[text_row_idx]
+        sign_matches = self.state.row_anchor_matches[text_row_idx]
         anchors = _exact_anchor_map(text_boxes, det_boxes, sign_matches)
         unmatched = [idx for idx in range(len(text_boxes)) if idx not in anchors]
         expected_centers = _expected_text_centers(
@@ -2650,7 +2996,7 @@ class _FeatureCoarseAligner:
             },
             expected_centers=expected_centers,
             baseline=_fit_row_baseline(det_boxes),
-            image_shape=self.state.crop_tablet.img.shape[:2],
+            image_shape=self.state.tablet.img.shape[:2],
             window_size=(self.window_width, self.window_height),
             step_px=self.config.step_px,
             margin_px=self.config.search_margin_px,
@@ -2701,7 +3047,7 @@ class _FeatureCoarseAligner:
 
         return FeatureRowAlignmentResult(
             text_row_idx=text_row_idx,
-            det_row_idx=det_row_idx,
+            optimize_row_idx=optimize_row_idx,
             anchors=anchors,
             unmatched_text_indices=unmatched,
             candidates=candidates,
@@ -2732,7 +3078,7 @@ class _FeatureCoarseAligner:
             crop = _window_box(
                 candidate,
                 text_boxes[unmatched[0]],
-                self.state.crop_tablet,
+                self.state.tablet,
             ).crop_image()
             crop_feature = self.runtime.featurize_image(crop)
             matches_by_sign = {}
@@ -3084,7 +3430,7 @@ def _render_overlay(
     context: CropContext,
     run: FeatureCoarseRun,
 ) -> np.ndarray:
-    image = _to_bgr(context.state.crop_tablet.img).copy()
+    image = _to_bgr(context.state.tablet.img).copy()
     for row_result in run.rows.values():
         for candidate in row_result.candidates:
             cv2.rectangle(
@@ -3147,13 +3493,19 @@ class Runner:
         self.context = context
         self.vis = vis or VisOptions()
         self._fragments = context.local_source.get_available_fragments()
-        context.state.fragments = self._fragments
         print(f"Found {len(self._fragments)} fragments with both image and annotation")
 
         if self.vis.save:
             os.makedirs(context.output_dir, exist_ok=True)
 
-    def run(self, steps: list[Step]) -> None:
+    def run(
+        self,
+        steps: list[Step],
+        *,
+        advance_iteration: bool = False,
+    ) -> None:
+        if advance_iteration:
+            self.context.state.optimization_iteration += 1
         for step in steps:
             step.run(self.context)
             if step.visualize:
@@ -3164,13 +3516,10 @@ class Runner:
             idx = self._fragments.index(name)
         fragment_id = self._fragments[idx]
         print(f"Processing sample: {fragment_id}")
-        self.context.state = SampleState(
-            fragments=self._fragments,
-            fragment_id=fragment_id,
-        )
+        self.context.state = SampleState(fragment_id=fragment_id)
 
     def choose_crop(self, crop_idx: int) -> None:
         self.context.img_idx = crop_idx
-        if self.context.state.detections is None:
+        if self.context.state.full_detections is None:
             return
         _select_crop(self.context, crop_idx)

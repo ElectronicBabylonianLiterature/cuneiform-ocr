@@ -87,14 +87,19 @@ if __name__ == "__main__":
                 Step("Create PSR optimizer", create_psr_optimizer, vis_psr_optimizer),
                 Step("Optimize PSR", optimize_psr, vis_optimization),
             ])
-            if not s.det_rows or not len(s.det_rows) or not s.matches or not s.aligned_boxes:
+            if (
+                not s.optimize_rows
+                or not len(s.optimize_rows)
+                or not s.matches
+                or not s.aligned_boxes
+            ):
                 continue
             crop_runner.run([
                 Step("Results comparison", lambda _: None, vis_results_comparison)
             ])
 
-            for sb in s.final_boxes:
-                all_optimized_full.append(sb.to_tablet(s.tablet))
+            for sb in s.optimize_boxes:
+                all_optimized_full.append(sb.to_tablet(s.full_tablet))
 
         TextVisualizer.save_text(
             s.text_lines,
@@ -103,8 +108,8 @@ if __name__ == "__main__":
         )
         summary.append({
             'fragment_id': fid,
-            'gt_count': len(s.gt_boxes or []),
-            'detected': len(s.detections or []),
+            'gt_count': len(s.full_gt_boxes or []),
+            'detected': len(s.full_detections or []),
             'aligned': len(all_optimized_full),
         })
         print(f"  Aligned: {len(all_optimized_full)} signs")

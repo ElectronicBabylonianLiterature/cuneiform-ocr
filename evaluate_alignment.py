@@ -587,22 +587,28 @@ def _load_and_detect_fragment(runner: Runner, context: CropContext, fid: str) ->
     runner.run([Step("Load data", load_data, vis_loaded_data)])
 
     s = context.state
-    if s.tablet is None or not s.text_lines or not s.gt_boxes:
+    if s.full_tablet is None or not s.text_lines or not s.full_gt_boxes:
         return False
 
     # Filter out abnormally large GT boxes (e.g. sub-tablet region annotations)
-    areas = [b.width * b.height for b in s.gt_boxes]
+    areas = [b.width * b.height for b in s.full_gt_boxes]
     mean_area = np.mean(areas)
-    s.gt_boxes = Boxes((b for b, a in zip(s.gt_boxes, areas) if a <= mean_area * 5),
-                       tablet=s.gt_boxes.tablet)
-    if not s.gt_boxes:
+    s.full_gt_boxes = Boxes(
+        (
+            box
+            for box, area in zip(s.full_gt_boxes, areas)
+            if area <= mean_area * 5
+        ),
+        tablet=s.full_gt_boxes.tablet,
+    )
+    if not s.full_gt_boxes:
         return False
 
     runner.run([
         Step("Detect signs", detect_signs, vis_detections),
         Step("Detection statistics", lambda _: None, vis_detection_statistics),
     ])
-    if not s.detections:
+    if not s.full_detections:
         return False
 
     return True
@@ -628,18 +634,18 @@ def _predict_detection_crops(
         if not s.det_boxes:
             continue
         for det in s.det_boxes:
-            raw_preds.append(det.to_tablet(s.tablet))
+            raw_preds.append(det.to_tablet(s.full_tablet))
 
     # Suppress cross-crop duplicates: the same sign detected in overlapping crops
     # appears multiple times after offsetting; all but the highest-score one are FP.
     preds = _nms_predictions(raw_preds, iou_threshold=0.5)
 
-    if visualize and s.tablet is not None:
+    if visualize and s.full_tablet is not None:
         visualize_evaluation_fragment(
-            img=s.tablet.img,
+            img=s.full_tablet.img,
             fragment_id=fid,
             preds=preds,
-            gts=s.gt_boxes,
+            gts=s.full_gt_boxes,
             iou_threshold=0.5,
             class_agnostic=False,
             output_dir=output_dir,
@@ -691,14 +697,14 @@ def _predict_without_psr_crops(
         # so detector confidence scores (already filtered by SCORE_THRESHOLD)
         # are preserved here.
         for box in s.result_without_optimization_boxes:
-            preds.append(box.to_tablet(s.tablet))
+            preds.append(box.to_tablet(s.full_tablet))
 
-    if visualize and s.tablet is not None:
+    if visualize and s.full_tablet is not None:
         visualize_evaluation_fragment(
-            img=s.tablet.img,
+            img=s.full_tablet.img,
             fragment_id=fid,
             preds=preds,
-            gts=s.gt_boxes,
+            gts=s.full_gt_boxes,
             iou_threshold=0.5,
             class_agnostic=False,
             output_dir=output_dir,
@@ -717,7 +723,7 @@ def _predict_det_as_candidates_crops(
 
     The alignment prefix is deliberately identical to WITHOUT_PSR and to the
     candidate notebook.  Detector boxes are then treated as fixed candidates;
-    the filtered ``candidate_test_boxes`` are returned in full-image coordinates.
+    the filtered candidate-run boxes are returned in full-image coordinates.
     The shared module-level ``SCORE_THRESHOLD`` remains the only prediction
     score threshold for this evaluation mode.
     """
@@ -739,26 +745,26 @@ def _predict_det_as_candidates_crops(
             continue
 
         _run_without_psr_alignment_steps(runner)
-        if s.aligned_rows is None or s.det_rows is None:
+        if s.aligned_rows is None or s.candidate_rows is None:
             continue
 
-        run_candidate_attraction(context, candidate_config)
-        if s.candidate_test_boxes is None:
+        candidate_run = run_candidate_attraction(context, candidate_config)
+        if not candidate_run.boxes:
             continue
 
-        for box in s.candidate_test_boxes:
+        for box in candidate_run.boxes:
             # Candidate construction and final assignment confidence deliberately
             # share the detector's module-level threshold; there is no mode-local
             # score cutoff.
             if box.score >= SCORE_THRESHOLD:
-                preds.append(box.to_tablet(s.tablet))
+                preds.append(box.to_tablet(s.full_tablet))
 
-    if visualize and s.tablet is not None:
+    if visualize and s.full_tablet is not None:
         visualize_evaluation_fragment(
-            img=s.tablet.img,
+            img=s.full_tablet.img,
             fragment_id=fid,
             preds=preds,
-            gts=s.gt_boxes,
+            gts=s.full_gt_boxes,
             iou_threshold=0.5,
             class_agnostic=False,
             output_dir=output_dir,
@@ -787,7 +793,12 @@ def _predict_psr_crops(
         if not s.det_boxes:
             continue
         _run_without_psr_alignment_steps(runner)
-        if not s.det_rows or not len(s.det_rows) or not s.matches or not s.aligned_boxes:
+        if (
+            not s.optimize_rows
+            or not len(s.optimize_rows)
+            or not s.matches
+            or not s.aligned_boxes
+        ):
             continue
 
         runner.run([
@@ -795,18 +806,18 @@ def _predict_psr_crops(
             Step("Create PSR optimizer", create_psr_optimizer, vis_psr_optimizer),
             Step("Optimize PSR", optimize_psr, vis_optimization),
         ])
-        if not s.final_boxes:
+        if not s.optimize_boxes:
             continue
 
-        for sb in s.final_boxes:
-            preds.append(sb.to_tablet(s.tablet))
+        for sb in s.optimize_boxes:
+            preds.append(sb.to_tablet(s.full_tablet))
 
-    if visualize and s.tablet is not None:
+    if visualize and s.full_tablet is not None:
         visualize_evaluation_fragment(
-            img=s.tablet.img,
+            img=s.full_tablet.img,
             fragment_id=fid,
             preds=preds,
-            gts=s.gt_boxes,
+            gts=s.full_gt_boxes,
             iou_threshold=0.5,
             class_agnostic=False,
             output_dir=output_dir,
@@ -873,11 +884,11 @@ def run_predictions(
             raise ValueError(f"Unknown prediction mode: {prediction_mode}")
 
         if verbose:
-            print(f"    GT={len(s.gt_boxes)}, Pred={len(all_preds)}")
+            print(f"    GT={len(s.full_gt_boxes)}, Pred={len(all_preds)}")
         all_results.append({
             'fragment_id': fid,
             'preds': all_preds,
-            'gts': s.gt_boxes,
+            'gts': s.full_gt_boxes,
         })
 
     return all_results, skipped
