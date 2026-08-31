@@ -64,7 +64,7 @@ load_dotenv()
 COCO_TEST_DIR = os.path.expanduser("~/erc-work-data/ready-for-training/coco-recognition-2025-09/data/coco")
 CONFIG_FILE = "configs/detr.py"
 CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/epoch_1000.pth")
-SCORE_THRESHOLD = 0.1
+SCORE_THRESHOLD = 0.0
 EVAL_OUTPUT_DIR = "evaluation_results"
 
 # Number of fragments to evaluate / search
@@ -1102,6 +1102,8 @@ if __name__ == "__main__":
         default_score_threshold=SCORE_THRESHOLD,
         keep_crops=True,
         is_crop_itself=True,
+        use_sahi=True,
+        box_slice_ratio=0.2,
     )
     print("Model loaded.")
 

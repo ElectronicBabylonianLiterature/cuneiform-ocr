@@ -1,5 +1,6 @@
 from attr import dataclass
 from enum import Enum
+import warnings
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -99,6 +100,15 @@ class BboxVisualizer:
             label_y2 = y1 + label_height
             
             # Draw label background with box color
+            if label_x2 < label_x1 or label_y2 < label_y1:
+                warnings.warn(
+                    "Skipping label for too-small box "
+                    f"{box.sign.name!r} at ({x1}, {y1}, {x2}, {y2}); "
+                    "the detection box itself is still drawn.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             draw.rectangle([label_x1, label_y1, label_x2, label_y2], fill=color)
             
             # Draw white text

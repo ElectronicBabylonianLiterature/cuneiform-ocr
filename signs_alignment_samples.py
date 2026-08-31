@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from sign_alignment import LocalDataSource, ModelConfig, TabletImageDetector, TextVisualizer
 from sign_alignment.visualizer import ColorConfig
 from sign_alignment.pipeline import (
+    INITIAL_OUTPUT_CATEGORY,
     CropContext, Runner, SampleState, Step, VisOptions,
     align_text_rows,
     build_sign_match_info,
@@ -17,6 +18,7 @@ from sign_alignment.pipeline import (
     match_rows,
     match_signs_in_rows,
     optimize_psr,
+    output_path,
     transform_gt_to_crop,
     vis_aligned_rows,
     vis_box_sets,
@@ -38,14 +40,21 @@ load_dotenv()
 ANNOTATIONS_DIR = os.path.expanduser("~/erc-work-data/data-of-cuneiform-ocr-data/filtered_annotations")
 CONFIG_FILE = "configs/detr.py"
 CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/epoch_1000.pth")
-SCORE_THRESHOLD = 0.5
+SCORE_THRESHOLD = 0.3
 OUTPUT_DIR = "alignment_results"
 SAMPLE_LIMIT = 7
 
 if __name__ == "__main__":
     local_source = LocalDataSource(ANNOTATIONS_DIR)
     model_config = ModelConfig(CONFIG_FILE, CHECKPOINT_FILE, device='auto')
-    tablet_detector = TabletImageDetector(model_config, SCORE_THRESHOLD, keep_crops=True)
+    tablet_detector = TabletImageDetector(
+        model_config=model_config,
+        default_score_threshold=SCORE_THRESHOLD,
+        keep_crops=True,
+        is_crop_itself=False,
+        use_sahi=True,
+        box_slice_ratio=0.2,
+    )
     context = CropContext(
         tablet_detector=tablet_detector,
         local_source=local_source,
@@ -103,7 +112,11 @@ if __name__ == "__main__":
 
         TextVisualizer.save_text(
             s.text_lines,
-            path=os.path.join(OUTPUT_DIR, f"{fid}_3_text.txt"),
+            path=output_path(
+                context,
+                "3_text.txt",
+                category=INITIAL_OUTPUT_CATEGORY,
+            ),
             fragment_id=fid,
         )
         summary.append({

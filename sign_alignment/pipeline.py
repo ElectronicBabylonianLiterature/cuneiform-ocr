@@ -126,16 +126,7 @@ class BoxRows:
     def detect_using_hough(
         cls,
         boxes: Boxes,
-        angle_range_deg: float = 15.0,
-        angle_step_deg: float = 1.0,
-        rho_step_factor: float = 0.04,
-        rho_sigma_factor: float = 0.10,
-        min_line_distance_factor: float = 0.30,
-        assignment_distance_factor: float = 0.24,
-        min_peak_votes: float = 1.25,
-        min_row_size: int = 2,
-        curve_search_angle_deg: float = 5.0,
-        curve_curvature_penalty: float = 1.0,
+        **hough_parameters,
     ) -> "BoxRows":
         """Group boxes using 2-D Hough peaks and one fitted angle per row.
 
@@ -145,11 +136,11 @@ class BoxRows:
         disjointly and each row is robustly refitted. A robust low-curvature,
         zero-average-slope angle curve is fitted through that first selection,
         then the final selection is repeated inside its local angle window.
-        Both the Hough grid and every continuous refit are bounded by
-        ``angle_range_deg``.
+        Detection parameters are passed directly to ``detect_hough_rows``,
+        which is the only place that defines their defaults.
         """
         if not boxes:
-            return cls(boxes=boxes, rows=[])
+            raise ValueError("Hough row detection requires at least one box")
 
         centers = np.asarray(
             [[box.cx, box.cy] for box in boxes],
@@ -159,16 +150,7 @@ class BoxRows:
         detection = detect_hough_rows(
             centers=centers,
             scale=scale,
-            angle_range_deg=angle_range_deg,
-            angle_step_deg=angle_step_deg,
-            rho_step_factor=rho_step_factor,
-            rho_sigma_factor=rho_sigma_factor,
-            min_line_distance_factor=min_line_distance_factor,
-            assignment_distance_factor=assignment_distance_factor,
-            min_peak_votes=min_peak_votes,
-            min_row_size=min_row_size,
-            curve_search_angle_deg=curve_search_angle_deg,
-            curve_curvature_penalty=curve_curvature_penalty,
+            **hough_parameters,
         )
         result = cls(
             boxes=boxes,
@@ -184,6 +166,8 @@ class BoxRows:
         result.hough_angles_deg = detection.angles_deg
         result.hough_rho_grid = detection.rho_grid
         result.hough_parameter_space = detection.parameter_space
+        result.hough_strict_neighbour_max = detection.strict_neighbour_max
+        result.hough_peak_indices = detection.peak_indices
         result.hough_angle_scores = detection.angle_scores
         result.hough_x_origin = detection.x_origin
         result.hough_initial_row_angles_deg = detection.initial_row_angles_deg
@@ -277,8 +261,8 @@ class CropContext:
     dift: Optional[DiftRuntime] = None
     sign_source: Optional[DataSource] = None
     canonical_source: Optional[DataSource] = None
-    state: SampleState = field(default_factory=SampleState)
     task_type: str = "debug"
+    state: SampleState = field(default_factory=SampleState)
     gt_visualization_excluded_prefixes: tuple[str, ...] = ("SURFACE_",)
 
 
@@ -293,20 +277,28 @@ class Step:
     visualize: Optional[VisFn] = None
 
 
-def output_path(context: CropContext, suffix: str) -> str:
-    iteration = context.state.optimization_iteration
-    iteration_suffix = f"_iter{iteration:03d}" if iteration > 0 else ""
-    fragment_dir = os.path.join(
+INITIAL_OUTPUT_CATEGORY = "initial"
+ROW_DETECTION_OUTPUT_CATEGORY = "row_detection"
+
+
+def output_path(
+    context: CropContext,
+    suffix: str,
+    *,
+    category: str | None = None,
+) -> str:
+    """Return a visualization path grouped by pipeline stage."""
+    if category is None:
+        category = f"iter_{context.state.optimization_iteration:03d}"
+    category_dir = os.path.join(
         context.output_dir,
         context.state.fragment_id,
+        category,
     )
-    os.makedirs(fragment_dir, exist_ok=True)
+    os.makedirs(category_dir, exist_ok=True)
     return os.path.join(
-        fragment_dir,
-        (
-            f"{context.task_type}_{context.state.fragment_id}"
-            f"{iteration_suffix}_{suffix}"
-        ),
+        category_dir,
+        f"{context.task_type}_{context.state.fragment_id}_{suffix}",
     )
 
 
@@ -404,12 +396,26 @@ def vis_loaded_data(context: CropContext, vis: VisOptions) -> None:
         )
     if vis.save:
         TextVisualizer.save_text(
-            s.text_lines, path=_out(context, "text_filtered.txt"),
+            s.text_lines,
+            path=_out(
+                context,
+                "text_filtered.txt",
+                category=INITIAL_OUTPUT_CATEGORY,
+            ),
             fragment_id=s.fragment_id)
         TextVisualizer.save_text(
-            s.text_lines_unfiltered, path=_out(context, "text.txt"),
+            s.text_lines_unfiltered,
+            path=_out(
+                context,
+                "text.txt",
+                category=INITIAL_OUTPUT_CATEGORY,
+            ),
             fragment_id=s.fragment_id)
-        gt_vis.save(_out(context, "gt.jpg"))
+        gt_vis.save(_out(
+            context,
+            "gt.jpg",
+            category=INITIAL_OUTPUT_CATEGORY,
+        ))
     if vis.display:
         gt_vis.display_result(vis_opt="draw")
 
@@ -493,8 +499,16 @@ def vis_detections(context: CropContext, vis: VisOptions) -> None:
             f"x={x}, y={y}, w={w}, h={h}"
         )
     if vis.save:
-        full_vis.save(_out(context, "det.jpg"))
-        crop_vis.save(_out(context, "sub_image.jpg"))
+        full_vis.save(_out(
+            context,
+            "det.jpg",
+            category=INITIAL_OUTPUT_CATEGORY,
+        ))
+        crop_vis.save(_out(
+            context,
+            "sub_image.jpg",
+            category=INITIAL_OUTPUT_CATEGORY,
+        ))
     if vis.display:
         crop_vis.display_result(vis_opt="draw")
 
@@ -524,7 +538,11 @@ def vis_crop_ground_truth(context: CropContext, vis: VisOptions) -> None:
     gt_vis = BboxVisualizer(color=context.color_config.GT_COLOR.value)
     gt_vis.draw_boxes(s.tablet.img.copy(), visual_gt_boxes)
     if vis.save:
-        gt_vis.save(_out(context, "sub_image_gt.jpg"))
+        gt_vis.save(_out(
+            context,
+            "sub_image_gt.jpg",
+            category=INITIAL_OUTPUT_CATEGORY,
+        ))
     if vis.display:
         gt_vis.display_result(vis_opt="draw")
 
@@ -586,14 +604,36 @@ def vis_detected_rows_info(context: CropContext, vis: VisOptions) -> None:
     ):
         return
 
-    image = _render_hough_parameter_space(rows)
-    if vis.display:
-        _display_bgr(image, "Hough parameter space")
-    if vis.save:
-        path = _out(context, "hough_parameter_space.jpg")
-        cv2.imwrite(path, image)
-        if vis.info:
-            print(f"✓ Saved to: {os.path.abspath(path)}")
+    rendered_images = [(
+        _render_hough_parameter_space(rows),
+        "Hough parameter space",
+        "hough_parameter_space.jpg",
+    )]
+    if getattr(rows, "hough_strict_neighbour_max", None) is not None:
+        rendered_images.append((
+            _render_hough_strict_neighbour_max(rows),
+            "Hough strict-neighbour maximum",
+            "hough_strict_neighbour_max.jpg",
+        ))
+    if getattr(rows, "hough_peak_indices", None) is not None:
+        rendered_images.append((
+            _render_hough_peaks(rows),
+            "Hough local peaks",
+            "hough_peaks.jpg",
+        ))
+
+    for image, title, suffix in rendered_images:
+        if vis.display:
+            _display_bgr(image, title)
+        if vis.save:
+            path = _out(
+                context,
+                suffix,
+                category=ROW_DETECTION_OUTPUT_CATEGORY,
+            )
+            cv2.imwrite(path, image)
+            if vis.info:
+                print(f"✓ Saved to: {os.path.abspath(path)}")
 
 
 def _print_detected_rows_info(context: CropContext) -> None:
@@ -830,6 +870,99 @@ def _render_hough_parameter_space(rows: BoxRows) -> np.ndarray:
     )
     ax.set_title("Two-pass Hough row selection from detection-box centers")
     ax.legend(loc="upper right")
+    fig.colorbar(image, ax=ax, label="equal-weight Gaussian votes")
+    fig.tight_layout()
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    result = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+    plt.close(fig)
+    return result
+
+
+def _render_hough_strict_neighbour_max(rows: BoxRows) -> np.ndarray:
+    """Render the maximum vote among neighbouring Hough cells."""
+    import matplotlib.pyplot as plt
+
+    angles = rows.hough_angles_deg
+    rho_grid = rows.hough_rho_grid
+    angle_step = float(angles[1] - angles[0])
+    rho_step = float(rho_grid[1] - rho_grid[0])
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    image = ax.imshow(
+        rows.hough_strict_neighbour_max,
+        cmap="magma",
+        aspect="auto",
+        interpolation="nearest",
+        vmin=float(np.min(rows.hough_parameter_space)),
+        vmax=float(np.max(rows.hough_parameter_space)),
+        extent=(
+            angles[0] - angle_step / 2,
+            angles[-1] + angle_step / 2,
+            rho_grid[-1] + rho_step / 2,
+            rho_grid[0] - rho_step / 2,
+        ),
+    )
+    ax.set_xlabel("row angle theta (degrees)")
+    x_origin = getattr(rows, "hough_x_origin", 0.0)
+    ax.set_ylabel(
+        f"normal coordinate rho (pixels; x centered at {x_origin:.1f})"
+    )
+    ax.set_title("Strict-neighbour maximum in Hough parameter space")
+    fig.colorbar(
+        image,
+        ax=ax,
+        label="maximum Gaussian vote among neighbouring cells",
+    )
+    fig.tight_layout()
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    result = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+    plt.close(fig)
+    return result
+
+
+def _render_hough_peaks(rows: BoxRows) -> np.ndarray:
+    """Render every thresholded strict peak over the Hough accumulator."""
+    import matplotlib.pyplot as plt
+
+    angles = rows.hough_angles_deg
+    rho_grid = rows.hough_rho_grid
+    angle_step = float(angles[1] - angles[0])
+    rho_step = float(rho_grid[1] - rho_grid[0])
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    image = ax.imshow(
+        rows.hough_parameter_space,
+        cmap="magma",
+        aspect="auto",
+        interpolation="nearest",
+        extent=(
+            angles[0] - angle_step / 2,
+            angles[-1] + angle_step / 2,
+            rho_grid[-1] + rho_step / 2,
+            rho_grid[0] - rho_step / 2,
+        ),
+    )
+    peaks = rows.hough_peak_indices
+    if len(peaks):
+        ax.scatter(
+            angles[peaks[:, 1]],
+            rho_grid[peaks[:, 0]],
+            facecolors="none",
+            edgecolors="cyan",
+            marker="o",
+            s=36,
+            linewidths=1.0,
+            label=f"strict local peaks ({len(peaks)})",
+        )
+        ax.legend(loc="upper right")
+    ax.set_xlabel("row angle theta (degrees)")
+    x_origin = getattr(rows, "hough_x_origin", 0.0)
+    ax.set_ylabel(
+        f"normal coordinate rho (pixels; x centered at {x_origin:.1f})"
+    )
+    ax.set_title("Thresholded strict local peaks in Hough parameter space")
     fig.colorbar(image, ax=ax, label="equal-weight Gaussian votes")
     fig.tight_layout()
     fig.canvas.draw()

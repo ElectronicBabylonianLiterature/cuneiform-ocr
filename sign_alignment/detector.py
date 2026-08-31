@@ -7,6 +7,7 @@ from typing import List, Optional
 from mmdet.apis import init_detector, inference_detector
 from mmdet.utils import register_all_modules
 
+import cv2
 import torch
 import numpy as np
 
@@ -30,12 +31,21 @@ class BaseDetector(ABC):
         default_score_threshold: float = 0.5,
         is_load_now: bool = True,
         model=None,
+        use_sahi: bool = False,
+        sahi_model=None,
+        box_slice_ratio: float = 0.15,
     ):
         self.default_score_threshold = default_score_threshold
         self.model_config = model_config
         self.model = model
+        self.use_sahi = use_sahi
+        self.sahi_model = sahi_model
+        self.box_slice_ratio = box_slice_ratio
+        self.slice_height = None
+        self.slice_width = None
         self.result = {}
-        if self.model is None and is_load_now:
+        model_is_missing = self.sahi_model is None if self.use_sahi else self.model is None
+        if model_is_missing and is_load_now:
             self.load_model()
     
     @abstractmethod
@@ -52,14 +62,26 @@ class BaseDetector(ABC):
         register_all_modules()
         device = self._select_device(self.model_config.device)
         print(f"Using device: {device}")
-        self.model = init_detector(
-            self.model_config.config_file,
-            self.model_config.checkpoint_file,
-            device=device,
-        )
+        if self.use_sahi:
+            from sahi import AutoDetectionModel
+
+            self.sahi_model = AutoDetectionModel.from_pretrained(
+                model_type="mmdet",
+                model_path=self.model_config.checkpoint_file,
+                config_path=self.model_config.config_file,
+                confidence_threshold=0.1,
+                device=device,
+            )
+        else:
+            self.model = init_detector(
+                self.model_config.config_file,
+                self.model_config.checkpoint_file,
+                device=device,
+            )
 
     def unload_model(self) -> None:
         self.model = None
+        self.sahi_model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -106,8 +128,66 @@ class SingleImageDetector(BaseDetector):
     def detect(self, tablet: Tablet, score_threshold: Optional[float] = None) -> Boxes:
         if score_threshold is None:
             score_threshold = self.default_score_threshold
+
         img_hash = hashlib.sha256(tablet.img.tobytes()).digest()
         img_key = (tablet.img.shape, tablet.img.dtype.str, img_hash)
+
+        if self.use_sahi:
+            from sahi.predict import get_prediction, get_sliced_prediction
+
+            def unpack_result(result):
+                predictions = result.object_prediction_list
+                labels = np.asarray(
+                    [prediction.category.id for prediction in predictions], dtype=np.int64
+                )
+                bboxes = np.asarray(
+                    [prediction.bbox.to_xyxy() for prediction in predictions], dtype=np.float32
+                ).reshape(-1, 4)
+                scores = np.asarray(
+                    [prediction.score.value for prediction in predictions], dtype=np.float32
+                )
+                return labels, bboxes, scores
+
+            img_key = (*img_key, float(score_threshold), self.box_slice_ratio)
+            if img_key not in self.result:
+                img_rgb = cv2.cvtColor(tablet.img, cv2.COLOR_BGR2RGB)
+                initial_result = get_prediction(
+                    img_rgb,
+                    self.sahi_model,
+                    confidence_threshold=0.0,
+                )
+                initial_labels, initial_bboxes, initial_scores = unpack_result(initial_result)
+                initial_detections = self._filter_detections(
+                    initial_labels,
+                    initial_bboxes,
+                    initial_scores,
+                    tablet,
+                    score_threshold,
+                    deduplicate=True,
+                )
+
+                slice_size = max(1, int(initial_detections.avg_size / self.box_slice_ratio))
+                self.slice_height = slice_size
+                self.slice_width = slice_size
+                sliced_result = get_sliced_prediction(
+                    img_rgb,
+                    self.sahi_model,
+                    confidence_threshold=0.2,
+                    slice_height=self.slice_height,
+                    slice_width=self.slice_width,
+                    overlap_height_ratio=0.2,
+                    overlap_width_ratio=0.2,
+                )
+                self.result[img_key] = (sliced_result, self.slice_height, self.slice_width)
+
+            result, self.slice_height, self.slice_width = self.result[img_key]
+            labels, bboxes, scores = unpack_result(result)
+
+            return self._filter_detections(
+                labels, bboxes, scores, tablet, score_threshold, deduplicate=True
+            )
+
+        # non-SAHI detection
         if img_key not in self.result:
             self.result[img_key] = inference_detector(self.model, tablet.img)
         OCR_result = self.result[img_key].pred_instances.cpu()
@@ -128,8 +208,16 @@ class TabletImageDetector(BaseDetector):
         keep_crops: bool = False,
         is_crop_itself: bool = False,
         is_load_now: bool = True,
+        use_sahi: bool = False,
+        box_slice_ratio: float = 0.15,
     ):
-        super().__init__(model_config, default_score_threshold, is_load_now=is_load_now)
+        super().__init__(
+            model_config,
+            default_score_threshold,
+            is_load_now=is_load_now,
+            use_sahi=use_sahi,
+            box_slice_ratio=box_slice_ratio,
+        )
         self.visualize_crop = visualize_crop
         self.logging_crop = logging_crop
         self.keep_crops = keep_crops
@@ -141,7 +229,8 @@ class TabletImageDetector(BaseDetector):
     def detect(self, tablet: Tablet, score_threshold: Optional[float] = None) -> Boxes:
         if score_threshold is None:
             score_threshold = self.default_score_threshold
-        if self.model is None:
+        model_is_missing = self.sahi_model is None if self.use_sahi else self.model is None
+        if model_is_missing:
             self.load_model()
 
         if self.keep_crops:
@@ -151,8 +240,16 @@ class TabletImageDetector(BaseDetector):
         if self.is_crop_itself:
             h, w = tablet.shape
             self.crop_coordinates = [{'x': 0, 'y': 0, 'w': w, 'h': h}]
-            single_detector = SingleImageDetector(model=self.model, default_score_threshold=score_threshold)
+            single_detector = SingleImageDetector(
+                model=self.model,
+                sahi_model=self.sahi_model,
+                use_sahi=self.use_sahi,
+                box_slice_ratio=self.box_slice_ratio,
+                default_score_threshold=score_threshold,
+            )
             detections = single_detector.detect(tablet)
+            self.slice_height = single_detector.slice_height
+            self.slice_width = single_detector.slice_width
             if self.keep_crops:
                 crop_tablet = SubTablet(
                     img=tablet.img,
@@ -176,7 +273,13 @@ class TabletImageDetector(BaseDetector):
         
         self.crop_coordinates = crop_coordinates
         
-        single_detector = SingleImageDetector(model=self.model, default_score_threshold=score_threshold)
+        single_detector = SingleImageDetector(
+            model=self.model,
+            sahi_model=self.sahi_model,
+            use_sahi=self.use_sahi,
+            box_slice_ratio=self.box_slice_ratio,
+            default_score_threshold=score_threshold,
+        )
         
         all_detections = Boxes(tablet=tablet)
         
@@ -191,6 +294,8 @@ class TabletImageDetector(BaseDetector):
                 mask=masks[idx],
             )
             piece_detections = single_detector.detect(crop_tablet)
+            self.slice_height = single_detector.slice_height
+            self.slice_width = single_detector.slice_width
 
             if self.keep_crops:
                 self.crop_tablets.append(crop_tablet)
