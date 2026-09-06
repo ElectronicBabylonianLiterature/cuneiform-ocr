@@ -50,7 +50,6 @@ if __name__ == "__main__":
     tablet_detector = TabletImageDetector(
         model_config=model_config,
         default_score_threshold=SCORE_THRESHOLD,
-        keep_crops=True,
         is_crop_itself=False,
         use_sahi=True,
         box_slice_ratio=0.2,
@@ -81,7 +80,7 @@ if __name__ == "__main__":
 
         s = context.state
         all_optimized_full = []
-        for crop_idx in range(len(tablet_detector.get_crop_tablets())):
+        for crop_idx in range(len(tablet_detector.crop_tablets)):
             crop_runner.choose_crop(crop_idx)
             if not s.det_boxes:
                 continue

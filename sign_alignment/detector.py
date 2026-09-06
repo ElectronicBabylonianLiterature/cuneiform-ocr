@@ -2,7 +2,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import hashlib
-from typing import List, Optional
+from typing import Optional
 
 from mmdet.apis import init_detector, inference_detector
 from mmdet.utils import register_all_modules
@@ -205,7 +205,6 @@ class TabletImageDetector(BaseDetector):
         default_score_threshold: float = 0.5,
         visualize_crop: bool = False,
         logging_crop: bool = False,
-        keep_crops: bool = False,
         is_crop_itself: bool = False,
         is_load_now: bool = True,
         use_sahi: bool = False,
@@ -220,7 +219,6 @@ class TabletImageDetector(BaseDetector):
         )
         self.visualize_crop = visualize_crop
         self.logging_crop = logging_crop
-        self.keep_crops = keep_crops
         self.is_crop_itself = is_crop_itself
         self.crop_tablets = []
         self.crop_boxes = []
@@ -233,9 +231,8 @@ class TabletImageDetector(BaseDetector):
         if model_is_missing:
             self.load_model()
 
-        if self.keep_crops:
-            self.crop_tablets = []
-            self.crop_boxes = []
+        self.crop_tablets = []
+        self.crop_boxes = []
 
         if self.is_crop_itself:
             h, w = tablet.shape
@@ -250,17 +247,16 @@ class TabletImageDetector(BaseDetector):
             detections = single_detector.detect(tablet)
             self.slice_height = single_detector.slice_height
             self.slice_width = single_detector.slice_width
-            if self.keep_crops:
-                crop_tablet = SubTablet(
-                    img=tablet.img,
-                    parent=tablet,
-                    offset_in_parent=(0.0, 0.0),
-                    mask=np.full((h, w), 255, dtype=np.uint8),
-                    name="crop_0",
-                )
-                crop_detections = detections.to_tablet(crop_tablet)
-                self.crop_tablets.append(crop_tablet)
-                self.crop_boxes.append(crop_detections)
+            crop_tablet = SubTablet(
+                img=tablet.img,
+                parent=tablet,
+                offset_in_parent=(0.0, 0.0),
+                mask=np.full((h, w), 255, dtype=np.uint8),
+                name="crop_0",
+            )
+            crop_detections = detections.to_tablet(crop_tablet)
+            self.crop_tablets.append(crop_tablet)
+            self.crop_boxes.append(crop_detections)
             return detections
 
         cropped_images, crop_coordinates, masks = divide_tablet_photo(
@@ -297,17 +293,10 @@ class TabletImageDetector(BaseDetector):
             self.slice_height = single_detector.slice_height
             self.slice_width = single_detector.slice_width
 
-            if self.keep_crops:
-                self.crop_tablets.append(crop_tablet)
-                self.crop_boxes.append(piece_detections)
+            self.crop_tablets.append(crop_tablet)
+            self.crop_boxes.append(piece_detections)
             
             for det in piece_detections:
                 all_detections.append(det.to_tablet(tablet))
         
         return all_detections
-    
-    def get_crop_tablets(self) -> List[SubTablet]:
-        return self.crop_tablets
-
-    def get_crop_boxes(self) -> List[Boxes]:
-        return self.crop_boxes

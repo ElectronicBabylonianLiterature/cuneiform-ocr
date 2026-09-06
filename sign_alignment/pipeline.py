@@ -423,26 +423,19 @@ def vis_loaded_data(context: CropContext, vis: VisOptions) -> None:
 def detect_signs(context: CropContext) -> None:
     s = context.state
     s.full_detections = context.tablet_detector.detect(s.full_tablet)
-    _select_crop(context, context.img_idx)
+    init_crop(context, context.img_idx)
 
 
-def _select_crop(context: CropContext, img_idx: int) -> None:
-    crop_tablets = context.tablet_detector.get_crop_tablets()
-    if not crop_tablets:
-        raise RuntimeError("detector produced no cropped images")
-    if not 0 <= img_idx < len(crop_tablets):
-        raise IndexError(
-            f"crop index {img_idx} is out of range after detection; "
-            f"available crop indices are 0..{len(crop_tablets) - 1}"
-        )
+def init_crop(context: CropContext, img_idx: int) -> None:
+    crop_tablets = context.tablet_detector.crop_tablets
     context.img_idx = img_idx
     s = context.state
     s.tablet = crop_tablets[img_idx]
-    s.det_boxes = context.tablet_detector.get_crop_boxes()[img_idx]
+    s.det_boxes = context.tablet_detector.crop_boxes[img_idx]
 
-    # A new crop starts with two isolated copies of the detector output: the
-    # fixed candidate pool and the mutable optimization state.
+    # The candiate boxes are fixed.
     s.candidate_boxes = s.det_boxes.copy()
+    # The optimized boxes will be updated during process.
     s.optimize_boxes = s.det_boxes.copy()
 
     # Invalidate every crop-local or iteration-local value. Full-image source
@@ -3655,4 +3648,4 @@ class Runner:
         self.context.img_idx = crop_idx
         if self.context.state.full_detections is None:
             return
-        _select_crop(self.context, crop_idx)
+        init_crop(self.context, crop_idx)

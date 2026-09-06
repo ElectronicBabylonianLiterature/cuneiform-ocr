@@ -24,6 +24,8 @@ class HoughRowDetection:
     angles_deg: np.ndarray
     rho_grid: np.ndarray
     parameter_space: np.ndarray
+    strict_neighbour_max: np.ndarray
+    peak_indices: np.ndarray
     angle_scores: np.ndarray
     x_origin: float
     initial_row_angles_deg: np.ndarray
@@ -229,36 +231,48 @@ def _fit_bounded_line(
     return angle_deg, rho
 
 
-def _two_dimensional_peaks(
+def _strict_neighbour_max(
     parameter_space: np.ndarray,
-    min_votes: float,
+    rho_window: int,
+    angle_window: int,
 ) -> np.ndarray:
-    """Return 3x3 local maxima sorted by accumulator value."""
+    """Return the maximum over each cell's neighbours, excluding itself."""
     if parameter_space.size == 0:
-        return np.empty((0, 2), dtype=np.int64)
+        return np.empty_like(parameter_space)
 
+    rho_radius = rho_window // 2
+    angle_radius = angle_window // 2
     rows, columns = parameter_space.shape
     padded = np.pad(
         parameter_space,
-        ((1, 1), (1, 1)),
+        ((rho_radius, rho_radius), (angle_radius, angle_radius)),
         mode="constant",
         constant_values=-np.inf,
     )
-    neighbour_max = np.full_like(parameter_space, -np.inf)
     strict_neighbour_max = np.full_like(parameter_space, -np.inf)
-    for row_offset in range(3):
-        for column_offset in range(3):
+    for row_offset in range(2 * rho_radius + 1):
+        for column_offset in range(2 * angle_radius + 1):
+            if row_offset == rho_radius and column_offset == angle_radius:
+                continue
             view = padded[
                 row_offset:row_offset + rows,
                 column_offset:column_offset + columns,
             ]
-            neighbour_max = np.maximum(neighbour_max, view)
-            if row_offset != 1 or column_offset != 1:
-                strict_neighbour_max = np.maximum(strict_neighbour_max, view)
+            strict_neighbour_max = np.maximum(strict_neighbour_max, view)
+    return strict_neighbour_max
+
+
+def _two_dimensional_peaks(
+    parameter_space: np.ndarray,
+    min_votes: float,
+    strict_neighbour_max: np.ndarray,
+) -> np.ndarray:
+    """Return strict local maxima sorted by accumulator value."""
+    if parameter_space.size == 0:
+        return np.empty((0, 2), dtype=np.int64)
 
     mask = (
-        (parameter_space >= neighbour_max)
-        & (parameter_space > strict_neighbour_max)
+        (parameter_space > strict_neighbour_max)
         & (parameter_space >= min_votes)
     )
     peaks = np.argwhere(mask)
@@ -607,37 +621,26 @@ def detect_hough_rows(
     angle_range_deg: float = 15.0,
     angle_step_deg: float = 1.0,
     rho_step_factor: float = 0.04,
-    rho_sigma_factor: float = 0.10,
+    rho_sigma_factor: float = 0.1,
     min_line_distance_factor: float = 0.30,
     assignment_distance_factor: float = 0.24,
     min_peak_votes: float = 1.25,
     min_row_size: int = 2,
-    curve_search_angle_deg: float = 5.0,
+    curve_search_angle_deg: float = 6.0,
     curve_curvature_penalty: float = 1.0,
+    peak_rho_window: int = 7,
+    peak_angle_window: int = 3,
 ) -> HoughRowDetection:
     """Detect rows from point centres with an independent angle per row.
 
     Candidate lines are local maxima in the full two-dimensional Hough space.
     Every continuous refit is clipped to ``[-angle_range_deg,
-    +angle_range_deg]``; no selected row can leave that interval.
+    +angle_range_deg]``; no selected row can leave that interval. All public
+    defaults are defined only in this function.
     """
-    centers = np.asarray(centers, dtype=np.float64)
-    if centers.ndim != 2 or centers.shape[1:] != (2,):
-        raise ValueError("centers must have shape (N, 2)")
-    if angle_range_deg <= 0 or angle_step_deg <= 0:
-        raise ValueError("angle range and step must be positive")
-    if scale <= 0:
-        raise ValueError("scale must be positive")
-    if rho_step_factor <= 0 or rho_sigma_factor <= 0:
-        raise ValueError("rho step and sigma factors must be positive")
-    if min_line_distance_factor < 0 or assignment_distance_factor <= 0:
-        raise ValueError("line distance factors must be non-negative")
-    if min_row_size < 1:
-        raise ValueError("min_row_size must be at least one")
-    if curve_search_angle_deg <= 0:
-        raise ValueError("curve_search_angle_deg must be positive")
-    if curve_curvature_penalty < 0:
-        raise ValueError("curve_curvature_penalty must be non-negative")
+    centers = np.asarray(centers, dtype=np.float64)  # shape (N, 2)
+    if len(centers) == 0:
+        raise ValueError("Hough row detection requires at least one center")
 
     angles_deg = np.arange(
         -angle_range_deg,
@@ -647,10 +650,9 @@ def detect_hough_rows(
     )
     if angles_deg[-1] < angle_range_deg - 1e-12:
         angles_deg = np.append(angles_deg, angle_range_deg)
-    x_origin = float(np.median(centers[:, 0])) if len(centers) else 0.0
+    x_origin = float(np.median(centers[:, 0]))
     hough_centers = centers.copy()
-    if len(hough_centers):
-        hough_centers[:, 0] -= x_origin
+    hough_centers[:, 0] -= x_origin
 
     rho_step = scale * rho_step_factor
     rho_sigma = scale * rho_sigma_factor
@@ -666,34 +668,11 @@ def detect_hough_rows(
             + hough_centers[:, 1] * np.cos(angle)
         )
         projected_by_angle.append(rhos)
-        if len(hough_centers):
-            pairwise_delta = (rhos[:, None] - rhos[None, :]) / rho_sigma
-            pairwise_votes = np.exp(-0.5 * pairwise_delta ** 2)
-            angle_scores.append(float(
-                (pairwise_votes.sum() - len(hough_centers)) / 2
-            ))
-        else:
-            angle_scores.append(0.0)
-
-    if not len(hough_centers):
-        return HoughRowDetection(
-            rows=[],
-            noise=[],
-            row_angles_deg=np.empty(0, dtype=np.float64),
-            row_rhos=np.empty(0, dtype=np.float64),
-            row_x_ranges=[],
-            global_angle_deg=0.0,
-            angles_deg=angles_deg,
-            rho_grid=np.empty(0, dtype=np.float64),
-            parameter_space=np.empty((0, len(angles_deg)), dtype=np.float64),
-            angle_scores=np.asarray(angle_scores),
-            x_origin=x_origin,
-            initial_row_angles_deg=np.empty(0, dtype=np.float64),
-            initial_row_rhos=np.empty(0, dtype=np.float64),
-            angle_curve_angles_deg=np.empty(0, dtype=np.float64),
-            angle_curve_inlier_mask=np.empty(0, dtype=bool),
-            curve_search_angle_deg=curve_search_angle_deg,
-        )
+        pairwise_delta = (rhos[:, None] - rhos[None, :]) / rho_sigma
+        pairwise_votes = np.exp(-0.5 * pairwise_delta ** 2)
+        angle_scores.append(float(
+            (pairwise_votes.sum() - len(hough_centers)) / 2
+        ))
 
     all_projected_rhos = np.concatenate(projected_by_angle)
     rho_grid = np.arange(
@@ -711,9 +690,22 @@ def detect_hough_rows(
         )
     parameter_space = np.asarray(parameter_space).T
 
+    # import matplotlib.pyplot as plt
+    # plt.imshow(parameter_space)
+    # plt.show()
+
     global_angle_idx = int(np.argmax(angle_scores))
     global_angle_deg = float(angles_deg[global_angle_idx])
-    peaks = _two_dimensional_peaks(parameter_space, min_peak_votes)
+    strict_neighbour_max = _strict_neighbour_max(
+        parameter_space,
+        peak_rho_window,
+        peak_angle_window,
+    )
+    peaks = _two_dimensional_peaks(
+        parameter_space,
+        min_peak_votes,
+        strict_neighbour_max,
+    )
     candidates: List[_LineCandidate] = []
     for rho_index, angle_index in peaks:
         candidate = _candidate_from_peak(
@@ -851,6 +843,8 @@ def detect_hough_rows(
         angles_deg=angles_deg,
         rho_grid=rho_grid,
         parameter_space=parameter_space,
+        strict_neighbour_max=strict_neighbour_max,
+        peak_indices=peaks,
         angle_scores=np.asarray(angle_scores, dtype=np.float64),
         x_origin=x_origin,
         initial_row_angles_deg=initial_angles,
