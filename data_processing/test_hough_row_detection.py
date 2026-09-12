@@ -4,6 +4,8 @@ import numpy as np
 
 from data_processing.hough_row_detection import (
     _fit_angle_curve,
+    _strict_neighbour_max,
+    _two_dimensional_peaks,
     detect_hough_rows,
 )
 
@@ -15,6 +17,57 @@ def _row(angle_deg, y_at_center, x_values, x_center=600.0):
 
 
 class MultiAngleHoughRowDetectionTest(unittest.TestCase):
+    def test_peak_window_is_seven_rho_by_three_angles(self):
+        def peaks(parameter_space):
+            strict_neighbour_max = _strict_neighbour_max(
+                parameter_space,
+                rho_window=7,
+                angle_window=3,
+            )
+            return _two_dimensional_peaks(
+                parameter_space,
+                min_votes=0.5,
+                strict_neighbour_max=strict_neighbour_max,
+            )
+
+        nearby_rhos = np.zeros((9, 1))
+        nearby_rhos[1, 0] = 2.0
+        nearby_rhos[4, 0] = 1.0
+        np.testing.assert_array_equal(
+            peaks(nearby_rhos),
+            np.array([[1, 0]]),
+        )
+
+        separated_rhos = np.zeros((9, 1))
+        separated_rhos[1, 0] = 2.0
+        separated_rhos[5, 0] = 1.0
+        np.testing.assert_array_equal(
+            peaks(separated_rhos),
+            np.array([[1, 0], [5, 0]]),
+        )
+
+        separated_angles = np.zeros((1, 5))
+        separated_angles[0, 1] = 2.0
+        separated_angles[0, 3] = 1.0
+        np.testing.assert_array_equal(
+            peaks(separated_angles),
+            np.array([[0, 1], [0, 3]]),
+        )
+
+    def test_strict_neighbour_max_excludes_the_center_cell(self):
+        parameter_space = np.zeros((7, 5))
+        parameter_space[3, 2] = 10.0
+        parameter_space[2, 2] = 4.0
+
+        strict_neighbour_max = _strict_neighbour_max(
+            parameter_space,
+            rho_window=7,
+            angle_window=3,
+        )
+
+        self.assertEqual(strict_neighbour_max[3, 2], 4.0)
+        self.assertEqual(strict_neighbour_max[2, 2], 10.0)
+
     def test_quadratic_angle_curve_robustly_rejects_two_outliers(self):
         rhos = np.linspace(100.0, 2700.0, 28)
         normalized = (rhos - rhos.mean()) / (np.ptp(rhos) / 2)
@@ -53,6 +106,14 @@ class MultiAngleHoughRowDetectionTest(unittest.TestCase):
             result.row_angles_deg,
             np.array([-10.0, -3.0, 8.0]),
             atol=0.25,
+        )
+        np.testing.assert_array_equal(
+            result.peak_indices,
+            _two_dimensional_peaks(
+                result.parameter_space,
+                min_votes=1.25,
+                strict_neighbour_max=result.strict_neighbour_max,
+            ),
         )
         self.assertEqual(result.noise, [])
 
@@ -143,15 +204,12 @@ class MultiAngleHoughRowDetectionTest(unittest.TestCase):
         self.assertEqual(result.angles_deg[0], -15.0)
         self.assertEqual(result.angles_deg[-1], 15.0)
 
-    def test_empty_input_is_supported(self):
-        result = detect_hough_rows(
-            np.empty((0, 2), dtype=np.float64),
-            scale=80.0,
-        )
-
-        self.assertEqual(result.rows, [])
-        self.assertEqual(result.noise, [])
-        self.assertEqual(result.parameter_space.shape[0], 0)
+    def test_empty_input_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "at least one center"):
+            detect_hough_rows(
+                np.empty((0, 2), dtype=np.float64),
+                scale=80.0,
+            )
 
 
 if __name__ == "__main__":

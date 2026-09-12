@@ -12,9 +12,9 @@ from sign_alignment.dift_align import (
     _dense_deformation_scores,
 )
 from sign_alignment.data_source import DataSource
-from sign_alignment.pipeline import _optimize_psr
-from sign_alignment.pipeline_2 import (
+from sign_alignment.pipeline import (
     SlidingWindow,
+    _optimize_psr,
     _ordered_score_assignment,
 )
 from sign_alignment.sign import SignResolver
@@ -294,14 +294,18 @@ class PsrIterationTest(unittest.TestCase):
             dift=SimpleNamespace(
                 config=DiftAlignmentConfig(affine_probe_iteration=10)
             ),
-            state=SimpleNamespace(optimizer=optimizer, final_boxes=None),
+            state=SimpleNamespace(
+                psr_optimizer=optimizer,
+                optimize_boxes=None,
+                aligned_rows=None,
+            ),
         )
 
         _optimize_psr(context)
         _optimize_psr(context)
 
         self.assertEqual(optimizer.calls, [70])
-        self.assertEqual(context.state.final_boxes, "cached")
+        self.assertEqual(context.state.optimize_boxes, "cached")
 
 
 if __name__ == "__main__":
