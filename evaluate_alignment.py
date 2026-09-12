@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from sign_alignment import (
     LocalTestDataSource,
     EBLAPISource,
-    ModelConfig, TabletImageDetector,
+    ModelConfig, SignClassifier, TabletImageDetector,
     Box, Boxes,
     hyperparameter_search,
 )
@@ -38,6 +38,7 @@ from sign_alignment.pipeline import (
     create_result_without_optimization,
     detect_rows,
     detect_signs,
+    improve_classification,
     load_data,
     match_rows,
     match_signs_in_rows,
@@ -64,7 +65,11 @@ load_dotenv()
 COCO_TEST_DIR = os.path.expanduser("~/erc-work-data/ready-for-training/coco-recognition-2025-09/data/coco")
 CONFIG_FILE = "configs/detr.py"
 CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/epoch_1000.pth")
+CLASSIFIER_CHECKPOINT_FILE = os.path.expanduser(
+    "~/erc-work-data/signs_alignment_data/best_resnet18_sign_classifier.pth"
+)
 SCORE_THRESHOLD = 0.0
+CLASSIFICATION_CONFIDENCE_THRESHOLD = 0.5
 EVAL_OUTPUT_DIR = "evaluation_results"
 
 # Number of fragments to evaluate / search
@@ -105,6 +110,7 @@ class PredictionMode(str, Enum):
     PSR = "psr"                      # Detection + text alignment + PSR optimization
     WITHOUT_PSR = "without_psr"      # Detection + text alignment, preserving detection geometry
     DETECTION = "detection"          # Raw detection model output only
+    IMPROVED_DETECTION = "improved_detection"  # Detection + ResNet classification fusion
     DET_AS_CANDIDATES = "det_as_candidates"  # Position-first fixed-candidate attraction
 
 # Default prediction mode used by run_evaluation
@@ -620,6 +626,7 @@ def _predict_detection_crops(
     fid: str,
     visualize: bool = False,
     output_dir: str = EVAL_OUTPUT_DIR,
+    improve: bool = False,
 ) -> List[Box]:
     """
     Collect raw detection model outputs across all crops, offset to full image coordinates.
@@ -629,10 +636,15 @@ def _predict_detection_crops(
     """
     s = context.state
     raw_preds: List[Box] = []
-    for crop_idx in range(len(context.tablet_detector.get_crop_tablets())):
+    for crop_idx in range(len(context.tablet_detector.crop_tablets)):
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
+        if improve:
+            improve_classification(
+                context,
+                CLASSIFICATION_CONFIDENCE_THRESHOLD,
+            )
         for det in s.det_boxes:
             raw_preds.append(det.to_tablet(s.full_tablet))
 
@@ -662,6 +674,13 @@ def _run_without_psr_alignment_steps(runner: Runner) -> None:
     """
     runner.run([
         Step("Transform GT to crop", transform_gt_to_crop, vis_crop_ground_truth),
+        Step(
+            "Improve classification",
+            lambda context: improve_classification(
+                context,
+                CLASSIFICATION_CONFIDENCE_THRESHOLD,
+            ),
+        ),
         Step("Create box sets", create_box_sets, vis_box_sets),
         Step("Detect rows (Hough)", detect_rows, vis_detected_rows_info),
         Step("Match rows", match_rows, vis_row_matches),
@@ -684,7 +703,7 @@ def _predict_without_psr_crops(
     """Return relabelled detections without changing their geometry or score."""
     s = context.state
     preds: List[Box] = []
-    for crop_idx in range(len(context.tablet_detector.get_crop_tablets())):
+    for crop_idx in range(len(context.tablet_detector.crop_tablets)):
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
@@ -739,7 +758,7 @@ def _predict_det_as_candidates_crops(
         device="auto",
     )
 
-    for crop_idx in range(len(context.tablet_detector.get_crop_tablets())):
+    for crop_idx in range(len(context.tablet_detector.crop_tablets)):
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
@@ -788,7 +807,7 @@ def _predict_psr_crops(
     """
     s = context.state
     preds: List[Box] = []
-    for crop_idx in range(len(context.tablet_detector.get_crop_tablets())):
+    for crop_idx in range(len(context.tablet_detector.crop_tablets)):
         runner.choose_crop(crop_idx)
         if not s.det_boxes:
             continue
@@ -870,6 +889,15 @@ def run_predictions(
         s = context.state
         if prediction_mode == PredictionMode.DETECTION:
             all_preds = _predict_detection_crops(runner, context, fid, visualize, output_dir)
+        elif prediction_mode == PredictionMode.IMPROVED_DETECTION:
+            all_preds = _predict_detection_crops(
+                runner,
+                context,
+                fid,
+                visualize,
+                output_dir,
+                improve=True,
+            )
         elif prediction_mode == PredictionMode.WITHOUT_PSR:
             all_preds = _predict_without_psr_crops(
                 runner, context, fid, visualize, output_dir
@@ -980,6 +1008,7 @@ def run_evaluation(
             PredictionMode.WITHOUT_PSR – aligned/relabelled detections without PSR
             PredictionMode.DET_AS_CANDIDATES – sign-alignment-3 candidate attraction
             PredictionMode.DETECTION   – raw detection model output only
+            PredictionMode.IMPROVED_DETECTION – detection + ResNet classification fusion
 
     Returns:
         Dict with mAP, per-threshold results, per-class results, and per-fragment details.
@@ -1100,15 +1129,21 @@ if __name__ == "__main__":
     tablet_detector = TabletImageDetector(
         model_config=model_config,
         default_score_threshold=SCORE_THRESHOLD,
-        keep_crops=True,
         is_crop_itself=True,
         use_sahi=True,
         box_slice_ratio=0.2,
     )
     print("Model loaded.")
 
+    sign_classifier = SignClassifier(
+        checkpoint_file=CLASSIFIER_CHECKPOINT_FILE,
+        device="auto",
+        is_load_now=False,
+    )
+
     context = CropContext(
         tablet_detector=tablet_detector,
+        sign_classifier=sign_classifier,
         local_source=test_source,
         api_source=EBLAPISource(strip_subtablet_suffix=True),
         color_config=ColorConfig,
@@ -1126,6 +1161,7 @@ if __name__ == "__main__":
     #   PredictionMode.WITHOUT_PSR – text-aligned labels, detection boxes/scores
     #   PredictionMode.DET_AS_CANDIDATES – position-first fixed-candidate attraction
     #   PredictionMode.DETECTION   – raw detection model output only
+    #   PredictionMode.IMPROVED_DETECTION – detection + ResNet classification fusion
     # ----------------------------------------------------------------
     PREDICTION_MODE = PredictionMode.DET_AS_CANDIDATES
 

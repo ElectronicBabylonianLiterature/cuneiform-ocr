@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from sign_alignment.detector import TabletImageDetector
+from sign_alignment.classifier import COMMON_SIGN_NAMES, SignClassifier
 from sign_alignment.data_source import (
     DataSource,
     EBLAPISource,
@@ -23,6 +24,7 @@ from sign_alignment.data_source import (
     SignTextParser,
 )
 from sign_alignment.box import Box, Boxes, SignCandidate, boxes_in_crop
+from sign_alignment.sign import SignResolver
 from sign_alignment.tablet import SubTablet, Tablet
 from sign_alignment.visualizer import (
     BboxVisualizer,
@@ -254,6 +256,7 @@ class CropContext:
     local_source: LocalDataSource
     color_config: ColorConfig
     output_dir: str
+    sign_classifier: Optional[SignClassifier] = None
     api_source: EBLAPISource = field(default_factory=EBLAPISource)
     sign_resolver: SignAPIResolver = field(default_factory=SignAPIResolver)
     img_idx: int = 1
@@ -433,18 +436,15 @@ def init_crop(context: CropContext, img_idx: int) -> None:
     s.tablet = crop_tablets[img_idx]
     s.det_boxes = context.tablet_detector.crop_boxes[img_idx]
 
-    # The candiate boxes are fixed.
-    s.candidate_boxes = s.det_boxes.copy()
-    # The optimized boxes will be updated during process.
-    s.optimize_boxes = s.det_boxes.copy()
-
     # Invalidate every crop-local or iteration-local value. Full-image source
     # data and parsed text remain valid.
     s.gt_boxes = None
     s.text_boxes = None
     s.text_rows = None
+    s.candidate_boxes = None
     s.candidate_rows = None
     s.optimization_iteration = 0
+    s.optimize_boxes = None
     s.optimize_rows = None
     s.optimize_to_candidate = {}
     s.optimize_row_to_candidate = {}
@@ -506,6 +506,92 @@ def vis_detections(context: CropContext, vis: VisOptions) -> None:
         crop_vis.display_result(vis_opt="draw")
 
 
+def choose_classification(
+    detr_candidate: SignCandidate,
+    classifier_prediction: tuple[str, float],
+    confidence_threshold: float = 0.5,
+) -> tuple[str, float, str]:
+    """Choose DETR or classifier output using the requested confidence rule."""
+    classifier_name, classifier_score = classifier_prediction
+    detr_is_high = detr_candidate.score >= confidence_threshold
+    classifier_is_high = classifier_score >= confidence_threshold
+
+    if detr_is_high:
+        return detr_candidate.sign.name, detr_candidate.score, "detr"
+    if classifier_is_high or classifier_score > detr_candidate.score:
+        return classifier_name, classifier_score, "classifier"
+    return detr_candidate.sign.name, detr_candidate.score, "detr"
+
+
+def improve_classification(
+    context: CropContext,
+    confidence_threshold: float = 0.5,
+) -> None:
+    """Classify each DETR crop and update only labels shared by both models."""
+    s = context.state
+    classifier_predictions = context.sign_classifier.classify_boxes(s.det_boxes)
+    decisions = []
+
+    for box, classifier_prediction in zip(s.det_boxes, classifier_predictions):
+        detr_candidate = box.best_candidate
+        if detr_candidate.sign.name not in COMMON_SIGN_NAMES:
+            decisions.append({
+                "before": detr_candidate.sign.name,
+                "after": detr_candidate.sign.name,
+                "source": "not_shared",
+            })
+            continue
+
+        name, score, source = choose_classification(
+            detr_candidate,
+            classifier_prediction,
+            confidence_threshold,
+        )
+        before = detr_candidate.sign.name
+        if source == "classifier":
+            box.candidates = [SignCandidate(SignResolver.from_name(name), score)]
+        decisions.append({
+            "before": before,
+            "after": name,
+            "source": source,
+            "detr_score": detr_candidate.score,
+            "classifier_name": classifier_prediction[0],
+            "classifier_score": classifier_prediction[1],
+        })
+
+    s.extras["classification_improvement"] = decisions
+
+
+def vis_improved_classification(context: CropContext, vis: VisOptions) -> None:
+    s = context.state
+    decisions = s.extras["classification_improvement"]
+    classifier_used = sum(
+        decision["source"] == "classifier" for decision in decisions
+    )
+    relabelled = sum(
+        decision["before"] != decision["after"] for decision in decisions
+    )
+    skipped = sum(decision["source"] == "not_shared" for decision in decisions)
+    if vis.info:
+        print(
+            f"Classification improvement: {len(decisions) - skipped} shared, "
+            f"{skipped} not shared, classifier used for {classifier_used}, "
+            f"labels changed: {relabelled}"
+        )
+
+    if vis.display or vis.save:
+        visualizer = BboxVisualizer(context.color_config.DET_COLOR.value)
+        visualizer.draw_boxes(s.tablet.img.copy(), s.det_boxes, show_scores=True)
+        if vis.display:
+            visualizer.display_result(vis_opt="draw")
+        if vis.save:
+            visualizer.save(_out(
+                context,
+                "improved_classification.jpg",
+                category=INITIAL_OUTPUT_CATEGORY,
+            ))
+
+
 def transform_gt_to_crop(context: CropContext) -> None:
     s = context.state
     s.gt_boxes = boxes_in_crop(s.full_gt_boxes, s.tablet)
@@ -540,6 +626,78 @@ def vis_crop_ground_truth(context: CropContext, vis: VisOptions) -> None:
         gt_vis.display_result(vis_opt="draw")
 
 
+def evaluate_detection(
+    context: CropContext,
+    boxes_name: str,
+    result_name: Optional[str] = None,
+) -> None:
+    """Evaluate one named Boxes collection for the current tablet crop."""
+    from evaluate_alignment import compute_coco_map
+
+    s = context.state
+    boxes = getattr(s, boxes_name).copy()
+    gt_boxes = gt_boxes_for_visualization(context, s.gt_boxes)
+    metrics = compute_coco_map([{
+        "fragment_id": s.fragment_id,
+        "preds": boxes,
+        "gts": gt_boxes,
+    }])
+    result = {
+        "name": result_name or boxes_name,
+        "boxes_name": boxes_name,
+        "boxes": boxes,
+        "gt_boxes": gt_boxes,
+        "metrics": metrics,
+    }
+    s.extras["current_detection_evaluation"] = result
+    s.extras.setdefault("detection_evaluations", {})[result["name"]] = result
+
+
+def vis_detection_evaluation(context: CropContext, vis: VisOptions) -> None:
+    from evaluate_alignment import visualize_evaluation_fragment
+
+    s = context.state
+    result = s.extras["current_detection_evaluation"]
+    if not (vis.display or vis.save):
+        return
+
+    def render(output_dir: str) -> str:
+        visualize_evaluation_fragment(
+            img=s.tablet.img,
+            fragment_id=s.fragment_id,
+            preds=result["boxes"],
+            gts=result["gt_boxes"],
+            iou_threshold=0.5,
+            class_agnostic=False,
+            output_dir=output_dir,
+        )
+        return os.path.join(
+            output_dir,
+            f"{s.fragment_id}_eval_IoU50.jpg",
+        )
+
+    if vis.save:
+        category_dir = os.path.dirname(_out(context, "evaluation.jpg"))
+        image_path = render(os.path.join(
+            category_dir,
+            f"evaluation_{result['name']}",
+        ))
+        if vis.display:
+            _display_bgr(
+                cv2.imread(image_path),
+                f"Detection evaluation [{result['name']}]",
+            )
+    else:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            image_path = render(temporary_dir)
+            _display_bgr(
+                cv2.imread(image_path),
+                f"Detection evaluation [{result['name']}]",
+            )
+
+
 def vis_detection_statistics(context: CropContext, vis: VisOptions) -> None:
     if not vis.info:
         return
@@ -552,6 +710,9 @@ def vis_detection_statistics(context: CropContext, vis: VisOptions) -> None:
 
 def create_box_sets(context: CropContext) -> None:
     s = context.state
+    # Freeze candidates only after the optional classification-improvement step.
+    s.candidate_boxes = s.det_boxes.copy()
+    s.optimize_boxes = s.det_boxes.copy()
     s.text_boxes = Boxes.from_text_lines(
         text_lines=s.text_lines,
         avg_width=s.full_detections.avg_width,
@@ -1131,6 +1292,10 @@ def vis_aligned_rows(context: CropContext, vis: VisOptions) -> None:
 
 def unload_detector(context: CropContext) -> None:
     context.tablet_detector.unload_model()
+
+
+def unload_classifier(context: CropContext) -> None:
+    context.sign_classifier.unload_model()
 
 
 # Fixed-candidate attraction

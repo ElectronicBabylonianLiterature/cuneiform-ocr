@@ -30,6 +30,12 @@ from .detector import (
     TabletImageDetector,
 )
 
+from .classifier import (
+    COMMON_SIGN_NAMES,
+    RESNET18_INDEX_TO_SIGN,
+    SignClassifier,
+)
+
 from .dift_align import (
     DiftAlignmentConfig,
     DiftMatchConfig,
@@ -92,6 +98,9 @@ __all__ = [
     'BaseDetector',
     'SingleImageDetector',
     'TabletImageDetector',
+    'SignClassifier',
+    'RESNET18_INDEX_TO_SIGN',
+    'COMMON_SIGN_NAMES',
     'DiftAlignmentConfig',
     'DiftMatchConfig',
     'DiftMatchResult',

@@ -172,7 +172,7 @@ class SingleImageDetector(BaseDetector):
                 sliced_result = get_sliced_prediction(
                     img_rgb,
                     self.sahi_model,
-                    confidence_threshold=0.2,
+                    confidence_threshold=0.1,
                     slice_height=self.slice_height,
                     slice_width=self.slice_width,
                     overlap_height_ratio=0.2,
