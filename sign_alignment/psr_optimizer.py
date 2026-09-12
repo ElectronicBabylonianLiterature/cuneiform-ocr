@@ -1,9 +1,9 @@
 """
 Point Set Registration (PSR) Optimizer for sign alignment.
 
-Replaces heatmap-based template matching with a GMM-based point set
-registration approach.  The source set S (text-derived signs, organized
-in rows) is optimized to match the target set X (detected signs).
+GMM-based point set registration for aligning text-derived boxes to
+detected boxes.  The source set S (text-derived signs, organized in rows)
+is optimized to match the target set X (detected signs).
 
 Data loss (GMM):
     E_data = -(1/N) ∑_n log p(x_n)
@@ -21,117 +21,15 @@ Structural losses preserve the row topology of S:
                 (piecewise quadratic + plateau)
 """
 
+from __future__ import annotations
+
 import numpy as np
 import torch
-import torch.nn.functional as F
-import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle as MplRectangle
-from PIL import Image, ImageDraw, ImageFont
-import cv2
-from typing import List, Optional, Dict, Tuple
-from collections import defaultdict
+from typing import Dict, List, Optional
 
 from .sign import CLASSES_ABZ as DEFAULT_CLASSES_ABZ
-from .tablet import SignBox, SubTablet
-from .bounding_box import BoundingBox, Detection
-
-
-# ================================================================
-#  Utility functions
-# ================================================================
-
-def initialize_text_subtablet(
-    text_lines: List[List[str]],
-    target_detections: Detection,
-    avg_width: float,
-    avg_height: float,
-    margin: float = None,
-    img: np.ndarray = None,
-) -> SubTablet:
-    """
-    Create a text SubTablet whose centroid coincides with the detection
-    centroid – a simple, heatmap-free initialisation.
-
-    Steps
-    -----
-    1. Lay out text signs on a uniform grid (one row per text line).
-    2. Compute the centroid of the grid.
-    3. Compute the centroid of the target detections.
-    4. Translate the whole grid so the two centroids coincide.
-
-    Parameters
-    ----------
-    text_lines : list[list[str]]
-        Parsed text lines (each inner list contains sign names).
-    target_detections : Detection
-        Bounding boxes from the object detector.
-    avg_width, avg_height : float
-        Average sign dimensions used for grid spacing.
-    margin : float, optional
-        Grid margin (defaults to ``max(avg_width, avg_height)``).
-    img : np.ndarray, optional
-        Image to attach to the SubTablet (for visualisation).
-
-    Returns
-    -------
-    SubTablet
-        With ``sign_boxes`` placed at the centroid-adjusted positions.
-    """
-    return SubTablet.from_text_lines(
-        text_lines=text_lines,
-        avg_width=avg_width,
-        avg_height=avg_height,
-        margin=margin,
-        img=img,
-        target_detections=target_detections,
-        align_to_detection_centroid=True,
-        name="text_initialized",
-    )
-
-
-def filter_boxes_by_mask(
-    subtablet: SubTablet,
-    mask: np.ndarray,
-    threshold: float = 0.5,
-) -> SubTablet:
-    """
-    Remove sign boxes whose centres fall outside a binary mask.
-
-    Parameters
-    ----------
-    subtablet : SubTablet
-        Input subtablet.
-    mask : np.ndarray
-        Binary mask (H, W). Values ≥ threshold are considered "inside".
-    threshold : float
-        Threshold in [0, 1] if max(mask) ≤ 1, else in [0, 255].
-
-    Returns
-    -------
-    SubTablet
-        Copy with only the boxes whose centres are inside the mask.
-    """
-    mask_h, mask_w = mask.shape[:2]
-    thr_val = threshold * 255 if mask.max() > 1 else threshold
-
-    filtered: List[SignBox] = []
-    for sb in subtablet.sign_boxes:
-        px, py = int(round(sb.cx)), int(round(sb.cy))
-        if 0 <= px < mask_w and 0 <= py < mask_h and mask[py, px] >= thr_val:
-            filtered.append(sb.copy())
-
-    return SubTablet(
-        img=subtablet.img,
-        sign_boxes=filtered,
-        name=subtablet.name + "_masked",
-        scale_factor=subtablet.scale_factor,
-        avg_width=subtablet.avg_width,
-        avg_height=subtablet.avg_height,
-        margin=subtablet.margin,
-        origin_x=subtablet.origin_x,
-        origin_y=subtablet.origin_y,
-    )
+from .box import Box, Boxes
 
 
 # ================================================================
@@ -148,8 +46,8 @@ class PointSetRegistrationOptimizer:
 
     def __init__(
         self,
-        sub_tablet_text: SubTablet,
-        target_detections: Detection,
+        source_rows: List[List[Box]],
+        target_detections: Boxes = None,
         classes_abz: List[str] = None,
         sigma: float = None,
         w_noise: float = 0.1,
@@ -159,16 +57,21 @@ class PointSetRegistrationOptimizer:
         lambda_seq: float = 0.1,
         lambda_height: float = 0.1,
         lambda_rows: float = 0.1,
-        rows_threshold_ratio: float = 1.0 / 3.0,
+        lambda_boundary: float = 0.0,
+        boundary_steepness: float = 1000.0,
+        rows_threshold_ratio_far: float = 1.0 / 3.0,
+        rows_threshold_ratio_close: float = 1.0 / 2.0,
+        rows_plateau_far: float = 1.0,
+        rows_plateau_close: float = 1.0,
+        contour_mask: np.ndarray = None,
         device: str = None,
     ):
         """
         Parameters
         ----------
-        sub_tablet_text : SubTablet
-            Text-derived sign boxes (source S). Must have ``row_idx``
-            and ``col_idx`` set on each ``SignBox``.
-        target_detections : Detection
+        source_rows : list[list[Box]]
+            Text-derived sign boxes grouped by row.
+        target_detections : Boxes
             Bounding boxes from the detector (target X).
         classes_abz : list[str]
             ABZ class name list (defaults to ``CLASSES_ABZ``).
@@ -180,9 +83,32 @@ class PointSetRegistrationOptimizer:
             Class matching weights.  Default: identity (same-class only).
         lambda_data .. lambda_rows : float
             Loss weights.
-        rows_threshold_ratio : float
+        rows_threshold_ratio_far : float
             Fraction of ideal inter-row spacing that defines the
-            quadratic → plateau transition in ``L_rows``.
+            quadratic → plateau transition in ``L_rows`` when rows
+            are **too far apart** (positive deviation).
+        rows_threshold_ratio_close : float
+            Fraction of ideal inter-row spacing that defines the
+            quadratic → plateau transition in ``L_rows`` when rows
+            are **too close together** (negative deviation).
+        rows_plateau_far : float
+            Maximum (plateau) loss value for the **too far** side of
+            ``L_rows``.
+        rows_plateau_close : float
+            Maximum (plateau) loss value for the **too close** side of
+            ``L_rows``.
+        lambda_boundary : float
+            Weight for the contour boundary loss.  Set to 0 to disable
+            (default).  Typical value: 5.0–20.0.
+        boundary_steepness : float
+            Steepness multiplier *k* for the boundary loss:
+            ``L = k · (1 − IoR)²``.  Default 4.0.
+        contour_mask : np.ndarray (H, W), optional
+            Binary mask from ``divide_tablet_photo(return_masks=True)``.
+            Values 255 = inside tablet, 0 = outside.  When provided
+            together with ``lambda_boundary > 0``, an extra loss
+            penalises the first sign of each row whose bounding box
+            extends outside the contour (top / left / bottom edges).
         device : str
             ``'cuda'`` or ``'cpu'``.
         """
@@ -193,8 +119,28 @@ class PointSetRegistrationOptimizer:
         self.lambda_seq = lambda_seq
         self.lambda_height = lambda_height
         self.lambda_rows = lambda_rows
-        self.rows_threshold_ratio = rows_threshold_ratio
-        self.sub_tablet_text = sub_tablet_text
+        self.lambda_boundary = lambda_boundary
+        self.boundary_steepness = boundary_steepness
+        self.rows_threshold_ratio_far = rows_threshold_ratio_far
+        self.rows_threshold_ratio_close = rows_threshold_ratio_close
+        self.rows_plateau_far = rows_plateau_far
+        self.rows_plateau_close = rows_plateau_close
+        if source_rows is None:
+            raise ValueError("PointSetRegistrationOptimizer requires source_rows")
+
+        self.rows = [list(row) for row in source_rows if row]
+        if not self.rows:
+            raise ValueError("PointSetRegistrationOptimizer requires non-empty source_rows")
+        self.source_tablet = self.rows[0][0].tablet
+        self.source_boxes = Boxes((box for row in self.rows for box in row), tablet=self.source_tablet)
+
+        # ---- Contour mask for boundary loss ------------------------------
+        if contour_mask is not None and lambda_boundary > 0:
+            self.contour_mask = contour_mask.astype(np.float32)
+            if self.contour_mask.max() > 1:
+                self.contour_mask = self.contour_mask / 255.0
+        else:
+            self.contour_mask = None
 
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -202,35 +148,34 @@ class PointSetRegistrationOptimizer:
             self.device = device
 
         # ---- Source point set S (text) -----------------------------------
-        self.rows = sub_tablet_text.get_rows()
         self.num_rows = len(self.rows)
         self.row_lengths = [len(r) for r in self.rows]
 
-        self.sign_boxes_flat: List[SignBox] = []
+        self.source_boxes_flat: List[Box] = []
         self.row_indices: List[int] = []
         self.col_indices: List[int] = []
         self.class_ids_source: List[int] = []
 
         for row_idx, row in enumerate(self.rows):
             for col_idx, sb in enumerate(row):
-                self.sign_boxes_flat.append(sb)
+                self.source_boxes_flat.append(sb)
                 self.row_indices.append(row_idx)
                 self.col_indices.append(col_idx)
-                cid = (self.classes_abz.index(sb.abz_name)
-                       if sb.abz_name in self.classes_abz else -1)
+                cid = (self.classes_abz.index(sb.sign.abz)
+                       if sb.sign.abz in self.classes_abz else -1)
                 self.class_ids_source.append(cid)
 
-        self.M = len(self.sign_boxes_flat)
+        self.M = len(self.source_boxes_flat)
 
         # ---- Target point set X (detections) -----------------------------
-        self.target_detections = target_detections
-        self.N = len(target_detections)
+        self.target_detections = target_detections or Boxes(tablet=self.source_tablet)
+        self.N = len(self.target_detections)
 
         target_pos = []
         target_sz = []
         self.class_ids_target: List[int] = []
 
-        for det in target_detections:
+        for det in self.target_detections:
             cx = (det.x1 + det.x2) / 2
             cy = (det.y1 + det.y2) / 2
             target_pos.append([cx, cy])
@@ -253,13 +198,13 @@ class PointSetRegistrationOptimizer:
 
         # ---- Optimisation parameters [cx, cy, w, h] ---------------------
         init = [[sb.cx, sb.cy, sb.width, sb.height]
-                for sb in self.sign_boxes_flat]
+                for sb in self.source_boxes_flat]
         self.params = torch.tensor(init, dtype=torch.float32,
                                    device=self.device, requires_grad=True)
         self.initial_params = self.params.clone().detach()
 
         # ---- Sigma -------------------------------------------------------
-        avg_size = (sub_tablet_text.avg_width + sub_tablet_text.avg_height) / 2
+        avg_size = self.source_boxes.avg_size
         self.sigma = float(sigma) if sigma is not None else float(avg_size)
 
         # ---- Confusion matrix (C×C) -------------------------------------
@@ -476,11 +421,12 @@ class PointSetRegistrationOptimizer:
         actual_spacing = baseline_{i+1}(x_align) − baseline_i(x_align)
         x_align = max(first_x_row_i, first_x_row_{i+1})
 
-        Piecewise loss per pair:
-            t = ideal · threshold_ratio           (default 1/3)
+        Asymmetric piecewise loss per pair:
             d = actual − ideal
-            |d| ≤ t :  L = (d/t)²
-            |d| > t :  L = 1              (constant plateau)
+            If d ≥ 0 (too far):  t = ideal · threshold_ratio_far,  plateau = plateau_far
+            If d < 0 (too close): t = ideal · threshold_ratio_close, plateau = plateau_close
+            |d| ≤ t :  L = plateau · (d/t)²
+            |d| > t :  L = plateau
         """
         if self.num_rows < 2:
             return torch.tensor(0.0, device=self.device)
@@ -512,16 +458,121 @@ class PointSetRegistrationOptimizer:
             actual = y_j - y_i  # should be positive (top→bottom)
 
             deviation = actual - ideal
-            threshold = (ideal * self.rows_threshold_ratio).clamp(min=1e-6)
+            # Asymmetric thresholds: different for too-far vs too-close
+            threshold_far = (ideal * self.rows_threshold_ratio_far).clamp(min=1e-6)
+            threshold_close = (ideal * self.rows_threshold_ratio_close).clamp(min=1e-6)
+            threshold = torch.where(deviation >= 0, threshold_far, threshold_close)
+            plateau = torch.where(
+                deviation >= 0,
+                torch.tensor(self.rows_plateau_far, device=self.device),
+                torch.tensor(self.rows_plateau_close, device=self.device),
+            )
             normalised = deviation / threshold
 
-            # Piecewise: quadratic inside, constant outside
+            # Piecewise: quadratic inside, constant plateau outside
             loss_pair = torch.where(
                 normalised.abs() <= 1.0,
-                normalised ** 2,
-                torch.ones_like(normalised),
+                plateau * normalised ** 2,
+                plateau,
             )
             loss = loss + loss_pair
+            count += 1
+
+        return loss / max(1, count)
+
+    # ------------------------------------------------------------------
+
+    def compute_boundary_loss(self) -> torch.Tensor:
+        """
+        Penalise the first sign of each row when its bbox extends
+        outside the tablet contour mask.
+
+        For each row, take the first sign (leftmost in the row list).
+        Compute the intersection area between its bbox and the contour
+        mask.  The loss is based on  ``1 − IoR`` (Intersection-over-
+        Region, where Region = bbox area), so a box fully inside the
+        contour yields 0 loss.
+
+        A steep exponential-like penalty is used so that even a small
+        exceedance produces a strong gradient:
+
+            L_boundary = mean_over_rows  [ (1 − IoR)^2 × k ]
+
+        where k = 4 gives a steep curve.
+
+        Returns ``0`` if no contour mask is set.
+        """
+        if self.contour_mask is None or self.num_rows == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        mask_h, mask_w = self.contour_mask.shape[:2]
+        loss = torch.tensor(0.0, device=self.device)
+        count = 0
+        k = self.boundary_steepness
+
+        for ri in range(self.num_rows):
+            off = self.row_offsets[ri]
+            rl = self.row_lengths[ri]
+            if rl == 0:
+                continue
+
+            # First sign in the row (index 0, leftmost)
+            cx = self.params[off, 0]
+            cy = self.params[off, 1]
+            w = self.params[off, 2]
+            h = self.params[off, 3]
+
+            # Bbox corners (float, differentiable)
+            x1 = cx - w / 2
+            y1 = cy - h / 2
+            x2 = cx + w / 2
+            y2 = cy + h / 2
+
+            # Clamp to image extent for the sampling grid
+            x1_c = x1.clamp(0, mask_w - 1)
+            y1_c = y1.clamp(0, mask_h - 1)
+            x2_c = x2.clamp(0, mask_w - 1)
+            y2_c = y2.clamp(0, mask_h - 1)
+
+            # If the bbox is entirely outside the image, IoR = 0
+            if (x1_c >= x2_c) or (y1_c >= y2_c):
+                loss = loss + torch.tensor(k, device=self.device)
+                count += 1
+                continue
+
+            # --- Compute IoR via grid sampling on the mask ----------------
+            # Use a coarse grid of sample points inside the (clamped) bbox
+            n_samples = 8  # per axis
+            xs = torch.linspace(float(x1_c.detach()), float(x2_c.detach()),
+                                n_samples, device=self.device)
+            ys = torch.linspace(float(y1_c.detach()), float(y2_c.detach()),
+                                n_samples, device=self.device)
+            gx, gy = torch.meshgrid(xs, ys, indexing='xy')
+            gx_int = gx.long().clamp(0, mask_w - 1)
+            gy_int = gy.long().clamp(0, mask_h - 1)
+
+            mask_t = torch.tensor(self.contour_mask, dtype=torch.float32,
+                                  device=self.device)
+            sampled = mask_t[gy_int, gx_int]  # (n, n) in [0,1]
+
+            # Fraction of the clamped region that's inside the contour
+            inside_ratio_clamped = sampled.mean()
+
+            # Account for the part of the bbox that's outside the image
+            # (which is definitely outside the contour)
+            clamped_area = (x2_c - x1_c) * (y2_c - y1_c)
+            bbox_area = (w * h).clamp(min=1.0)
+            # What fraction of the full bbox is inside the image?
+            area_ratio = clamped_area / bbox_area
+
+            # Overall IoR: inside_clamped * (clamped_area / bbox_area)
+            # Detach the sampling parts (non-differentiable lookup) and
+            # keep the bbox geometry differentiable through area_ratio.
+            ior = inside_ratio_clamped.detach() * area_ratio
+
+            # Steep penalty:  k * (1 - IoR)^2
+            violation = (1.0 - ior)
+            loss = loss + k * violation ** 2
             count += 1
 
         return loss / max(1, count)
@@ -536,14 +587,16 @@ class PointSetRegistrationOptimizer:
         L_seq = self.compute_seq_loss()
         L_height = self.compute_height_loss()
         L_rows = self.compute_rows_loss()
+        L_boundary = self.compute_boundary_loss()
 
         L_total = (self.lambda_data * L_data
                    + self.lambda_anchor * L_anchor
                    + self.lambda_seq * L_seq
                    + self.lambda_height * L_height
-                   + self.lambda_rows * L_rows)
+                   + self.lambda_rows * L_rows
+                   + self.lambda_boundary * L_boundary)
 
-        return L_total, L_data, L_anchor, L_seq, L_height, L_rows
+        return L_total, L_data, L_anchor, L_seq, L_height, L_rows, L_boundary
 
     # ==================================================================
     #  Optimisation loop
@@ -557,7 +610,7 @@ class PointSetRegistrationOptimizer:
         sigma_final: float = None,
         verbose: bool = True,
         log_every: int = 10,
-    ) -> SubTablet:
+    ) -> Boxes:
         """
         Run gradient-descent optimisation.
 
@@ -576,7 +629,7 @@ class PointSetRegistrationOptimizer:
 
         Returns
         -------
-        SubTablet
+        Boxes
             Optimised sign positions.
         """
         opt = torch.optim.Adam([self.params], lr=lr)
@@ -598,7 +651,9 @@ class PointSetRegistrationOptimizer:
             print(f"  w_noise:        {self.w_noise}")
             print(f"  Lambdas:  data={self.lambda_data}, anchor={self.lambda_anchor}, "
                   f"seq={self.lambda_seq}, height={self.lambda_height}, "
-                  f"rows={self.lambda_rows}")
+                  f"rows={self.lambda_rows}, boundary={self.lambda_boundary}")
+            if self.contour_mask is not None:
+                print(f"  Contour mask: {self.contour_mask.shape[1]}×{self.contour_mask.shape[0]}")
             print("-" * 60)
 
         for it in range(num_iterations):
@@ -608,7 +663,7 @@ class PointSetRegistrationOptimizer:
                 self.sigma = sigma_init * (1.0 - t) + sigma_final * t
 
             opt.zero_grad()
-            L_total, L_data, L_anchor, L_seq, L_height, L_rows = \
+            L_total, L_data, L_anchor, L_seq, L_height, L_rows, L_boundary = \
                 self.compute_total_loss()
             L_total.backward()
 
@@ -633,6 +688,7 @@ class PointSetRegistrationOptimizer:
                 'seq': L_seq.item(),
                 'height': L_height.item(),
                 'rows': L_rows.item(),
+                'boundary': L_boundary.item(),
                 'sigma': self.sigma,
             })
 
@@ -642,41 +698,31 @@ class PointSetRegistrationOptimizer:
                         f"anchor={L_anchor.item():.4f}  "
                         f"seq={L_seq.item():.4f}  "
                         f"height={L_height.item():.4f}  "
-                        f"rows={L_rows.item():.4f}")
+                        f"rows={L_rows.item():.4f}  "
+                        f"boundary={L_boundary.item():.4f}")
                 if sigma_anneal:
                     line += f"  σ={self.sigma:.1f}"
                 print(line)
 
-        return self.get_optimized_subtablet()
+        return self.get_optimized_boxes()
 
     # ------------------------------------------------------------------
     #  Results
     # ------------------------------------------------------------------
 
-    def get_optimized_subtablet(self) -> SubTablet:
-        """Build a new SubTablet from the current optimised parameters."""
+    def get_optimized_boxes(self) -> Boxes:
+        """Build the current optimised boxes."""
         p = self.params.detach().cpu().numpy()
 
-        boxes = []
-        for i, sb in enumerate(self.sign_boxes_flat):
-            boxes.append(SignBox(
+        boxes = Boxes(tablet=self.source_boxes.tablet)
+        for i, sb in enumerate(self.source_boxes_flat):
+            boxes.append(Box.from_center(
                 sign=sb.sign, score=sb.score,
                 cx=float(p[i, 0]), cy=float(p[i, 1]),
                 width=float(p[i, 2]), height=float(p[i, 3]),
-                row_idx=sb.row_idx, col_idx=sb.col_idx,
+                tablet=self.source_boxes.tablet,
             ))
-
-        return SubTablet(
-            img=self.sub_tablet_text.img,
-            sign_boxes=boxes,
-            name="optimized",
-            scale_factor=self.sub_tablet_text.scale_factor,
-            avg_width=self.sub_tablet_text.avg_width,
-            avg_height=self.sub_tablet_text.avg_height,
-            margin=self.sub_tablet_text.margin,
-            origin_x=self.sub_tablet_text.origin_x,
-            origin_y=self.sub_tablet_text.origin_y,
-        )
+        return boxes
 
     def get_param_changes(self) -> np.ndarray:
         """Return (current − initial) parameter array  (M, 4)."""
@@ -687,196 +733,240 @@ class PointSetRegistrationOptimizer:
     #  Visualisation
     # ==================================================================
 
-    def plot_loss_history(self, figsize: tuple = (20, 5)):
-        """Plot loss curves: total, raw components, weighted components."""
+    def plot_loss_history(self, figsize: tuple = (16, 12)):
+        """Plot loss curves in a 2x2 grid: total, raw, weighted, log-scale."""
         if not self.loss_components_history:
             print("No optimisation history available.")
             return
 
-        fig, axes = plt.subplots(1, 3, figsize=figsize)
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
 
-        # -- Total loss --
-        axes[0].plot(self.loss_history)
-        axes[0].set_xlabel('Iteration')
-        axes[0].set_ylabel('Total Loss')
-        axes[0].set_title('Total Loss')
-        axes[0].grid(True, alpha=0.3)
-
-        # -- Raw component losses --
         keys = ['data', 'anchor', 'seq', 'height', 'rows']
+        if self.lambda_boundary > 0:
+            keys.append('boundary')
+
+        # -- (0,0) Total loss --
+        axes[0, 0].plot(self.loss_history)
+        axes[0, 0].set_xlabel('Iteration')
+        axes[0, 0].set_ylabel('Total Loss')
+        axes[0, 0].set_title('Total Loss')
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # -- (0,1) Raw component losses --
         for k in keys:
             vals = [h[k] for h in self.loss_components_history]
-            axes[1].plot(vals, label=f'L_{k}')
-        axes[1].set_xlabel('Iteration')
-        axes[1].set_ylabel('Loss')
-        axes[1].set_title('Raw Loss Components')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
+            axes[0, 1].plot(vals, label=f'L_{k}')
+        axes[0, 1].set_xlabel('Iteration')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].set_title('Raw Loss Components')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
 
-        # -- Weighted components or sigma --
+        # -- (1,0) Weighted components (+ sigma if annealed) --
         sigma_vals = [h.get('sigma', self.sigma)
                       for h in self.loss_components_history]
         if len(set(sigma_vals)) > 1:
-            ax2r = axes[2].twinx()
+            ax_twin = axes[1, 0].twinx()
             for k in keys:
                 lam = getattr(self, f'lambda_{k}')
                 vals = [lam * h[k] for h in self.loss_components_history]
-                axes[2].plot(vals, label=f'λ·L_{k}')
-            ax2r.plot(sigma_vals, 'k--', alpha=0.5, label='σ')
-            ax2r.set_ylabel('σ')
-            ax2r.legend(loc='upper right')
-            axes[2].set_title('Weighted Components + σ')
+                axes[1, 0].plot(vals, label=f'λ·L_{k}')
+            ax_twin.plot(sigma_vals, 'k--', alpha=0.5, label='σ')
+            ax_twin.set_ylabel('σ')
+            ax_twin.legend(loc='upper right')
+            axes[1, 0].set_title('Weighted Components + σ')
         else:
             for k in keys:
                 lam = getattr(self, f'lambda_{k}')
                 vals = [lam * h[k] for h in self.loss_components_history]
-                axes[2].plot(vals, label=f'λ·L_{k}')
-            axes[2].set_title('Weighted Loss Components')
-        axes[2].set_xlabel('Iteration')
-        axes[2].set_ylabel('Weighted Loss')
-        axes[2].legend(loc='upper left')
-        axes[2].grid(True, alpha=0.3)
+                axes[1, 0].plot(vals, label=f'λ·L_{k}')
+            axes[1, 0].set_title('Weighted Loss Components')
+        axes[1, 0].set_xlabel('Iteration')
+        axes[1, 0].set_ylabel('Weighted Loss')
+        axes[1, 0].legend(loc='upper left')
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # -- (1,1) Log-scale raw components --
+        for k in keys:
+            vals = [h[k] for h in self.loss_components_history]
+            axes[1, 1].plot(vals, label=f'L_{k}')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].set_xlabel('Iteration')
+        axes[1, 1].set_ylabel('Loss (log)')
+        axes[1, 1].set_title('Raw Loss Components (log scale)')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
 
         plt.tight_layout()
         plt.show()
 
     # ------------------------------------------------------------------
 
-    def plot_topology(
-        self,
-        figsize: tuple = (16, 10),
-        title: str = "Optimisation Point Set — Topology",
-        show_labels: bool = True,
-    ):
+    def plot_loss_curves(self, save_dir: str = "alignment_loss_functions",
+                         show: bool = True):
         """
-        Standalone topology visualisation of the source point set S.
+        Plot the characteristic shape of each loss function and save to files.
 
-        * Rows are coloured distinctly.
-        * Intra-row edges (adjacent signs) are drawn.
-        * Sign class name is annotated above each box.
-        * Row indices are labelled on the left.
+        Generates one image per loss function showing how the loss responds
+        to its input variable, using the optimizer's current parameters.
         """
-        fig, ax = plt.subplots(1, 1, figsize=figsize)
-        p = self.params.detach().cpu().numpy()
+        import os
+        os.makedirs(save_dir, exist_ok=True)
 
-        cmap = plt.cm.tab10
-        n_colors = max(self.num_rows, 1)
+        saved_files = []
 
-        for ri in range(self.num_rows):
-            off = self.row_offsets[ri]
-            rl = self.row_lengths[ri]
-            color = cmap(ri / n_colors)
+        def finish(fig, filename: str) -> None:
+            path = os.path.join(save_dir, filename)
+            fig.savefig(path, dpi=150, bbox_inches='tight')
+            saved_files.append(path)
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
 
-            # Intra-row edges
-            for j in range(rl - 1):
-                x1, y1 = p[off + j, 0], p[off + j, 1]
-                x2, y2 = p[off + j + 1, 0], p[off + j + 1, 1]
-                ax.plot([x1, x2], [y1, y2], '-', color=color,
-                        linewidth=2, alpha=0.6)
+        # ---- 1. Rows loss (asymmetric piecewise) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        r_far = self.rows_threshold_ratio_far
+        r_close = self.rows_threshold_ratio_close
+        p_far = self.rows_plateau_far
+        p_close = self.rows_plateau_close
+        # x-axis: deviation / ideal  (dimensionless ratio)
+        d_ratio = np.linspace(-1.5, 1.5, 500)
+        loss_vals = np.zeros_like(d_ratio)
+        for i, dr in enumerate(d_ratio):
+            if dr >= 0:
+                t_r, plat = r_far, p_far
+            else:
+                t_r, plat = r_close, p_close
+            normed = dr / t_r if t_r > 0 else 0
+            loss_vals[i] = plat * min(normed ** 2, 1.0)
+        ax.plot(d_ratio, loss_vals, 'b-', linewidth=2)
+        ax.axvline(0, color='gray', linestyle='--', alpha=0.5, label='ideal spacing')
+        ax.axvline(r_far, color='r', linestyle=':', alpha=0.7,
+                   label=f'threshold far = {r_far:.3f}')
+        ax.axvline(-r_close, color='orange', linestyle=':', alpha=0.7,
+                   label=f'threshold close = {r_close:.3f}')
+        ax.axhline(p_far, color='r', linestyle='-', alpha=0.3,
+                   label=f'plateau far = {p_far}')
+        ax.axhline(p_close, color='orange', linestyle='-', alpha=0.3,
+                   label=f'plateau close = {p_close}')
+        ax.set_xlabel('(actual − ideal) / ideal')
+        ax.set_ylabel('Loss')
+        ax.set_title(f'$L_{{rows}}$: Asymmetric Piecewise Loss\n'
+                     f'(r_far={r_far:.3f}, r_close={r_close:.3f}, '
+                     f'p_far={p_far}, p_close={p_close})')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(-0.05, max(p_far, p_close) * 1.3)
+        finish(fig, 'loss_rows.png')
 
-            # Signs
-            for j in range(rl):
-                idx = off + j
-                cx, cy, w, h = p[idx]
-                sb = self.sign_boxes_flat[idx]
+        # ---- 2. Anchor loss (quadratic deviation from baseline) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        dev = np.linspace(-100, 100, 500)
+        loss_a = dev ** 2
+        ax.plot(dev, loss_a, 'b-', linewidth=2)
+        ax.set_xlabel('y − y_baseline  (pixels)')
+        ax.set_ylabel('Loss (per sign)')
+        ax.set_title('$L_{anchor}$: Squared Deviation from Row Baseline')
+        ax.grid(True, alpha=0.3)
+        ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
+        finish(fig, 'loss_anchor.png')
 
-                rect = MplRectangle(
-                    (cx - w / 2, cy - h / 2), w, h,
-                    linewidth=1.5, edgecolor=color,
-                    facecolor=color, alpha=0.15,
-                )
-                ax.add_patch(rect)
-                ax.plot(cx, cy, 'o', color=color, markersize=4)
+        # ---- 3. Seq loss (gap deviation) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        gap_dev = np.linspace(-100, 100, 500)
+        loss_s = gap_dev ** 2
+        ax.plot(gap_dev, loss_s, 'b-', linewidth=2)
+        ax.set_xlabel('actual_gap − expected_gap  (pixels)')
+        ax.set_ylabel('Loss (per pair)')
+        ax.set_title('$L_{seq}$: Squared Gap Deviation\n'
+                     '(expected_gap = $(w_j + w_{j+1})/2$)')
+        ax.grid(True, alpha=0.3)
+        ax.axvline(0, color='gray', linestyle='--', alpha=0.5,
+                   label='ideal gap')
+        ax.legend()
+        finish(fig, 'loss_seq.png')
 
-                if show_labels:
-                    ax.text(cx, cy - h / 2 - 3, sb.sign_name[:8],
-                            fontsize=6, ha='center', va='bottom',
-                            color='black', fontweight='bold')
+        # ---- 4. Height loss (variance) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        # Show how variance grows as one sign deviates from mean
+        # In a row of n signs, if one deviates by delta from the
+        # uniform height, Var = delta^2 * (n-1)/n^2
+        # For simplicity show Var for n=5
+        n_demo = 5
+        delta = np.linspace(-80, 80, 500)
+        var_vals = delta ** 2 * (n_demo - 1) / (n_demo ** 2)
+        ax.plot(delta, var_vals, 'b-', linewidth=2,
+                label=f'row with {n_demo} signs')
+        for n_ex in [3, 10]:
+            v = delta ** 2 * (n_ex - 1) / (n_ex ** 2)
+            ax.plot(delta, v, '--', linewidth=1, alpha=0.6,
+                    label=f'row with {n_ex} signs')
+        ax.set_xlabel('$h_j - \\bar{h}$  (pixel deviation of one sign)')
+        ax.set_ylabel('Variance contribution')
+        ax.set_title('$L_{height}$: Height Variance within a Row\n'
+                     '(one sign deviating, others uniform)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
+        finish(fig, 'loss_height.png')
 
-            # Row label
-            if rl > 0:
-                first_cx = p[off, 0]
-                first_w = p[off, 2]
-                first_cy = p[off, 1]
-                ax.text(first_cx - first_w - 5, first_cy,
-                        f'R{ri}', fontsize=10, ha='right', va='center',
-                        color=color, fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.2',
-                                  facecolor=color, alpha=0.25))
+        # ---- 5. Data loss (GMM likelihood for one source) ----
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        sigma = self.sigma
+        w = self.w_noise
+        # Show -log p(x) as a function of distance from the nearest
+        # source centre, for a single source-target pair
+        dist = np.linspace(0, 4 * sigma, 500)
+        gauss = (1.0 / (2 * np.pi * sigma ** 2)) * np.exp(
+            -dist ** 2 / (2 * sigma ** 2))
+        # p(x) = w/N + (1-w)/M * gauss  (simplified for M=N=1)
+        p_x = w + (1 - w) * gauss
+        neg_log_p = -np.log(p_x)
+        ax.plot(dist, neg_log_p, 'b-', linewidth=2)
+        ax.axhline(-np.log(w), color='r', linestyle=':', alpha=0.7,
+                   label=f'floor: −log(w) = {-np.log(w):.2f}')
+        ax.axvline(sigma, color='orange', linestyle='--', alpha=0.6,
+                   label=f'σ = {sigma:.1f}')
+        ax.axvline(2 * sigma, color='orange', linestyle=':', alpha=0.4,
+                   label=f'2σ = {2*sigma:.1f}')
+        ax.set_xlabel('‖x − s‖  (distance, pixels)')
+        ax.set_ylabel('−log p(x)')
+        ax.set_title(f'$E_{{data}}$: Neg-Log-Likelihood per Target Point\n'
+                     f'(σ={sigma:.1f}, w={w})')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        finish(fig, 'loss_data.png')
 
-        ax.set_aspect('equal')
-        ax.invert_yaxis()
-        ax.set_xlabel('x (pixels)')
-        ax.set_ylabel('y (pixels)')
-        ax.set_title(title)
-        ax.grid(True, alpha=0.2)
-        plt.tight_layout()
-        plt.show()
+        # ---- 6. Boundary loss (steep IoR penalty) ----
+        if self.lambda_boundary > 0:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+            ior_vals = np.linspace(0, 1, 500)
+            k = self.boundary_steepness
+            boundary_loss = k * (1.0 - ior_vals) ** 2
+            ax.plot(ior_vals, boundary_loss, 'b-', linewidth=2)
+            ax.axvline(1.0, color='gray', linestyle='--', alpha=0.5,
+                       label='fully inside (IoR=1)')
+            ax.axhline(0, color='gray', linestyle='-', alpha=0.3)
+            # Mark some reference points
+            for ref_ior in [0.5, 0.8, 0.9]:
+                ref_loss = k * (1.0 - ref_ior) ** 2
+                ax.plot(ref_ior, ref_loss, 'ro', markersize=5)
+                ax.annotate(f'IoR={ref_ior}: L={ref_loss:.2f}',
+                           xy=(ref_ior, ref_loss),
+                           xytext=(ref_ior - 0.15, ref_loss + 0.2),
+                           fontsize=8, alpha=0.8)
+            ax.set_xlabel('IoR (Intersection over Region)')
+            ax.set_ylabel('Loss (per row-first sign)')
+            ax.set_title(f'$L_{{boundary}}$: Contour Boundary Penalty\n'
+                         f'$k \\cdot (1 - IoR)^2$, k={k}')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(-0.05, 1.05)
+            ax.set_ylim(-0.1, k + 0.5)
+            finish(fig, 'loss_boundary.png')
 
-    # ------------------------------------------------------------------
-
-    def plot_point_sets(
-        self,
-        img: np.ndarray = None,
-        figsize: tuple = (16, 10),
-        title: str = "Source S (blue) and Target X (red)",
-    ):
-        """
-        Overlay both source (S) and target (X) point sets, optionally
-        on the tablet image.
-
-        * Source boxes: blue / cyan  (with intra-row connections)
-        * Target boxes: red
-        """
-        fig, ax = plt.subplots(1, 1, figsize=figsize)
-
-        if img is not None:
-            ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-        # ---- Target X  (red) ----
-        if self.N > 0:
-            Xp = self.X_pos.cpu().numpy()
-            Xs = self.X_size.cpu().numpy()
-            for n in range(self.N):
-                cx, cy = Xp[n]
-                w, h = Xs[n]
-                rect = MplRectangle(
-                    (cx - w / 2, cy - h / 2), w, h,
-                    linewidth=1, edgecolor='red',
-                    facecolor='red', alpha=0.12,
-                )
-                ax.add_patch(rect)
-            ax.scatter(Xp[:, 0], Xp[:, 1], c='red', s=20, zorder=5,
-                       label=f'Target X ({self.N})')
-
-        # ---- Source S  (blue / cyan) ----
-        p = self.params.detach().cpu().numpy()
-        for ri in range(self.num_rows):
-            off = self.row_offsets[ri]
-            rl = self.row_lengths[ri]
-            for j in range(rl - 1):
-                x1, y1 = p[off + j, 0], p[off + j, 1]
-                x2, y2 = p[off + j + 1, 0], p[off + j + 1, 1]
-                ax.plot([x1, x2], [y1, y2], '-', color='cyan',
-                        linewidth=1, alpha=0.5)
-            for j in range(rl):
-                idx = off + j
-                cx, cy, w, h = p[idx]
-                rect = MplRectangle(
-                    (cx - w / 2, cy - h / 2), w, h,
-                    linewidth=1, edgecolor='blue',
-                    facecolor='cyan', alpha=0.12,
-                )
-                ax.add_patch(rect)
-
-        ax.scatter(p[:, 0], p[:, 1], c='blue', s=15, zorder=5,
-                   marker='s', label=f'Source S ({self.M})')
-
-        ax.legend(fontsize=10)
-        ax.set_title(title)
-        if img is None:
-            ax.set_aspect('equal')
-            ax.invert_yaxis()
-        ax.grid(True, alpha=0.2)
-        plt.tight_layout()
-        plt.show()
+        print(f"Loss curve plots saved to {save_dir}/:")
+        for f in saved_files:
+            print(f"  {f}")
+        return saved_files

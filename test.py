@@ -77,7 +77,7 @@ def main():
         "checkpoints/efficient-net/efficient-net-24/epoch_300.pth"
     )
 
-    runner.model = Recognition(detection_model, classification_model, classes, cfg)
+    runner.model = Recognition(detection_model,  classification_model, classes, cfg)
     """
     runner.model.eval()
     img = mmcv.imread('data/coco/val2017/BM.33016-0.jpg', channel_order='rgb')

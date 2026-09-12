@@ -138,7 +138,7 @@ model = dict(
     num_feature_levels=4,
     num_queries=300,
     positional_encoding=dict(normalize=True, num_feats=128, offset=-0.5),
-    test_cfg=dict(max_per_img=100),
+    test_cfg=dict(max_per_img=300),
     train_cfg=dict(
         assigner=dict(
             match_costs=[

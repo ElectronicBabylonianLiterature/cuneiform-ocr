@@ -1,75 +1,126 @@
-"""
-Evaluation script for Cuneiform Signs Alignment.
+"""Evaluation script for the available Cuneiform Signs Alignment modes.
 
 Computes object-detection-style metrics (mAP, IoU, Precision, Recall)
-by comparing optimized alignment bounding boxes against ground-truth annotations.
+by comparing each mode's bounding boxes against ground-truth annotations.
 
 Also includes a fast coordinate-wise hyperparameter sweep for the
-ElasticChainOptimizer.
+PointSetRegistrationOptimizer.
+
+Uses the step functions from sign_alignment/pipeline.py for the alignment
+pipeline.
 """
 
 import json
 import os
-import time
 import numpy as np
 import cv2
-import torch
+from enum import Enum
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
+from PIL import Image as PILImage, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 from sign_alignment import (
-    LocalDataSource, EBLAPISource, SignTextParser,
-    CLASSES_ABZ, SignResolver,
-    ModelConfig, TabletImageDetector, SingleImage,
-    compute_avg_dimensions,
-    match_heatmaps_ncc, transform_gt_to_cropped_region,
-    SubTablet, ElasticChainOptimizer,
-    BoundingBox, Detection, GroundTruths,
+    LocalTestDataSource,
+    EBLAPISource,
+    ModelConfig, SignClassifier, TabletImageDetector,
+    Box, Boxes,
+    hyperparameter_search,
+)
+from sign_alignment.visualizer import ColorConfig
+from sign_alignment.pipeline import (
+    CandidateAttractionConfig,
+    CropContext, Runner, SampleState, Step, VisOptions,
+    align_text_rows,
+    build_sign_match_info,
+    create_box_sets,
+    create_psr_optimizer,
+    create_result_without_optimization,
+    detect_rows,
+    detect_signs,
+    improve_classification,
+    load_data,
+    match_rows,
+    match_signs_in_rows,
+    optimize_psr,
+    run_candidate_attraction,
+    transform_gt_to_crop,
+    vis_aligned_rows,
+    vis_box_sets,
+    vis_crop_ground_truth,
+    vis_detected_rows_info,
+    vis_detection_statistics,
+    vis_detections,
+    vis_loaded_data,
+    vis_optimization,
+    vis_psr_optimizer,
+    vis_row_matches,
+    vis_sign_match_info,
+    vis_sign_matches,
 )
 
 load_dotenv()
 
 # ============ Configuration ============
-ANNOTATIONS_DIR = os.path.expanduser("~/erc-work-data/data-of-cuneiform-ocr-data/filtered_annotations")
+COCO_TEST_DIR = os.path.expanduser("~/erc-work-data/ready-for-training/coco-recognition-2025-09/data/coco")
 CONFIG_FILE = "configs/detr.py"
 CHECKPOINT_FILE = os.path.expanduser("~/erc-work-data/retrained_models/detr-173/epoch_1000.pth")
-SCORE_THRESHOLD = 0.5
-SCALE_FACTOR = 10
+CLASSIFIER_CHECKPOINT_FILE = os.path.expanduser(
+    "~/erc-work-data/signs_alignment_data/best_resnet18_sign_classifier.pth"
+)
+SCORE_THRESHOLD = 0.0
+CLASSIFICATION_CONFIDENCE_THRESHOLD = 0.5
 EVAL_OUTPUT_DIR = "evaluation_results"
 
-# --- Iteration counts (easy to tweak) ---
-NUM_ITERATIONS_EVAL = 50          # iterations for full evaluation
-NUM_ITERATIONS_SEARCH = 30        # iterations during hyperparameter sweep (fast)
-
 # Number of fragments to evaluate / search
-EVAL_SAMPLE_LIMIT = 10
-SEARCH_SAMPLE_LIMIT = 5           # small subset for fast sweep
-
-# Default optimizer hyperparameters
-DEFAULT_OPTIMIZER_PARAMS = dict(
-    lambda_data=10000.0,
-    lambda_iou=20000.0,
-    lambda_seq=0.05,
-    lambda_smooth=0.15,
-    lambda_anchor=0.05,
-    lambda_size=0.1,
-    alpha_geo=0.0,                # disabled
-    num_iterations=NUM_ITERATIONS_EVAL,
-    lr=5.0,
-)
-
-HEATMAP_METHOD = 'gaussian'
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+EVAL_SAMPLE_LIMIT = 100
+SEARCH_SAMPLE_LIMIT = 5
 
 # IoU thresholds for mAP computation
 IOU_THRESHOLDS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 
+# --- Default PSR optimizer hyperparameters (used by hyperparameter sweep) ---
+DEFAULT_PSR_PARAMS = dict(
+    sigma_factor=1.5,
+    w_noise=0.1,
+    lambda_data=2.0,
+    lambda_anchor=0.01,
+    lambda_seq=0.1,
+    lambda_height=0.01,
+    lambda_rows=5.0,
+    lambda_boundary=1.0,
+    rows_threshold_ratio_far=1 / 3.0,
+    rows_threshold_ratio_close=2 / 3.0,
+    rows_plateau_far=0.5,
+    rows_plateau_close=1.0,
+    num_iterations=150,
+    lr=1.0,
+    sigma_anneal=True,
+)
+
+# Faster settings for hyperparameter sweep
+SEARCH_PSR_PARAMS = dict(DEFAULT_PSR_PARAMS)
+SEARCH_PSR_PARAMS['num_iterations'] = 40
+
+
+# ============ Prediction Mode ============
+
+class PredictionMode(str, Enum):
+    """Controls how bounding box predictions are produced during evaluation."""
+    PSR = "psr"                      # Detection + text alignment + PSR optimization
+    WITHOUT_PSR = "without_psr"      # Detection + text alignment, preserving detection geometry
+    DETECTION = "detection"          # Raw detection model output only
+    IMPROVED_DETECTION = "improved_detection"  # Detection + ResNet classification fusion
+    DET_AS_CANDIDATES = "det_as_candidates"  # Position-first fixed-candidate attraction
+
+# Default prediction mode used by run_evaluation
+DEFAULT_PREDICTION_MODE = PredictionMode.WITHOUT_PSR
+
 
 # ============ IoU & Metrics ============
 
-def compute_iou(box_a: BoundingBox, box_b: BoundingBox) -> float:
-    """Compute IoU between two BoundingBox objects."""
+def compute_iou(box_a: Box, box_b: Box) -> float:
+    """Compute IoU between two Box objects."""
     x1 = max(box_a.x1, box_b.x1)
     y1 = max(box_a.y1, box_b.y1)
     x2 = min(box_a.x2, box_b.x2)
@@ -85,7 +136,7 @@ def compute_iou(box_a: BoundingBox, box_b: BoundingBox) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def compute_iou_matrix(preds: Detection, gts: GroundTruths) -> np.ndarray:
+def compute_iou_matrix(preds: Boxes, gts: Boxes) -> np.ndarray:
     """Compute IoU matrix of shape (len(preds), len(gts))."""
     n_pred = len(preds)
     n_gt = len(gts)
@@ -97,8 +148,8 @@ def compute_iou_matrix(preds: Detection, gts: GroundTruths) -> np.ndarray:
 
 
 def match_predictions_to_gt(
-    preds: Detection,
-    gts: GroundTruths,
+    preds: Boxes,
+    gts: Boxes,
     iou_threshold: float = 0.5,
     class_agnostic: bool = False,
 ) -> Dict:
@@ -107,8 +158,8 @@ def match_predictions_to_gt(
     Each GT box is matched to at most one prediction (greedy, highest IoU first).
 
     Args:
-        preds: Predicted BoundingBox list
-        gts: Ground truth BoundingBox list
+        preds: Predicted Box list
+        gts: Ground truth Box list
         iou_threshold: IoU threshold for a match
         class_agnostic: If False, pred and GT must share the same sign name
 
@@ -171,332 +222,754 @@ def compute_precision_recall(tp: int, fp: int, fn: int) -> Tuple[float, float]:
     return precision, recall
 
 
-def compute_ap_at_threshold(
-    all_fragment_results: List[Dict],
-    iou_threshold: float = 0.5,
-    class_agnostic: bool = False,
+def _compute_coco_class_ap(
+    preds_sorted: List[Tuple[str, 'Box']],
+    gts_by_image: Dict[str, List['Box']],
+    total_gt: int,
+    iou_threshold: float,
+) -> Tuple[float, int, int, int, List[float]]:
+    """
+    COCO-style 101-point interpolated AP for a single class at a single IoU threshold.
+
+    Args:
+        preds_sorted: [(fid, box), ...] sorted by score descending.
+        gts_by_image: {fid: [gt_boxes_for_this_class]}.
+        total_gt: Total number of GT boxes for this class (across all images).
+        iou_threshold: IoU threshold for a match.
+
+    Returns:
+        (ap, tp, fp, fn, matched_ious)
+    """
+    if total_gt == 0:
+        return 0.0, 0, len(preds_sorted), 0, []
+
+    # Track which GT boxes have been matched (per image)
+    gt_matched = {fid: [False] * len(gts) for fid, gts in gts_by_image.items()}
+
+    is_tp = np.zeros(len(preds_sorted), dtype=np.float64)
+    is_fp = np.zeros(len(preds_sorted), dtype=np.float64)
+    matched_ious: List[float] = []
+
+    for i, (fid, pred_box) in enumerate(preds_sorted):
+        img_gts = gts_by_image.get(fid, [])
+        if not img_gts:
+            is_fp[i] = 1.0
+            continue
+
+        # Find best unmatched GT for this pred in the same image
+        best_iou = -1.0
+        best_j = -1
+        for j, gt_box in enumerate(img_gts):
+            if gt_matched[fid][j]:
+                continue
+            iou = compute_iou(pred_box, gt_box)
+            if iou > best_iou:
+                best_iou = iou
+                best_j = j
+
+        if best_iou >= iou_threshold and best_j >= 0:
+            gt_matched[fid][best_j] = True
+            is_tp[i] = 1.0
+            matched_ious.append(best_iou)
+        else:
+            is_fp[i] = 1.0
+
+    # Build cumulative precision / recall arrays
+    cum_tp = np.cumsum(is_tp)
+    cum_fp = np.cumsum(is_fp)
+    precision_curve = cum_tp / (cum_tp + cum_fp)
+    recall_curve = cum_tp / total_gt
+
+    # 101-point interpolated AP (COCO standard)
+    ap = 0.0
+    for r_thresh in np.linspace(0.0, 1.0, 101):
+        mask = recall_curve >= r_thresh
+        if mask.any():
+            ap += float(precision_curve[mask].max())
+    ap /= 101.0
+
+    tp = int(is_tp.sum())
+    fp = int(is_fp.sum())
+    fn = total_gt - tp
+    return ap, tp, fp, fn, matched_ious
+
+
+def compute_coco_map(
+    all_results: List[Dict],
+    iou_thresholds: List[float] = IOU_THRESHOLDS,
+    max_dets: Optional[int] = None,
 ) -> Dict:
     """
-    Compute AP (average precision) at a single IoU threshold
-    across all fragments (micro-averaged).
+    COCO-style mAP: per-class score-sorted 101-point interpolated AP,
+    macro-averaged across classes, then averaged across IoU thresholds.
 
-    Each fragment_result should have:
-      - 'preds': Detection  (list of BoundingBox)
-      - 'gts': GroundTruths (list of BoundingBox)
+    Args:
+        all_results: List of dicts with 'fragment_id', 'preds', 'gts'.
+        iou_thresholds: IoU thresholds to evaluate at.
+        max_dets: If set, cap predictions per class at this many (highest score first).
+                  Default None = no cap (COCO default is 100; pass 100 to compare).
+
+    Returns:
+        Dict with mAP, AP@0.5, AP@0.75, AR, per_threshold details, and per_class stats.
     """
-    total_tp = 0
-    total_fp = 0
-    total_fn = 0
-    all_ious = []
+    # Organise data by class
+    preds_by_class: Dict[str, List] = defaultdict(list)           # cls -> [(score, fid, box)]
+    gts_by_class_image: Dict[str, Dict[str, List]] = defaultdict(
+        lambda: defaultdict(list)
+    )                                                              # cls -> {fid -> [boxes]}
 
-    for fr in all_fragment_results:
-        m = match_predictions_to_gt(
-            fr['preds'], fr['gts'],
-            iou_threshold=iou_threshold,
-            class_agnostic=class_agnostic,
-        )
-        total_tp += m['tp']
-        total_fp += m['fp']
-        total_fn += m['fn']
-        all_ious.extend(m['matched_ious'])
+    for r in all_results:
+        fid = r['fragment_id']
+        for box in r['gts']:
+            gts_by_class_image[box.sign.name][fid].append(box)
+        for box in r['preds']:
+            preds_by_class[box.sign.name].append((box.score, fid, box))
 
-    precision, recall = compute_precision_recall(total_tp, total_fp, total_fn)
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    mean_iou = float(np.mean(all_ious)) if all_ious else 0.0
+    # Sort predictions by score descending; apply optional maxDets cap
+    for cls in preds_by_class:
+        preds_by_class[cls].sort(key=lambda x: -x[0])
+        if max_dets is not None:
+            preds_by_class[cls] = preds_by_class[cls][:max_dets]
 
-    return {
-        'iou_threshold': iou_threshold,
-        'tp': total_tp,
-        'fp': total_fp,
-        'fn': total_fn,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'mean_matched_iou': mean_iou,
-    }
+    # Only classes that appear in the GT contribute to the macro average
+    all_classes = sorted(gts_by_class_image.keys())
 
+    per_threshold = []
+    per_class_at_50: Dict[str, Dict] = {}
 
-def compute_map(all_fragment_results: List[Dict], class_agnostic: bool = False) -> Dict:
-    """
-    Compute mAP across standard IoU thresholds [0.5, 0.55, ..., 0.95].
-    Also returns detailed results per threshold.
-    """
-    results_per_threshold = []
-    for thresh in IOU_THRESHOLDS:
-        r = compute_ap_at_threshold(all_fragment_results, iou_threshold=thresh,
-                                    class_agnostic=class_agnostic)
-        results_per_threshold.append(r)
+    for thresh in iou_thresholds:
+        class_aps: List[float] = []
+        class_recalls: List[float] = []   # per-class recall for COCO AR
+        total_tp_all = 0
+        total_fp_all = 0
+        total_fn_all = 0
+        all_matched_ious: List[float] = []
 
-    # mAP = mean of precision across thresholds (COCO-style: uses precision at each threshold)
-    precisions = [r['precision'] for r in results_per_threshold]
-    mAP = float(np.mean(precisions))
+        for cls in all_classes:
+            gts_by_image = dict(gts_by_class_image[cls])
+            total_gt = sum(len(v) for v in gts_by_image.values())
+            preds_sorted = [(fid, box) for _, fid, box in preds_by_class.get(cls, [])]
+
+            ap, tp, fp, fn, m_ious = _compute_coco_class_ap(
+                preds_sorted, gts_by_image, total_gt, thresh
+            )
+            class_aps.append(ap)
+            # COCO AR uses per-class recall, macro-averaged (same denominator as AP)
+            recall_cls = tp / total_gt if total_gt > 0 else 0.0
+            class_recalls.append(recall_cls)
+            total_tp_all += tp
+            total_fp_all += fp
+            total_fn_all += fn
+            all_matched_ious.extend(m_ious)
+
+            # Collect per-class breakdown at IoU=0.5
+            if thresh == 0.5:
+                p_cls, r_cls = compute_precision_recall(tp, fp, fn)
+                f1_cls = 2 * p_cls * r_cls / (p_cls + r_cls) if (p_cls + r_cls) > 0 else 0.0
+                per_class_at_50[cls] = {
+                    'ap': ap,
+                    'tp': tp, 'fp': fp, 'fn': fn,
+                    'precision': p_cls,
+                    'recall': r_cls,
+                    'f1': f1_cls,
+                }
+
+        macro_ap = float(np.mean(class_aps)) if class_aps else 0.0
+        macro_recall = float(np.mean(class_recalls)) if class_recalls else 0.0
+        precision, recall = compute_precision_recall(total_tp_all, total_fp_all, total_fn_all)
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        per_threshold.append({
+            'iou_threshold': thresh,
+            'ap': macro_ap,
+            'macro_recall': macro_recall,   # per-class macro avg recall at this threshold
+            'tp': total_tp_all,
+            'fp': total_fp_all,
+            'fn': total_fn_all,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'mean_matched_iou': float(np.mean(all_matched_ious)) if all_matched_ious else 0.0,
+        })
+
+    aps = [r['ap'] for r in per_threshold]
+    mAP = float(np.mean(aps))
+    ap50 = per_threshold[0]['ap']
+    ap75 = per_threshold[5]['ap'] if len(per_threshold) > 5 else 0.0
+    # COCO AR: macro-averaged recall, averaged across all IoU thresholds
+    AR = float(np.mean([r['macro_recall'] for r in per_threshold]))
 
     return {
         'mAP': mAP,
-        'AP@0.5': results_per_threshold[0]['precision'],
-        'AP@0.75': results_per_threshold[5]['precision'] if len(results_per_threshold) > 5 else 0.0,
-        'per_threshold': results_per_threshold,
+        'AP@0.5': ap50,
+        'AP@0.75': ap75,
+        'AR': AR,
+        'per_threshold': per_threshold,
+        'per_class': per_class_at_50,
+        'num_classes': len(all_classes),
     }
 
 
-# ============ Per-class metrics ============
+# ============ Evaluation Visualization ============
 
-def compute_per_class_metrics(
-    all_fragment_results: List[Dict],
-    iou_threshold: float = 0.5,
-) -> Dict[str, Dict]:
-    """Compute precision / recall per sign class."""
-    class_stats = defaultdict(lambda: {'tp': 0, 'fp': 0, 'fn': 0})
-
-    for fr in all_fragment_results:
-        preds = fr['preds']
-        gts = fr['gts']
-        m = match_predictions_to_gt(preds, gts, iou_threshold=iou_threshold,
-                                    class_agnostic=False)
-        matched_pred_ids = set()
-        matched_gt_ids = set()
-        for pi, gj in m['matched_pairs']:
-            cls = gts[gj].sign.name
-            class_stats[cls]['tp'] += 1
-            matched_pred_ids.add(pi)
-            matched_gt_ids.add(gj)
-
-        for pi, p in enumerate(preds):
-            if pi not in matched_pred_ids:
-                class_stats[p.sign.name]['fp'] += 1
-        for gj, g in enumerate(gts):
-            if gj not in matched_gt_ids:
-                class_stats[g.sign.name]['fn'] += 1
-
-    per_class = {}
-    for cls, stats in sorted(class_stats.items()):
-        p, r = compute_precision_recall(stats['tp'], stats['fp'], stats['fn'])
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-        per_class[cls] = {**stats, 'precision': p, 'recall': r, 'f1': f1}
-    return per_class
+def _get_eval_font(size: int):
+    """Load font for evaluation annotations."""
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+    except Exception:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
+        except Exception:
+            return ImageFont.load_default()
 
 
-# ============ Alignment Pipeline (reused from signs_alignment_heatmap.py) ============
-
-def run_alignment_pipeline(
-    tablet_detector: TabletImageDetector,
-    local_source: LocalDataSource,
-    api_source: EBLAPISource,
+def visualize_evaluation_fragment(
+    img: np.ndarray,
     fragment_id: str,
-    scale_factor: int = SCALE_FACTOR,
-    method: str = HEATMAP_METHOD,
-    optimizer_params: dict = None,
-    verbose: bool = False,
-) -> Optional[Dict]:
+    preds: Boxes,
+    gts: Boxes,
+    iou_threshold: float = 0.5,
+    class_agnostic: bool = True,
+    output_dir: str = EVAL_OUTPUT_DIR,
+):
     """
-    Run the full alignment pipeline for one fragment.
-    Returns dict with 'preds' (optimized boxes in full img coords) and 'gts'.
+    Visualize evaluation results for a single fragment.
+
+    Draws semi-transparent filled boxes:
+      - Green:   matched GT and pred boxes (TP)
+      - Orange:  false positive pred boxes (FP)
+      - Magenta: missed GT boxes (FN)
+
+    Annotates per-image evaluation metrics at the top of the image.
     """
-    if optimizer_params is None:
-        optimizer_params = DEFAULT_OPTIMIZER_PARAMS
+    match_result = match_predictions_to_gt(
+        preds, gts, iou_threshold=iou_threshold, class_agnostic=class_agnostic
+    )
 
-    img = local_source.load_image(fragment_id)
-    if img is None:
-        return None
+    tp = match_result['tp']
+    fp = match_result['fp']
+    fn = match_result['fn']
+    precision, recall = compute_precision_recall(tp, fp, fn)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    mean_iou = float(np.mean(match_result['matched_ious'])) if match_result['matched_ious'] else 0.0
 
-    gt_boxes = local_source.load_annotation(fragment_id)
-    if not gt_boxes:
-        return None
+    matched_pred_idxs = {pi for pi, gj in match_result['matched_pairs']}
+    matched_gt_idxs = {gj for pi, gj in match_result['matched_pairs']}
 
-    signs_text = api_source.get_signs(fragment_id)
-    if signs_text is None:
-        return None
+    # Colors in BGR
+    GREEN = (0, 200, 0)
+    ORANGE = (0, 165, 255)
+    MAGENTA = (255, 0, 255)
+    alpha = 0.3
 
-    text_lines = SignTextParser.parse_api_signs(signs_text)
-    if not text_lines:
-        return None
+    # --- Step 1: Draw semi-transparent fills on overlay ---
+    overlay = img.copy()
 
-    detections = tablet_detector.detect(img)
-    if not detections:
-        return None
+    for gj in matched_gt_idxs:
+        box = gts[gj]
+        cv2.rectangle(overlay, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), GREEN, -1)
+    for pi in matched_pred_idxs:
+        box = preds[pi]
+        cv2.rectangle(overlay, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), GREEN, -1)
+    for pi, box in enumerate(preds):
+        if pi not in matched_pred_idxs:
+            cv2.rectangle(overlay, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), ORANGE, -1)
+    for gj, box in enumerate(gts):
+        if gj not in matched_gt_idxs:
+            cv2.rectangle(overlay, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), MAGENTA, -1)
 
-    cropped_images = tablet_detector.get_cropped_images()
-    crop_coordinates = tablet_detector.crop_coordinates
-    avg_width, avg_height = compute_avg_dimensions(detections)
-    margin = max(avg_width, avg_height)
+    # --- Step 2: Blend ---
+    vis_img = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
 
-    all_optimized_full: List[BoundingBox] = []
+    # --- Step 3: Draw crisp outlines on top ---
+    for gj in matched_gt_idxs:
+        box = gts[gj]
+        cv2.rectangle(vis_img, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), GREEN, 2)
+    for pi in matched_pred_idxs:
+        box = preds[pi]
+        cv2.rectangle(vis_img, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), GREEN, 2)
+    for pi, box in enumerate(preds):
+        if pi not in matched_pred_idxs:
+            cv2.rectangle(vis_img, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), ORANGE, 2)
+    for gj, box in enumerate(gts):
+        if gj not in matched_gt_idxs:
+            cv2.rectangle(vis_img, (int(box.x1), int(box.y1)), (int(box.x2), int(box.y2)), MAGENTA, 2)
 
-    for idx, crop_single in enumerate(cropped_images):
-        crop_dets = crop_single.detections
-        if not crop_dets:
+    # --- Step 4: Build text banner ---
+    h, w = vis_img.shape[:2]
+    font_scale = max(w / 1200.0, 0.8)
+    font_title_size = int(22 * font_scale)
+    font_text_size = int(18 * font_scale)
+    font_legend_size = int(16 * font_scale)
+    line_h = int(26 * font_scale)
+    banner_height = line_h * 4 + 10
+
+    banner = np.ones((banner_height, w, 3), dtype=np.uint8) * 255
+    result_img = np.vstack([banner, vis_img])
+
+    # Render text with PIL (Unicode-safe)
+    result_pil = PILImage.fromarray(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(result_pil)
+    font_title = _get_eval_font(font_title_size)
+    font_text = _get_eval_font(font_text_size)
+    font_legend = _get_eval_font(font_legend_size)
+
+    y = 5
+    draw.text((10, y), f"Fragment: {fragment_id}    IoU threshold: {iou_threshold}",
+              font=font_title, fill=(0, 0, 0))
+    y += line_h
+    draw.text((10, y),
+              f"GT: {len(gts)}    Pred: {len(preds)}    TP: {tp}    FP: {fp}    FN: {fn}",
+              font=font_text, fill=(0, 0, 0))
+    y += line_h
+    draw.text((10, y),
+              f"Precision: {precision:.4f}    Recall: {recall:.4f}    "
+              f"F1: {f1:.4f}    Mean IoU: {mean_iou:.4f}",
+              font=font_text, fill=(0, 0, 0))
+    y += line_h
+
+    # Legend
+    sq = int(14 * font_scale)
+    gap = int(10 * font_scale)
+    lx = 10
+    draw.rectangle([lx, y, lx + sq, y + sq], fill=(0, 200, 0))
+    draw.text((lx + sq + 4, y - 2), "Match (TP)", font=font_legend, fill=(0, 0, 0))
+    lx += int(120 * font_scale)
+    draw.rectangle([lx, y, lx + sq, y + sq], fill=(255, 165, 0))
+    draw.text((lx + sq + 4, y - 2), "FP (pred)", font=font_legend, fill=(0, 0, 0))
+    lx += int(120 * font_scale)
+    draw.rectangle([lx, y, lx + sq, y + sq], fill=(255, 0, 255))
+    draw.text((lx + sq + 4, y - 2), "Miss (GT)", font=font_legend, fill=(0, 0, 0))
+
+    result_img = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+
+    # --- Save ---
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, f"{fragment_id}_eval_IoU{int(iou_threshold * 100)}.jpg")
+    cv2.imwrite(save_path, result_img)
+    print(f"  Saved evaluation visualization: {save_path}")
+
+
+# ============ Prediction & Evaluation Runner ============
+
+def _nms_predictions(
+    preds: List[Box],
+    iou_threshold: float = 0.5,
+) -> List[Box]:
+    """
+    Per-class non-maximum suppression.
+
+    Suppresses duplicate predictions (e.g. from overlapping crops) that share
+    the same class and have IoU >= iou_threshold. Keeps the higher-score box.
+    """
+    by_class: Dict[str, List[Box]] = defaultdict(list)
+    for p in preds:
+        by_class[p.sign.name].append(p)
+
+    kept: List[Box] = []
+    for boxes in by_class.values():
+        boxes = sorted(boxes, key=lambda b: -b.score)
+        suppressed = [False] * len(boxes)
+        for i, bi in enumerate(boxes):
+            if suppressed[i]:
+                continue
+            kept.append(bi)
+            for j in range(i + 1, len(boxes)):
+                if not suppressed[j] and compute_iou(bi, boxes[j]) >= iou_threshold:
+                    suppressed[j] = True
+    return kept
+
+
+def _load_and_detect_fragment(runner: Runner, context: CropContext, fid: str) -> bool:
+    """
+    Load a fragment and run sign detection.
+
+    Sets up context.state in place. Returns False if the fragment should be
+    skipped (missing data, empty GT/detections, etc.).
+    """
+    context.state = SampleState()
+    context.state.fragment_id = fid
+
+    runner.run([Step("Load data", load_data, vis_loaded_data)])
+
+    s = context.state
+    if s.full_tablet is None or not s.text_lines or not s.full_gt_boxes:
+        return False
+
+    # Filter out abnormally large GT boxes (e.g. sub-tablet region annotations)
+    areas = [b.width * b.height for b in s.full_gt_boxes]
+    mean_area = np.mean(areas)
+    s.full_gt_boxes = Boxes(
+        (
+            box
+            for box, area in zip(s.full_gt_boxes, areas)
+            if area <= mean_area * 5
+        ),
+        tablet=s.full_gt_boxes.tablet,
+    )
+    if not s.full_gt_boxes:
+        return False
+
+    runner.run([
+        Step("Detect signs", detect_signs, vis_detections),
+        Step("Detection statistics", lambda _: None, vis_detection_statistics),
+    ])
+    if not s.full_detections:
+        return False
+
+    return True
+
+
+def _predict_detection_crops(
+    runner: Runner,
+    context: CropContext,
+    fid: str,
+    visualize: bool = False,
+    output_dir: str = EVAL_OUTPUT_DIR,
+    improve: bool = False,
+) -> List[Box]:
+    """
+    Collect raw detection model outputs across all crops, offset to full image coordinates.
+
+    Requires _load_and_detect_fragment() to have been called first.
+    Optionally saves a per-fragment evaluation visualization.
+    """
+    s = context.state
+    raw_preds: List[Box] = []
+    for crop_idx in range(len(context.tablet_detector.crop_tablets)):
+        runner.choose_crop(crop_idx)
+        if not s.det_boxes:
+            continue
+        if improve:
+            improve_classification(
+                context,
+                CLASSIFICATION_CONFIDENCE_THRESHOLD,
+            )
+        for det in s.det_boxes:
+            raw_preds.append(det.to_tablet(s.full_tablet))
+
+    # Suppress cross-crop duplicates: the same sign detected in overlapping crops
+    # appears multiple times after offsetting; all but the highest-score one are FP.
+    preds = _nms_predictions(raw_preds, iou_threshold=0.5)
+
+    if visualize and s.full_tablet is not None:
+        visualize_evaluation_fragment(
+            img=s.full_tablet.img,
+            fragment_id=fid,
+            preds=preds,
+            gts=s.full_gt_boxes,
+            iou_threshold=0.5,
+            class_agnostic=False,
+            output_dir=output_dir,
+        )
+    return preds
+
+
+def _run_without_psr_alignment_steps(runner: Runner) -> None:
+    """Run the notebook alignment flow through result_without_optimization.
+
+    Both PSR and WITHOUT_PSR use this shared prefix so row detection and
+    matching stay in sync.  In particular, ``detect_rows`` currently uses the
+    Hough-based row detector from ``sign_alignment.pipeline``.
+    """
+    runner.run([
+        Step("Transform GT to crop", transform_gt_to_crop, vis_crop_ground_truth),
+        Step(
+            "Improve classification",
+            lambda context: improve_classification(
+                context,
+                CLASSIFICATION_CONFIDENCE_THRESHOLD,
+            ),
+        ),
+        Step("Create box sets", create_box_sets, vis_box_sets),
+        Step("Detect rows (Hough)", detect_rows, vis_detected_rows_info),
+        Step("Match rows", match_rows, vis_row_matches),
+        Step("Match signs", match_signs_in_rows, vis_sign_matches),
+        Step("Align text rows", align_text_rows, vis_aligned_rows),
+        Step(
+            "Result without PSR",
+            create_result_without_optimization,
+        ),
+    ])
+
+
+def _predict_without_psr_crops(
+    runner: Runner,
+    context: CropContext,
+    fid: str,
+    visualize: bool = False,
+    output_dir: str = EVAL_OUTPUT_DIR,
+) -> List[Box]:
+    """Return relabelled detections without changing their geometry or score."""
+    s = context.state
+    preds: List[Box] = []
+    for crop_idx in range(len(context.tablet_detector.crop_tablets)):
+        runner.choose_crop(crop_idx)
+        if not s.det_boxes:
             continue
 
-        # Detection SubTablet
-        sub_det = SubTablet.from_detections(
-            img=crop_single.img, detections=crop_dets,
-            name="det", avg_width=avg_width, avg_height=avg_height,
+        _run_without_psr_alignment_steps(runner)
+        if s.result_without_optimization_boxes is None:
+            continue
+
+        # create_result_without_optimization starts from s.det_boxes.copy(),
+        # so detector confidence scores (already filtered by SCORE_THRESHOLD)
+        # are preserved here.
+        for box in s.result_without_optimization_boxes:
+            preds.append(box.to_tablet(s.full_tablet))
+
+    if visualize and s.full_tablet is not None:
+        visualize_evaluation_fragment(
+            img=s.full_tablet.img,
+            fragment_id=fid,
+            preds=preds,
+            gts=s.full_gt_boxes,
+            iou_threshold=0.5,
+            class_agnostic=False,
+            output_dir=output_dir,
         )
-        sub_det.create_heatmap(scale_factor=scale_factor, method=method)
+    return preds
 
-        # Full-text SubTablet
-        sub_text = SubTablet.from_text_lines(
-            text_lines=text_lines, avg_width=avg_width,
-            avg_height=avg_height, margin=margin,
-            img=None,
-            target_detections=None,
-            align_to_detection_centroid=False,
-            name="text",
+
+def _predict_det_as_candidates_crops(
+    runner: Runner,
+    context: CropContext,
+    fid: str,
+    visualize: bool = False,
+    output_dir: str = EVAL_OUTPUT_DIR,
+) -> List[Box]:
+    """Run the sign-alignment-3 fixed-candidate flow across all crops.
+
+    The alignment prefix is deliberately identical to WITHOUT_PSR and to the
+    candidate notebook.  Detector boxes are then treated as fixed candidates;
+    the filtered candidate-run boxes are returned in full-image coordinates.
+    The shared module-level ``SCORE_THRESHOLD`` remains the only prediction
+    score threshold for this evaluation mode.
+    """
+
+    s = context.state
+    preds: List[Box] = []
+    candidate_config = CandidateAttractionConfig(
+        temperatures=(2.0, 1.0, 0.5, 0.25),
+        steps_per_temperature=35,
+        learning_rate=0.04,
+        class_bonus=0.06,
+        objectness_bonus=0.10,
+        device="auto",
+    )
+
+    for crop_idx in range(len(context.tablet_detector.crop_tablets)):
+        runner.choose_crop(crop_idx)
+        if not s.det_boxes:
+            continue
+
+        _run_without_psr_alignment_steps(runner)
+        if s.aligned_rows is None or s.candidate_rows is None:
+            continue
+
+        candidate_run = run_candidate_attraction(context, candidate_config)
+        if not candidate_run.boxes:
+            continue
+
+        for box in candidate_run.boxes:
+            # Candidate construction and final assignment confidence deliberately
+            # share the detector's module-level threshold; there is no mode-local
+            # score cutoff.
+            if box.score >= SCORE_THRESHOLD:
+                preds.append(box.to_tablet(s.full_tablet))
+
+    if visualize and s.full_tablet is not None:
+        visualize_evaluation_fragment(
+            img=s.full_tablet.img,
+            fragment_id=fid,
+            preds=preds,
+            gts=s.full_gt_boxes,
+            iou_threshold=0.5,
+            class_agnostic=False,
+            output_dir=output_dir,
         )
-        sub_text.create_heatmap(scale_factor=scale_factor, method=method)
+    return preds
 
-        # NCC
-        _, match_score, top_left_original = match_heatmaps_ncc(
-            sub_det.heatmap, sub_text.heatmap, scale_factor=scale_factor,
+
+def _predict_psr_crops(
+    runner: Runner,
+    context: CropContext,
+    fid: str,
+    visualize: bool = False,
+    output_dir: str = EVAL_OUTPUT_DIR,
+) -> List[Box]:
+    """
+    Run the full PSR alignment pipeline across all crops and return optimized boxes
+    offset to full image coordinates.
+
+    Requires _load_and_detect_fragment() to have been called first.
+    Optionally saves a per-fragment evaluation visualization.
+    """
+    s = context.state
+    preds: List[Box] = []
+    for crop_idx in range(len(context.tablet_detector.crop_tablets)):
+        runner.choose_crop(crop_idx)
+        if not s.det_boxes:
+            continue
+        _run_without_psr_alignment_steps(runner)
+        if (
+            not s.optimize_rows
+            or not len(s.optimize_rows)
+            or not s.matches
+            or not s.aligned_boxes
+        ):
+            continue
+
+        runner.run([
+            Step("Build sign match info", build_sign_match_info, vis_sign_match_info),
+            Step("Create PSR optimizer", create_psr_optimizer, vis_psr_optimizer),
+            Step("Optimize PSR", optimize_psr, vis_optimization),
+        ])
+        if not s.optimize_boxes:
+            continue
+
+        for sb in s.optimize_boxes:
+            preds.append(sb.to_tablet(s.full_tablet))
+
+    if visualize and s.full_tablet is not None:
+        visualize_evaluation_fragment(
+            img=s.full_tablet.img,
+            fragment_id=fid,
+            preds=preds,
+            gts=s.full_gt_boxes,
+            iou_threshold=0.5,
+            class_agnostic=False,
+            output_dir=output_dir,
         )
-        tx, ty = top_left_original
-        eh, ew = crop_single.img.shape[:2]
-
-        # Extract aligned region
-        sub_aligned = sub_text.extract_sub_region(
-            offset_x=tx, offset_y=ty, width=ew, height=eh,
-            img=crop_single.img, name="aligned",
-        )
-        sub_aligned.create_heatmap(
-            scale_factor=scale_factor, img_shape=crop_single.img.shape, method=method,
-        )
-
-        # Optimize
-        prior_ar = avg_width / avg_height if avg_height > 0 else 1.0
-        opt = ElasticChainOptimizer(
-            sub_tablet_text=sub_aligned,
-            detection_heatmap=sub_det.heatmap,
-            detection_boxes=crop_dets,
-            scale_factor=scale_factor,
-            lambda_data=optimizer_params.get('lambda_data', 10000.0),
-            lambda_iou=optimizer_params.get('lambda_iou', 500.0),
-            lambda_seq=optimizer_params.get('lambda_seq', 0.05),
-            lambda_smooth=optimizer_params.get('lambda_smooth', 0.15),
-            lambda_anchor=optimizer_params.get('lambda_anchor', 0.05),
-            lambda_size=optimizer_params.get('lambda_size', 0.1),
-            alpha_geo=optimizer_params.get('alpha_geo', 0.0),
-            prior_aspect_ratio=prior_ar,
-            device=DEVICE,
-        )
-        sub_opt = opt.optimize(
-            num_iterations=optimizer_params.get('num_iterations', 100),
-            lr=optimizer_params.get('lr', 5.0),
-            verbose=False,
-        )
-
-        # Transform to full image coords
-        ox = crop_coordinates[idx]['x']
-        oy = crop_coordinates[idx]['y']
-        for sb in sub_opt.sign_boxes:
-            all_optimized_full.append(BoundingBox(
-                x1=sb.x1 + ox, y1=sb.y1 + oy,
-                x2=sb.x2 + ox, y2=sb.y2 + oy,
-                score=sb.score, sign=sb.sign,
-            ))
-
-    if verbose:
-        print(f"  {fragment_id}: GT={len(gt_boxes)}, Pred={len(all_optimized_full)}")
-
-    return {
-        'fragment_id': fragment_id,
-        'preds': all_optimized_full,
-        'gts': gt_boxes,
-        'detections': detections,
-    }
+    return preds
 
 
-# ============ Evaluation Runner ============
-
-def run_evaluation(
-    tablet_detector: TabletImageDetector,
-    local_source: LocalDataSource,
-    api_source: EBLAPISource,
+def run_predictions(
+    context: CropContext,
     fragment_ids: List[str],
-    optimizer_params: dict = None,
+    psr_params: Optional[dict] = None,
     verbose: bool = True,
     label: str = "",
-) -> Dict:
+    prediction_mode: PredictionMode = DEFAULT_PREDICTION_MODE,
+    visualize: bool = False,
+    output_dir: str = EVAL_OUTPUT_DIR,
+) -> Tuple[List[Dict], int]:
     """
-    Run evaluation on a list of fragments.
+    Run predictions on a list of fragments and return raw results.
+
+    Args:
+        context: Pipeline context.
+        fragment_ids: List of fragment IDs to process.
+        psr_params: PSR optimizer hyperparameters (only used for PSR mode).
+        verbose: Print progress messages.
+        label: Label for progress output.
+        prediction_mode: How to produce predictions (PSR, without PSR,
+                         fixed-candidate attraction, or raw detection).
+        visualize: Save per-fragment evaluation visualizations.
+        output_dir: Directory for visualization outputs.
 
     Returns:
-        Dict with mAP, per-threshold results, per-class results, and per-fragment details.
+        Tuple of (all_results, skipped) where all_results is a list of dicts with
+        keys 'fragment_id', 'preds' (List[Box]), 'gts' (List[Box]).
     """
-    if optimizer_params is None:
-        optimizer_params = DEFAULT_OPTIMIZER_PARAMS
-
+    context.psr_params = psr_params  # None = step defaults
+    vis = VisOptions(info=False, display=False, save=False)
+    runner = Runner(context, vis=vis)
     all_results = []
     skipped = 0
 
     for i, fid in enumerate(fragment_ids):
-        if verbose and (i % 10 == 0 or i == len(fragment_ids) - 1):
+        if verbose and (i % 5 == 0 or i == len(fragment_ids) - 1):
             print(f"  [{label}] Processing {i+1}/{len(fragment_ids)}: {fid}")
 
-        result = run_alignment_pipeline(
-            tablet_detector=tablet_detector,
-            local_source=local_source,
-            api_source=api_source,
-            fragment_id=fid,
-            optimizer_params=optimizer_params,
-            verbose=verbose,
-        )
-        if result is None:
+        if not _load_and_detect_fragment(runner, context, fid):
             skipped += 1
             continue
-        all_results.append(result)
 
+        s = context.state
+        if prediction_mode == PredictionMode.DETECTION:
+            all_preds = _predict_detection_crops(runner, context, fid, visualize, output_dir)
+        elif prediction_mode == PredictionMode.IMPROVED_DETECTION:
+            all_preds = _predict_detection_crops(
+                runner,
+                context,
+                fid,
+                visualize,
+                output_dir,
+                improve=True,
+            )
+        elif prediction_mode == PredictionMode.WITHOUT_PSR:
+            all_preds = _predict_without_psr_crops(
+                runner, context, fid, visualize, output_dir
+            )
+        elif prediction_mode == PredictionMode.DET_AS_CANDIDATES:
+            all_preds = _predict_det_as_candidates_crops(
+                runner, context, fid, visualize, output_dir
+            )
+        elif prediction_mode == PredictionMode.PSR:
+            all_preds = _predict_psr_crops(runner, context, fid, visualize, output_dir)
+        else:
+            raise ValueError(f"Unknown prediction mode: {prediction_mode}")
+
+        if verbose:
+            print(f"    GT={len(s.full_gt_boxes)}, Pred={len(all_preds)}")
+        all_results.append({
+            'fragment_id': fid,
+            'preds': all_preds,
+            'gts': s.full_gt_boxes,
+        })
+
+    return all_results, skipped
+
+
+
+def evaluate_predictions(
+    all_results: List[Dict],
+    label: str = "",
+    skipped: int = 0,
+    psr_params: Optional[dict] = None,
+    prediction_mode: PredictionMode = DEFAULT_PREDICTION_MODE,
+) -> Dict:
+    """
+    Compute COCO-style evaluation metrics from a list of prediction results.
+
+    Args:
+        all_results: List of dicts with 'fragment_id', 'preds', 'gts' keys,
+                     as returned by run_predictions().
+        label: Label for the evaluation run.
+        skipped: Number of fragments skipped during prediction.
+        psr_params: PSR params used (stored in summary for reference).
+        prediction_mode: Prediction mode used (stored in summary for reference).
+
+    Returns:
+        Dict with COCO-style mAP, AP@0.5, AP@0.75, AR, per-threshold and per-class details.
+    """
     if not all_results:
-        print(f"  [{label}] No results produced.")
+        print(f"  [{label}] No results to evaluate.")
         return {'error': 'no results'}
 
-    # --- Class-agnostic metrics (localization only) ---
-    map_agnostic = compute_map(all_results, class_agnostic=True)
+    # COCO-style class-aware per-class score-sorted 101-point interpolated AP
+    coco = compute_coco_map(all_results)
 
-    # --- Class-aware metrics ---
-    map_aware = compute_map(all_results, class_agnostic=False)
+    t05 = coco['per_threshold'][0]  # results at IoU=0.5
 
-    # --- Per-class at IoU=0.5 ---
-    per_class = compute_per_class_metrics(all_results, iou_threshold=0.5)
-
-    # --- Aggregate IoU stats ---
-    all_matched_ious = []
-    for fr in all_results:
-        m = match_predictions_to_gt(fr['preds'], fr['gts'], iou_threshold=0.5,
-                                    class_agnostic=True)
-        all_matched_ious.extend(m['matched_ious'])
-
-    mean_iou = float(np.mean(all_matched_ious)) if all_matched_ious else 0.0
-    median_iou = float(np.median(all_matched_ious)) if all_matched_ious else 0.0
-
-    summary = {
+    return {
         'label': label,
+        'prediction_mode': str(prediction_mode),
         'num_fragments': len(all_results),
         'skipped': skipped,
-        'optimizer_params': optimizer_params,
-        'class_agnostic': {
-            'mAP': map_agnostic['mAP'],
-            'AP@0.5': map_agnostic['AP@0.5'],
-            'AP@0.75': map_agnostic['AP@0.75'],
-            'per_threshold': map_agnostic['per_threshold'],
-        },
-        'class_aware': {
-            'mAP': map_aware['mAP'],
-            'AP@0.5': map_aware['AP@0.5'],
-            'AP@0.75': map_aware['AP@0.75'],
-            'per_threshold': map_aware['per_threshold'],
-        },
+        'psr_params': dict(psr_params) if psr_params else {},
+        'mAP': coco['mAP'],
+        'AP@0.5': coco['AP@0.5'],
+        'AP@0.75': coco['AP@0.75'],
+        'AR': coco['AR'],
         'iou_stats': {
-            'mean_iou': mean_iou,
-            'median_iou': median_iou,
-            'num_matched': len(all_matched_ious),
+            'mean_iou': t05['mean_matched_iou'],
+            'num_matched': t05['tp'],
         },
-        'num_classes_evaluated': len(per_class),
-    }
-
-    # For the detailed output
-    detail = {
-        **summary,
-        'per_class': per_class,
+        'num_classes_evaluated': coco['num_classes'],
+        'per_threshold': coco['per_threshold'],
+        'per_class': coco['per_class'],
         'per_fragment': [
             {
                 'fragment_id': r['fragment_id'],
@@ -507,11 +980,65 @@ def run_evaluation(
         ],
     }
 
-    return detail
+
+def run_evaluation(
+    context: CropContext,
+    fragment_ids: List[str],
+    psr_params: Optional[dict] = None,
+    verbose: bool = True,
+    label: str = "",
+    visualize: bool = False,
+    output_dir: str = EVAL_OUTPUT_DIR,
+    prediction_mode: PredictionMode = DEFAULT_PREDICTION_MODE,
+) -> Dict:
+    """
+    Run predictions then evaluate. Convenience wrapper around
+    run_predictions() + evaluate_predictions().
+
+    Args:
+        context: Pipeline context.
+        fragment_ids: List of fragment IDs to process.
+        psr_params: PSR optimizer hyperparameters (only used for PSR mode).
+        verbose: Print progress messages.
+        label: Label for progress/summary output.
+        visualize: Save per-fragment evaluation visualizations.
+        output_dir: Directory for outputs.
+        prediction_mode: How to produce predictions.
+            PredictionMode.PSR         – full PSR alignment optimization
+            PredictionMode.WITHOUT_PSR – aligned/relabelled detections without PSR
+            PredictionMode.DET_AS_CANDIDATES – sign-alignment-3 candidate attraction
+            PredictionMode.DETECTION   – raw detection model output only
+            PredictionMode.IMPROVED_DETECTION – detection + ResNet classification fusion
+
+    Returns:
+        Dict with mAP, per-threshold results, per-class results, and per-fragment details.
+    """
+    all_results, skipped = run_predictions(
+        context=context,
+        fragment_ids=fragment_ids,
+        psr_params=psr_params,
+        verbose=verbose,
+        label=label,
+        prediction_mode=prediction_mode,
+        visualize=visualize,
+        output_dir=output_dir,
+    )
+
+    if not all_results:
+        print(f"  [{label}] No results produced.")
+        return {'error': 'no results'}
+
+    return evaluate_predictions(
+        all_results=all_results,
+        label=label,
+        skipped=skipped,
+        psr_params=psr_params,
+        prediction_mode=prediction_mode,
+    )
 
 
 def print_eval_summary(eval_result: Dict):
-    """Pretty-print evaluation results."""
+    """Pretty-print COCO-style evaluation results."""
     if 'error' in eval_result:
         print(f"  Evaluation error: {eval_result['error']}")
         return
@@ -521,195 +1048,78 @@ def print_eval_summary(eval_result: Dict):
     print(f"EVALUATION RESULTS {f'({label})' if label else ''}")
     print(f"{'='*60}")
     print(f"Fragments evaluated: {eval_result['num_fragments']} (skipped: {eval_result['skipped']})")
+    print(f"Classes evaluated:   {eval_result['num_classes_evaluated']}")
+    print(f"Prediction mode:     {eval_result.get('prediction_mode', 'unknown')}")
 
-    for mode in ['class_agnostic', 'class_aware']:
-        m = eval_result[mode]
-        print(f"\n--- {mode.replace('_', ' ').title()} ---")
-        print(f"  mAP [0.5:0.95]:  {m['mAP']:.4f}")
-        print(f"  AP@0.5:          {m['AP@0.5']:.4f}")
-        print(f"  AP@0.75:         {m['AP@0.75']:.4f}")
+    print(f"\n--- COCO-style Metrics (class-aware, macro avg, 101-pt interpolated AP) ---")
+    print(f"  mAP [0.5:0.95]:  {eval_result['mAP']:.4f}")
+    print(f"  AP@0.5:          {eval_result['AP@0.5']:.4f}")
+    print(f"  AP@0.75:         {eval_result['AP@0.75']:.4f}")
+    print(f"  AR [0.5:0.95]:   {eval_result['AR']:.4f}")
 
-        # Detailed per-threshold at 0.5
-        t05 = m['per_threshold'][0]
-        print(f"  At IoU=0.5: TP={t05['tp']}, FP={t05['fp']}, FN={t05['fn']}")
-        print(f"    Precision: {t05['precision']:.4f}")
-        print(f"    Recall:    {t05['recall']:.4f}")
-        print(f"    F1:        {t05['f1']:.4f}")
-        print(f"    Mean matched IoU: {t05['mean_matched_iou']:.4f}")
+    # Detailed at IoU=0.5
+    t05 = eval_result['per_threshold'][0]
+    print(f"\n  At IoU=0.5 (aggregate counts): "
+          f"TP={t05['tp']}, FP={t05['fp']}, FN={t05['fn']}")
+    print(f"    Precision: {t05['precision']:.4f}")
+    print(f"    Recall:    {t05['recall']:.4f}")
+    print(f"    F1:        {t05['f1']:.4f}")
+    print(f"    Mean matched IoU: {t05['mean_matched_iou']:.4f}")
 
-    iou_s = eval_result['iou_stats']
-    print(f"\n--- IoU Statistics (class-agnostic, thresh=0.5) ---")
-    print(f"  Mean IoU:   {iou_s['mean_iou']:.4f}")
-    print(f"  Median IoU: {iou_s['median_iou']:.4f}")
-    print(f"  Matched:    {iou_s['num_matched']}")
+    # Per-threshold AP table
+    print(f"\n  Per-threshold AP:")
+    for r in eval_result['per_threshold']:
+        print(f"    IoU={r['iou_threshold']:.2f}  AP={r['ap']:.4f}  "
+              f"P={r['precision']:.4f}  R={r['recall']:.4f}")
 
     # Top-10 classes by support
     if 'per_class' in eval_result:
         pc = eval_result['per_class']
         if pc:
-            print(f"\n--- Per-class (IoU=0.5, top-10 by support) ---")
-            sorted_cls = sorted(pc.items(), key=lambda x: x[1]['tp'] + x[1]['fn'], reverse=True)
+            print(f"\n--- Per-class @ IoU=0.5 (top-10 by GT count) ---")
+            sorted_cls = sorted(
+                pc.items(),
+                key=lambda x: x[1]['tp'] + x[1]['fn'],
+                reverse=True,
+            )
             for cls_name, s in sorted_cls[:10]:
                 support = s['tp'] + s['fn']
-                print(f"  {cls_name:15s}: P={s['precision']:.3f} R={s['recall']:.3f} "
-                      f"F1={s['f1']:.3f} (TP={s['tp']}, FP={s['fp']}, FN={s['fn']}, support={support})")
+                print(f"  {cls_name:15s}: AP={s['ap']:.3f}  "
+                      f"P={s['precision']:.3f}  R={s['recall']:.3f}  "
+                      f"F1={s['f1']:.3f}  "
+                      f"(TP={s['tp']}, FP={s['fp']}, FN={s['fn']}, support={support})")
 
 
 # ============ Hyperparameter Tuning ============
 
 def _eval_score(
-    tablet_detector: TabletImageDetector,
-    local_source: LocalDataSource,
-    api_source: EBLAPISource,
+    context: CropContext,
     fragment_ids: List[str],
     params: dict,
 ) -> float:
-    """Run evaluation and return class-agnostic mAP (higher is better)."""
+    """Run evaluation and return mAP (higher is better)."""
     result = run_evaluation(
-        tablet_detector=tablet_detector,
-        local_source=local_source,
-        api_source=api_source,
+        context=context,
         fragment_ids=fragment_ids,
-        optimizer_params=params,
+        psr_params=params,
         verbose=False,
         label="sweep",
     )
     if 'error' in result:
         return -1.0
-    return result['class_agnostic']['mAP']
-
-
-def hyperparameter_search(
-    tablet_detector: TabletImageDetector,
-    local_source: LocalDataSource,
-    api_source: EBLAPISource,
-    fragment_ids: List[str],
-    output_dir: str = EVAL_OUTPUT_DIR,
-) -> Dict:
-    """
-    Fast coordinate-wise (one-parameter-at-a-time) hyperparameter sweep.
-
-    For each parameter, sweep candidate values while keeping all other
-    parameters at their current best.  This reduces the search from
-    O(product of grid sizes) to O(sum of grid sizes), making it orders
-    of magnitude faster than a full grid search.
-
-    The procedure runs two rounds to allow parameters to adapt to each
-    other's updated values.
-    """
-    # Candidate values for each tunable parameter
-    search_axes = {
-        'lambda_data':   [1000.0, 5000.0, 10000.0, 50000.0],
-        'lambda_iou':    [0.0, 500.0, 5000.0, 20000.0],
-        'lambda_seq':    [0.01, 0.05, 0.2],
-        'lambda_smooth': [0.05, 0.15, 0.5],
-        'lambda_anchor': [0.01, 0.05, 0.2],
-        'lambda_size':   [0.0, 0.05, 0.1, 0.5, 1.0],
-    }
-
-    # Start from defaults (use fast iteration count for searching)
-    best_params = dict(DEFAULT_OPTIMIZER_PARAMS)
-    best_params['num_iterations'] = NUM_ITERATIONS_SEARCH
-
-    total_evals = 2 * sum(len(v) for v in search_axes.values())
-    print(f"Coordinate-wise sweep: {total_evals} evaluations "
-          f"(2 rounds × {sum(len(v) for v in search_axes.values())} candidates)")
-
-    best_score = _eval_score(tablet_detector, local_source, api_source,
-                             fragment_ids, best_params)
-    print(f"  Baseline mAP = {best_score:.4f}")
-
-    all_search_results = []
-    eval_count = 0
-
-    for round_idx in range(2):
-        print(f"\n--- Round {round_idx + 1} ---")
-        for key, candidates in search_axes.items():
-            old_val = best_params[key]
-            round_best_val = old_val
-            round_best_score = best_score
-
-            for val in candidates:
-                if val == old_val:
-                    continue  # already evaluated
-                trial = dict(best_params)
-                trial[key] = val
-                eval_count += 1
-
-                t0 = time.time()
-                score = _eval_score(tablet_detector, local_source, api_source,
-                                    fragment_ids, trial)
-                elapsed = time.time() - t0
-
-                entry = {
-                    'round': round_idx + 1,
-                    'param': key,
-                    'value': val,
-                    'mAP': score,
-                    'elapsed_s': elapsed,
-                    'full_params': {k: v for k, v in trial.items()},
-                }
-                all_search_results.append(entry)
-
-                tag = ""
-                if score > round_best_score:
-                    round_best_score = score
-                    round_best_val = val
-                    tag = " *"
-
-                print(f"  [{eval_count:3d}] {key}={val:<10}  mAP={score:.4f} "
-                      f"({elapsed:.1f}s){tag}")
-
-            # Update best for this axis
-            if round_best_score > best_score:
-                best_params[key] = round_best_val
-                best_score = round_best_score
-                print(f"  >> {key} updated to {round_best_val} (mAP={best_score:.4f})")
-            else:
-                print(f"  >> {key} stays at {old_val}")
-
-    # Restore full iteration count
-    best_params['num_iterations'] = NUM_ITERATIONS_EVAL
-
-    # Sort results
-    all_search_results.sort(key=lambda x: -x['mAP'])
-
-    print(f"\n{'='*60}")
-    print(f"SWEEP RESULTS (top 10)")
-    print(f"{'='*60}")
-    for entry in all_search_results[:10]:
-        print(f"  {entry['param']:15s}={entry['value']:<10}  mAP={entry['mAP']:.4f}")
-
-    print(f"\nBest params: {best_params}")
-    print(f"Best mAP:    {best_score:.4f}")
-
-    os.makedirs(output_dir, exist_ok=True)
-    search_save = {
-        'best_params': best_params,
-        'best_mAP': best_score,
-        'all_results': all_search_results,
-    }
-    with open(os.path.join(output_dir, "hyperparam_search.json"), 'w') as f:
-        json.dump(search_save, f, indent=2)
-    print(f"Saved to {output_dir}/hyperparam_search.json")
-
-    return search_save
+    return result['mAP']
 
 
 # ============ Main ============
 
 if __name__ == "__main__":
-    print("Cuneiform Signs Alignment - Evaluation & Hyperparameter Sweep")
+    print("Cuneiform Signs Alignment - Evaluation & Hyperparameter Sweep (PSR)")
     print("=" * 60)
 
-    # Data sources
-    local_source = LocalDataSource(ANNOTATIONS_DIR)
-    api_source = EBLAPISource()
+    test_source = LocalTestDataSource(COCO_TEST_DIR)
+    fragments = test_source.get_available_fragments()
+    print(f"Found {len(fragments)} fragments in COCO test set")
 
-    fragments = local_source.get_available_fragments()
-    print(f"Found {len(fragments)} fragments with both image and annotation")
-
-    # Detector
     print("Loading detection model...")
     model_config = ModelConfig(
         config_file=CONFIG_FILE,
@@ -718,28 +1128,60 @@ if __name__ == "__main__":
     )
     tablet_detector = TabletImageDetector(
         model_config=model_config,
-        score_threshold=SCORE_THRESHOLD,
-        keep_crops=True,
+        default_score_threshold=SCORE_THRESHOLD,
+        is_crop_itself=True,
+        use_sahi=True,
+        box_slice_ratio=0.2,
     )
     print("Model loaded.")
+
+    sign_classifier = SignClassifier(
+        checkpoint_file=CLASSIFIER_CHECKPOINT_FILE,
+        device="auto",
+        is_load_now=False,
+    )
+
+    context = CropContext(
+        tablet_detector=tablet_detector,
+        sign_classifier=sign_classifier,
+        local_source=test_source,
+        api_source=EBLAPISource(strip_subtablet_suffix=True),
+        color_config=ColorConfig,
+        output_dir=EVAL_OUTPUT_DIR,
+        img_idx=0,
+        task_type="evaluation",
+    )
 
     eval_fragments = fragments[:EVAL_SAMPLE_LIMIT]
     os.makedirs(EVAL_OUTPUT_DIR, exist_ok=True)
 
+    # ----------------------------------------------------------------
+    # Select prediction mode here:
+    #   PredictionMode.PSR         – full PSR alignment optimization
+    #   PredictionMode.WITHOUT_PSR – text-aligned labels, detection boxes/scores
+    #   PredictionMode.DET_AS_CANDIDATES – position-first fixed-candidate attraction
+    #   PredictionMode.DETECTION   – raw detection model output only
+    #   PredictionMode.IMPROVED_DETECTION – detection + ResNet classification fusion
+    # ----------------------------------------------------------------
+    PREDICTION_MODE = PredictionMode.DET_AS_CANDIDATES
+
     # --- STEP 1: Full evaluation with default params ---
     print(f"\n{'='*60}")
-    print(f"STEP 1: Evaluation with default parameters ({len(eval_fragments)} fragments)")
-    print(f"  num_iterations = {NUM_ITERATIONS_EVAL}")
+    print(f"STEP 1: {PREDICTION_MODE.value} evaluation ({len(eval_fragments)} fragments)")
+    print(f"  prediction_mode  = {PREDICTION_MODE}")
+    if PREDICTION_MODE == PredictionMode.PSR:
+        print(f"  num_iterations   = {DEFAULT_PSR_PARAMS['num_iterations']}")
     print(f"{'='*60}")
 
     eval_result = run_evaluation(
-        tablet_detector=tablet_detector,
-        local_source=local_source,
-        api_source=api_source,
+        context=context,
         fragment_ids=eval_fragments,
-        optimizer_params=DEFAULT_OPTIMIZER_PARAMS,
+        psr_params=DEFAULT_PSR_PARAMS,
         verbose=True,
-        label="default",
+        label=PREDICTION_MODE.value,
+        visualize=True,
+        output_dir=EVAL_OUTPUT_DIR,
+        prediction_mode=PREDICTION_MODE,
     )
     print_eval_summary(eval_result)
 
@@ -749,39 +1191,43 @@ if __name__ == "__main__":
         json.dump(eval_save, f, indent=2)
     print(f"Saved to {EVAL_OUTPUT_DIR}/evaluation_default.json")
 
+    ### ---
+    # not to run tunning
+    exit(0)  #
+
+    ### ---
+
     # --- STEP 2: Fast coordinate-wise hyperparameter sweep ---
     search_fragments = eval_fragments[:SEARCH_SAMPLE_LIMIT]
 
     print(f"\n{'='*60}")
     print(f"STEP 2: Coordinate-wise sweep ({len(search_fragments)} fragments, "
-          f"num_iterations = {NUM_ITERATIONS_SEARCH})")
+          f"num_iterations = {SEARCH_PSR_PARAMS['num_iterations']})")
     print(f"{'='*60}")
 
     search_result = hyperparameter_search(
-        tablet_detector=tablet_detector,
-        local_source=local_source,
-        api_source=api_source,
+        context=context,
         fragment_ids=search_fragments,
+        eval_fn=_eval_score,
+        base_params=SEARCH_PSR_PARAMS,
         output_dir=EVAL_OUTPUT_DIR,
+        full_num_iterations=DEFAULT_PSR_PARAMS['num_iterations'],
     )
 
     # --- STEP 3: Re-evaluate with best params on full set ---
     if search_result.get('best_params'):
         best_params = search_result['best_params']
-        best_params['num_iterations'] = NUM_ITERATIONS_EVAL
 
         print(f"\n{'='*60}")
         print(f"STEP 3: Re-evaluation with best params ({len(eval_fragments)} fragments)")
-        print(f"  num_iterations = {NUM_ITERATIONS_EVAL}")
+        print(f"  num_iterations = {best_params['num_iterations']}")
         print(f"  Params: {best_params}")
         print(f"{'='*60}")
 
         eval_best = run_evaluation(
-            tablet_detector=tablet_detector,
-            local_source=local_source,
-            api_source=api_source,
+            context=context,
             fragment_ids=eval_fragments,
-            optimizer_params=best_params,
+            psr_params=best_params,
             verbose=True,
             label="best_params",
         )

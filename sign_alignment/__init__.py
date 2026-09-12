@@ -6,11 +6,12 @@ between images and text transcriptions.
 """
 
 from .data_source import (
+    EBLMongoCanonicalSource,
     LocalDataSource,
+    LocalTestDataSource,
     EBLAPISource,
     SignTextParser,
-    create_local_source,
-    create_api_source,
+    SignAPIResolver,
 )
 
 from .sign import (
@@ -20,36 +21,34 @@ from .sign import (
     CLASSES_ABZ,
 )
 
-from .bounding_box import (
-    BoundingBox,
-    Detection,
-    GroundTruths,
-)
+from .box import Box, Boxes, SignCandidate, boxes_in_crop
 
 from .detector import (
     ModelConfig,
-    SingleImage,
     BaseDetector,
     SingleImageDetector,
     TabletImageDetector,
 )
 
+from .classifier import (
+    COMMON_SIGN_NAMES,
+    RESNET18_INDEX_TO_SIGN,
+    SignClassifier,
+)
+
+from .dift_align import (
+    DiftAlignmentConfig,
+    DiftMatchConfig,
+    DiftMatchResult,
+    DiftRuntime,
+    ImageView,
+)
+
 from .visualizer import (
     BboxVisualizer,
     TextVisualizer,
-    HeatmapVisualizer,
-)
-
-from .heatmap import (
-    create_2d_gaussian,
-    create_2d_rectangle_blur,
-    create_detection_heatmap,
-    create_text_heatmap,
-    match_heatmaps_ncc,
-    compute_avg_dimensions,
-    group_detections_into_lines,
-    transform_gt_to_cropped_region,
-    create_text_based_detections,
+    CompositeVisualizer,
+    build_sign_match_info,
 )
 
 from data_processing.line_process import (
@@ -62,29 +61,25 @@ from data_processing.line_process import (
     align_text_to_detection_rows,
 )
 
-from .tablet import (
-    SignBox,
-    SubTablet,
-)
-
-from .optimizer import (
-    ElasticChainOptimizer,
-    build_agnostic_heatmap,
-)
+from .tablet import SubTablet, Tablet
 
 from .psr_optimizer import (
     PointSetRegistrationOptimizer,
-    initialize_text_subtablet,
-    filter_boxes_by_mask,
+)
+
+from .hyperparam import (
+    hyperparameter_search,
+    SEARCH_AXES,
 )
 
 __all__ = [
     # Data sources
+    'EBLMongoCanonicalSource',
     'LocalDataSource',
+    'LocalTestDataSource',
     'EBLAPISource',
     'SignTextParser',
-    'create_local_source',
-    'create_api_source',
+    'SignAPIResolver',
     
     # Sign utilities
     'Sign',
@@ -92,33 +87,31 @@ __all__ = [
     'CLASSES_NAME',
     'CLASSES_ABZ',
     
-    # Bounding boxes
-    'BoundingBox',
-    'Detection',
-    'GroundTruths',
+    # Boxes
+    'Box',
+    'Boxes',
+    'SignCandidate',
+    'boxes_in_crop',
     
     # Detection
     'ModelConfig',
-    'SingleImage',
     'BaseDetector',
     'SingleImageDetector',
     'TabletImageDetector',
+    'SignClassifier',
+    'RESNET18_INDEX_TO_SIGN',
+    'COMMON_SIGN_NAMES',
+    'DiftAlignmentConfig',
+    'DiftMatchConfig',
+    'DiftMatchResult',
+    'DiftRuntime',
+    'ImageView',
     
     # Visualization
     'BboxVisualizer',
     'TextVisualizer',
-    'HeatmapVisualizer',
-    
-    # Heatmap utilities
-    'create_2d_gaussian',
-    'create_2d_rectangle_blur',
-    'create_detection_heatmap',
-    'create_text_heatmap',
-    'match_heatmaps_ncc',
-    'compute_avg_dimensions',
-    'group_detections_into_lines',
-    'transform_gt_to_cropped_region',
-    'create_text_based_detections',
+    'CompositeVisualizer',
+    'build_sign_match_info',
     
     # Line/row processing
     'detect_rows_dbscan',
@@ -129,16 +122,14 @@ __all__ = [
     'align_text_row_to_detection',
     'align_text_to_detection_rows',
     
-    # Tablet data structures
-    'SignBox',
+    # Tablet image frames
+    'Tablet',
     'SubTablet',
-    
-    # Optimization
-    'ElasticChainOptimizer',
-    'build_agnostic_heatmap',
     
     # PSR Optimization
     'PointSetRegistrationOptimizer',
-    'initialize_text_subtablet',
-    'filter_boxes_by_mask',
+
+    # Hyperparameter search
+    'hyperparameter_search',
+    'SEARCH_AXES',
 ]
