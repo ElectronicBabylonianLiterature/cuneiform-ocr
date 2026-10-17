@@ -17,14 +17,14 @@ from data import DetectionDataset, collate_fn, move_batch
 from model import DetectionLoss, GRADIENT_CHECKPOINTING, build_model
 from test import evaluate, visualize
 
-RUN_TAG = "mid"
+RUN_TAG = "aug-res-1"
 
 DATASET_ROOT = "~/erc-work-data/data-of-cuneiform-ocr-data/processed-data-exp-1/"
 VARIANT = "base-coco"
 DEBUG_SUBSET = False  # True applies the subset rule defined in data.py.
 DEVICE = "cuda"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-RESUME =  "output/last.pt" # For example, OUTPUT_DIR / "last.pt" or OUTPUT_DIR / "epoch_0005.pt".
+RESUME =  None # "output/last.pt" # For example, OUTPUT_DIR / "last.pt" or OUTPUT_DIR / "epoch_0005.pt".
 TRAIN_CONFIG = {
     "epochs": 1000,
     "batch_size": 2,

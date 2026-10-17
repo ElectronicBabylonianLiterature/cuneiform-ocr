@@ -98,8 +98,8 @@ def coco_metrics(dataset, predictions, max_detections=300):
     return metrics
 
 
-def draw_detections(image, predictions, categories, threshold=0.5):
-    """Return a PIL image for saving or TensorBoard, displaying original COCO category IDs."""
+def draw_detections(image, predictions, categories, threshold=0.5, *, ground_truth=()):
+    """Overlay green GT and red predictions using original COCO coordinates/category IDs."""
     canvas = image.convert("RGB").copy()
     draw = ImageDraw.Draw(canvas)
     font_size = max(14, min(32, min(canvas.size) // 50))
@@ -107,20 +107,30 @@ def draw_detections(image, predictions, categories, threshold=0.5):
         font = ImageFont.truetype("DejaVuSans.ttf", font_size)
     except OSError:
         font = ImageFont.load_default(size=font_size)
+    def draw_box(box, caption, color, width, label_below=False):
+        x, y, w, h = box
+        left, top = max(0, min(canvas.width - 1, x)), max(0, min(canvas.height - 1, y))
+        right, bottom = max(left, min(canvas.width - 1, x + w)), max(top, min(canvas.height - 1, y + h))
+        draw.rectangle((left, top, right, bottom), outline=color, width=width)
+        text_box = draw.textbbox((0, 0), caption, font=font)
+        text_width = text_box[2] - text_box[0]
+        label_y = top + 4 if label_below else top - font_size - 4
+        position = (min(left, max(0, canvas.width - text_width)),
+                    max(0, min(canvas.height - font_size - 4, label_y)))
+        draw.rectangle(draw.textbbox(position, caption, font=font), fill=color)
+        draw.text(position, caption, fill="black" if color == "lime" else "white", font=font)
+
+    # A thicker GT outline remains visible even when a prediction matches it exactly.
+    for annotation in ground_truth:
+        category = annotation["category_id"]
+        draw_box(annotation["bbox"], f"GT {category}: {categories[category]['name']}",
+                 "lime", width=4, label_below=True)
     for prediction in predictions:
         if prediction["score"] < threshold:
             continue
-        x, y, w, h = prediction["bbox"]
-        left, top = max(0, min(canvas.width - 1, x)), max(0, min(canvas.height - 1, y))
-        right, bottom = max(left, min(canvas.width - 1, x + w)), max(top, min(canvas.height - 1, y + h))
         category = prediction["category_id"]
-        caption = f"{category}: {categories[category]['name']}  {prediction['score']:.2f}"
-        draw.rectangle((left, top, right, bottom), outline="red", width=2)
-        text_box = draw.textbbox((0, 0), caption, font=font)
-        text_width = text_box[2] - text_box[0]
-        position = (min(left, max(0, canvas.width - text_width)), max(0, top - font_size - 4))
-        draw.rectangle(draw.textbbox(position, caption, font=font), fill="red")
-        draw.text(position, caption, fill="white", font=font)
+        caption = f"Pred {category}: {categories[category]['name']}  {prediction['score']:.2f}"
+        draw_box(prediction["bbox"], caption, "red", width=2)
     return canvas
 
 
@@ -137,7 +147,8 @@ def visualize(dataset, predictions, output_dir=None, writer=None, step=0, max_im
         info = dataset.coco.imgs[image_id]
         with Image.open(Path(dataset.root) / info["file_name"]) as image:
             canvas = draw_detections(image, grouped[image_id], dataset.coco.cats,
-                                     config["visualization_threshold"])
+                                     config["visualization_threshold"],
+                                     ground_truth=dataset.coco.imgToAnns.get(image_id, []))
         if output_dir is not None:
             canvas.save(output_dir / f"{image_id}_{Path(info['file_name']).stem}.jpg", quality=95)
         if writer is not None:

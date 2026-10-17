@@ -16,7 +16,7 @@ DEBUG_SUBSET = False
 OUTPUT_DIR = Path(__file__).resolve().parent / "output_with_cuneimae"
 MAE_CHECKPOINT = Path(__file__).resolve().parent / "pretrained" / "checkpoint-10.pth"
 RESUME = None
-RUN_TAG = "heat-1"
+RUN_TAG = "aug-cunei-1"
 
 # TRAIN_CONFIG = dict(base_train.TRAIN_CONFIG)
 TRAIN_CONFIG = {
