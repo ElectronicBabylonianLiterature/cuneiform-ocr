@@ -13,18 +13,22 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from data import DetectionDataset, collate_fn, move_batch
+from data import DetectionDataset, SynDetectionDataset, collate_fn, move_batch
 from model import DetectionLoss, GRADIENT_CHECKPOINTING, build_model
-from test import evaluate, visualize
+from test import evaluate, visualize, visualize_training_samples
 
-RUN_TAG = "aug-res-1"
+RUN_TAG = "aug-divide-1" 
+# RUN_TAG = "divide-syn-1"
 
-DATASET_ROOT = "~/erc-work-data/data-of-cuneiform-ocr-data/processed-data-exp-1/"
-VARIANT = "base-coco"
+DATASET_ROOT = "~/erc-work-data/data-of-cuneiform-ocr-data/processed-data-exp-6/"
+VARIANT = "divided-coco"
+TRAIN_DATASET_CLASS = DetectionDataset  # Switch to SynDetectionDataset for online sign replacement.
+# TRAIN_DATASET_CLASS = SynDetectionDataset
+TRAIN_DATASET_KWARGS = {}  # SynDetectionDataset defaults: target_count=500, seed=42.
 DEBUG_SUBSET = False  # True applies the subset rule defined in data.py.
 DEVICE = "cuda"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-RESUME =  None # "output/last.pt" # For example, OUTPUT_DIR / "last.pt" or OUTPUT_DIR / "epoch_0005.pt".
+RESUME = "output/last_aug-divide-1.pt"  # Start a new experiment when changing dataset class; later use its last_<RUN_TAG>.pt.
 TRAIN_CONFIG = {
     "epochs": 1000,
     "batch_size": 2,
@@ -33,7 +37,7 @@ TRAIN_CONFIG = {
     "lr": 2e-4,
     "lr_backbone": 2e-5,
     "weight_decay": 1e-4,
-    "lr_drop_epoch": 40,
+    "lr_drop_epoch": 120,
     "max_grad_norm": 0.1,
     "eval_interval": 5,
     "num_workers": 14,
@@ -57,6 +61,7 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, global_ste
         "train_config": {**config, "amp_dtype": str(config["amp_dtype"])},
         "class_names": dataset.class_names, "category_to_label": dataset.category_to_label,
         "train_ids": dataset.ids, "val_ids": val_dataset.ids,
+        "dataset_config": getattr(dataset, "dataset_config", {"type": type(dataset).__name__}),
         "python_rng": random.getstate(),
         "numpy_rng": (numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:]),
         "torch_rng": torch.get_rng_state(),
@@ -91,16 +96,29 @@ def restore_training(checkpoint, optimizer, scheduler, scaler, generator):
     return checkpoint["epoch"] + 1, checkpoint["global_step"], checkpoint["best_ap"]
 
 
+def validate_resume_dataset(checkpoint, train_dataset, val_dataset):
+    saved_config = checkpoint.get("dataset_config", {"type": "DetectionDataset"})
+    if saved_config != train_dataset.dataset_config:
+        raise ValueError("Dataset type, seed, and target_count must match when resuming; set RESUME=None to change augmentation")
+    if (checkpoint["class_names"] != train_dataset.class_names
+            or checkpoint["category_to_label"] != train_dataset.category_to_label
+            or checkpoint["train_ids"] != train_dataset.ids or checkpoint["val_ids"] != val_dataset.ids):
+        raise ValueError("Keep the original class mapping, input data, and data subset when resuming")
+
+
 def main(*, model_builder=None, train_config=None, debug_subset=None,
-         output_dir=None, resume=RESUME, run_tag=None, tag_checkpoints=False):
+         output_dir=None, resume=RESUME, run_tag=None, tag_checkpoints=False,
+         dataset_class=None, dataset_kwargs=None):
     """Shared training loop; alternate entrypoints supply a model builder and experiment settings."""
     model_builder = build_model if model_builder is None else model_builder
     config = TRAIN_CONFIG if train_config is None else train_config
     debug_subset = DEBUG_SUBSET if debug_subset is None else debug_subset
     output_dir = Path(OUTPUT_DIR if output_dir is None else output_dir)
     run_tag = RUN_TAG if run_tag is None else run_tag
+    dataset_class = TRAIN_DATASET_CLASS if dataset_class is None else dataset_class
+    dataset_kwargs = TRAIN_DATASET_KWARGS if dataset_kwargs is None else dataset_kwargs
     if not torch.cuda.is_available():
-        raise RuntimeError("本脚本固定使用 CUDA，请在 GPU 环境运行")
+        raise RuntimeError("This script requires CUDA; run it in a GPU environment")
     random.seed(config["seed"])
     np.random.seed(config["seed"])
     torch.manual_seed(config["seed"])
@@ -108,11 +126,11 @@ def main(*, model_builder=None, train_config=None, debug_subset=None,
     generator = torch.Generator().manual_seed(config["seed"])
 
     root = Path(DATASET_ROOT).expanduser() / VARIANT
-    train_dataset = DetectionDataset(root, "train", debug_subset)
+    train_dataset = dataset_class(root, "train", debug_subset, **dataset_kwargs)
     val_dataset = DetectionDataset(root, "val", debug_subset)
     if (train_dataset.category_to_label != val_dataset.category_to_label
             or train_dataset.class_names != val_dataset.class_names):
-        raise ValueError("train/val 的类别 ID 和名称必须一致")
+        raise ValueError("Category IDs and names must match between train and val")
     train_loader = DataLoader(
         train_dataset, batch_size=config["batch_size"], shuffle=True, generator=generator,
         num_workers=config["num_workers"], collate_fn=collate_fn, pin_memory=True,
@@ -125,10 +143,7 @@ def main(*, model_builder=None, train_config=None, debug_subset=None,
 
     checkpoint = torch.load(resume, map_location="cpu", weights_only=True) if resume else None
     if checkpoint is not None:
-        if (checkpoint["class_names"] != train_dataset.class_names
-                or checkpoint["category_to_label"] != train_dataset.category_to_label
-                or checkpoint["train_ids"] != train_dataset.ids or checkpoint["val_ids"] != val_dataset.ids):
-            raise ValueError("续训时请保持原来的类别映射和数据 subset")
+        validate_resume_dataset(checkpoint, train_dataset, val_dataset)
     model = model_builder(train_dataset.class_names, checkpoint).to(DEVICE)
     if GRADIENT_CHECKPOINTING:
         model.gradient_checkpointing_enable()
@@ -155,6 +170,7 @@ def main(*, model_builder=None, train_config=None, debug_subset=None,
     # https://docs.pytorch.org/tutorials/recipes/recipes/tensorboard_with_pytorch.html
     with SummaryWriter(str(output_dir / "tensorboard" / "train" / run_tag),
                        purge_step=global_step + 1 if resume else None) as writer:
+        visualize_training_samples(train_dataset, writer, step=global_step)
         for epoch in range(start_epoch, config["epochs"] + 1):
             model.train()
             optimizer.zero_grad(set_to_none=True)
@@ -197,7 +213,8 @@ def main(*, model_builder=None, train_config=None, debug_subset=None,
                 metrics, predictions = evaluate(model, val_loader, val_dataset, config["max_detections"])
                 for name, value in metrics.items():
                     writer.add_scalar(f"val/{name}", value, global_step)
-                visualize(val_dataset, predictions, writer=writer, step=global_step, max_images=10)
+                visualize(val_dataset, predictions, writer=writer, step=global_step, max_images=20)
+                visualize_training_samples(train_dataset, writer, step=global_step)
                 improved = metrics["AP"] > best_ap
                 best_ap = max(best_ap, metrics["AP"])
                 print(f"epoch={epoch}, val_AP={metrics['AP']:.4f}, best_AP={best_ap:.4f}")
@@ -215,4 +232,4 @@ def main(*, model_builder=None, train_config=None, debug_subset=None,
 
 
 if __name__ == "__main__":
-    main()
+    main(tag_checkpoints=True)

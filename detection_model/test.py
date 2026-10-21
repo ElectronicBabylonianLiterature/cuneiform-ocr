@@ -13,12 +13,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from data import DetectionDataset, PROCESSOR, collate_fn, move_batch
+from data import DetectionDataset, PROCESSOR, collate_fn, move_batch, preview_samples
 from model import build_model
 
 
-DATASET_ROOT = "~/erc-work-data/data-of-cuneiform-ocr-data/processed-data-exp-1/"
-VARIANT = "base-coco"
+DATASET_ROOT = "~/erc-work-data/data-of-cuneiform-ocr-data/processed-data-exp-6/"
+VARIANT = "divided-coco"
 DEBUG_SUBSET = True  # True applies the subset rule defined in data.py.
 DEVICE = "cuda"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -134,6 +134,22 @@ def draw_detections(image, predictions, categories, threshold=0.5, *, ground_tru
     return canvas
 
 
+def visualize_training_samples(dataset, writer, step=0, *, per_kind=2, seed=42):
+    """Log before/after GT for real and synthetic train samples, using isolated RNGs."""
+    for sample in preview_samples(dataset, per_kind=per_kind, seed=seed):
+        kind = "synthetic" if sample["is_synthetic"] else "real"
+        for stage in ("original", "augmented"):
+            image, annotations = sample[stage]
+            canvas = draw_detections(image, [], dataset.coco.cats, ground_truth=annotations)
+            canvas.thumbnail((1600, 1600))
+            draw = ImageDraw.Draw(canvas)
+            caption = f"{kind} {sample['image_id']} | base: {sample['base_file_name']} | {stage}"
+            draw.rectangle(draw.textbbox((8, 8), caption), fill="black")
+            draw.text((8, 8), caption, fill="white")
+            writer.add_image(f"train_samples/{kind}_{sample['image_id']}/{stage}",
+                             np.array(canvas), step, dataformats="HWC")
+
+
 def visualize(dataset, predictions, output_dir=None, writer=None, step=0, max_images=None,
               *, test_config=None):
     config = TEST_CONFIG if test_config is None else test_config
@@ -164,14 +180,14 @@ def main(*, model_builder=None, test_config=None, debug_subset=None,
     debug_subset = DEBUG_SUBSET if debug_subset is None else debug_subset
     output_dir = Path(OUTPUT_DIR if output_dir is None else output_dir)
     if not torch.cuda.is_available():
-        raise RuntimeError("本脚本固定使用 CUDA，请在 GPU 环境运行")
+        raise RuntimeError("This script requires CUDA; run it in a GPU environment")
     dataset = DetectionDataset(Path(DATASET_ROOT).expanduser() / VARIANT, "test", debug_subset)
     loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False,
                         num_workers=config["num_workers"], collate_fn=collate_fn, pin_memory=True)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if (checkpoint["class_names"] != dataset.class_names
             or checkpoint["category_to_label"] != dataset.category_to_label):
-        raise ValueError("测试集的类别 ID/名称与训练 checkpoint 不一致")
+        raise ValueError("Test set category IDs/names do not match the training checkpoint")
     model = model_builder(dataset.class_names, checkpoint).to(DEVICE)
     del checkpoint
     metrics, predictions = evaluate(model, loader, dataset, config["max_detections"], test_config=config)

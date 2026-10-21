@@ -34,3 +34,6 @@ evaluation_results_*/
 ngram_match_search_output/
 alignment_loss_functions/
 research/
+
+*.pt
+events.out.tfevents.*
